@@ -1,0 +1,4892 @@
+//! A multi-sorted CHC system with tuples.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::Hash;
+
+use num_bigint::BigInt;
+use pretty::{termcolor, Pretty};
+use rustc_index::IndexVec;
+
+use crate::pretty::PrettyDisplayExt as _;
+
+pub mod answer;
+mod cache;
+mod candidate_atoms;
+mod clause_builder;
+mod components;
+mod cones;
+pub mod debug;
+mod dedup;
+mod flatten;
+pub(crate) mod format_context;
+mod hoice;
+mod prune;
+pub mod sexp;
+mod smtlib2;
+mod solver;
+mod standalone;
+mod unbox;
+
+pub use candidate_atoms::{conjuncts, instances, CandidateAtoms, CandidateAtomsMode, HeadTerms};
+pub use clause_builder::{ClauseBuilder, Var};
+pub use cones::{goals_by_conjunct, split_conjuncts_in_body, split_goals, NotHorn};
+pub use debug::DebugInfo;
+pub use dedup::dedup_pred_args;
+pub use flatten::flatten_recursive_pred_args;
+pub use solver::{verdict, Answer, Capabilities, CheckSatError, Config, Refused, Requests};
+pub use unbox::{unbox, unbox_formula, unbox_sort};
+
+/// A name of a datatype, or of a constructor or a selector of one.
+///
+/// Two symbols are the same when they are written the same in the query; `name` only changes
+/// how Thrust's printer shows one.
+#[derive(Debug, Clone)]
+pub struct DatatypeSymbol {
+    inner: String,
+    /// The path of the item it was made from, shown in place of `inner`.
+    name: Option<String>,
+}
+
+impl PartialEq for DatatypeSymbol {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl Eq for DatatypeSymbol {}
+
+impl Hash for DatatypeSymbol {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.inner.hash(state)
+    }
+}
+
+impl PartialOrd for DatatypeSymbol {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DatatypeSymbol {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.inner.cmp(&other.inner)
+    }
+}
+
+impl std::fmt::Display for DatatypeSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &DatatypeSymbol
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.text(self.name.as_deref().unwrap_or(&self.inner).to_owned())
+    }
+}
+
+impl DatatypeSymbol {
+    pub fn new(inner: String) -> Self {
+        DatatypeSymbol { inner, name: None }
+    }
+
+    /// This symbol, printed as `name`, the path of the item it was made from.
+    pub fn named(self, name: String) -> Self {
+        Self {
+            name: Some(name),
+            ..self
+        }
+    }
+
+    /// The symbol of `member` of this one, `<self>.<member>`, printed as `<name>::<member>`.
+    pub fn member(&self, member: impl std::fmt::Display) -> Self {
+        DatatypeSymbol {
+            inner: format!("{}.{}", self.inner, member),
+            name: self.name.as_ref().map(|name| format!("{name}::{member}")),
+        }
+    }
+
+    /// This symbol with `suffix` appended, printed by the same name.
+    pub fn suffixed(&self, suffix: impl std::fmt::Display) -> Self {
+        DatatypeSymbol {
+            inner: format!("{}{}", self.inner, suffix),
+            name: self.name.clone(),
+        }
+    }
+}
+
+/// A datatype sort.
+///
+/// A datatype sort is a sort that is defined by a datatype. It has a symbol and a list of
+/// argument sorts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DatatypeSort {
+    symbol: DatatypeSymbol,
+    args: Vec<Sort>,
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &DatatypeSort
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let inner = allocator.intersperse(
+            self.args.iter().map(|t| t.pretty_atom(allocator)),
+            allocator.line(),
+        );
+        let sym = self.symbol.pretty(allocator);
+        if self.args.is_empty() {
+            sym
+        } else {
+            sym.append(allocator.line()).append(inner.nest(2)).group()
+        }
+    }
+}
+
+impl DatatypeSort {
+    pub fn new(symbol: DatatypeSymbol, args: Vec<Sort>) -> Self {
+        DatatypeSort { symbol, args }
+    }
+
+    pub fn symbol(&self) -> &DatatypeSymbol {
+        &self.symbol
+    }
+
+    pub fn args(&self) -> &[Sort] {
+        &self.args
+    }
+
+    pub fn args_mut(&mut self) -> &mut Vec<Sort> {
+        &mut self.args
+    }
+}
+
+rustc_index::newtype_index! {
+    /// An index representing sort-level variable.
+    ///
+    /// We manage sort-level variables using indices that are unique in the whole CHC system.
+    /// [`System`] contains `Vec<ForallSortIdx>` that manages the indices of the variables.
+    #[orderable]
+    #[debug_format = "a{}"]
+    pub struct ForallSortIdx { }
+}
+
+impl Default for ForallSortIdx {
+    fn default() -> Self {
+        0_usize.into()
+    }
+}
+
+impl std::fmt::Display for ForallSortIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a{}", self.index())
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &ForallSortIdx
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator
+            .as_string(self)
+            .annotate(ForallSortIdx::color_spec())
+    }
+}
+
+impl ForallSortIdx {
+    fn color_spec() -> termcolor::ColorSpec {
+        termcolor::ColorSpec::new()
+    }
+}
+
+/// A forall sort declaration, carrying debug information about the type
+/// parameter it was issued for.
+///
+/// [`System`] contains `Vec<ForallSortDef>` that manages the indices and the debug information
+/// of the sort-level variables.
+#[derive(Debug, Clone)]
+pub struct ForallSortDef {
+    pub idx: ForallSortIdx,
+    pub debug_info: DebugInfo,
+}
+
+impl ForallSortDef {
+    pub fn new(idx: ForallSortIdx, debug_info: DebugInfo) -> Self {
+        Self { idx, debug_info }
+    }
+}
+
+/// A sort is the type of a logical term.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Sort {
+    Null,
+    Int,
+    BitVec { width: u32 },
+    Bool,
+    String,
+    Param(usize),
+    Box(Box<Sort>),
+    Mut(Box<Sort>),
+    Tuple(Vec<Sort>),
+    Array(Box<Sort>, Box<Sort>),
+    Seq(Box<Sort>),
+    Datatype(DatatypeSort),
+    Forall(ForallSortIdx),
+}
+
+impl From<DatatypeSort> for Sort {
+    fn from(sort: DatatypeSort) -> Self {
+        Sort::Datatype(sort)
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &Sort
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match self {
+            Sort::Null => allocator.text("null"),
+            Sort::Int => allocator.text("int"),
+            Sort::BitVec { width } => allocator.text(format!("bv{width}")),
+            Sort::Bool => allocator.text("bool"),
+            Sort::String => allocator.text("string"),
+            Sort::Param(i) => allocator.text("T").append(allocator.as_string(i)),
+            Sort::Box(s) => allocator
+                .text("box")
+                .append(allocator.line())
+                .append(s.pretty_atom(allocator))
+                .group(),
+            Sort::Mut(s) => allocator
+                .text("mut")
+                .append(allocator.line())
+                .append(s.pretty_atom(allocator))
+                .group(),
+            Sort::Tuple(ss) => {
+                let separator = allocator.text(",").append(allocator.line());
+                if ss.len() == 1 {
+                    ss[0].pretty(allocator).append(separator).parens().group()
+                } else {
+                    allocator
+                        .intersperse(ss.iter().map(|s| s.pretty(allocator)), separator)
+                        .parens()
+                        .group()
+                }
+            }
+            Sort::Array(s1, s2) => {
+                if matches!(**s1, Sort::Int) {
+                    s2.pretty(allocator).brackets()
+                } else {
+                    allocator.text("array").append(
+                        allocator
+                            .line()
+                            .append(s1.pretty_atom(allocator))
+                            .append(allocator.text("->"))
+                            .append(allocator.line())
+                            .append(s2.pretty_atom(allocator))
+                            .parens(),
+                    )
+                }
+            }
+            Sort::Seq(elem) => allocator
+                .text("Seq")
+                .append(elem.pretty(allocator).angles()),
+            Sort::Datatype(sort) => sort.pretty(allocator),
+            Sort::Forall(idx) => idx.pretty(allocator),
+        }
+    }
+}
+
+impl Sort {
+    fn pretty_atom<'b, 'a, D>(
+        &'b self,
+        allocator: &'a D,
+    ) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec>
+    where
+        D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+        D::Doc: Clone,
+    {
+        match &self {
+            Sort::Box(_) | Sort::Mut(_) | Sort::Datatype { .. } => self.pretty(allocator).parens(),
+            _ => self.pretty(allocator),
+        }
+    }
+
+    fn walk<'a>(&'a self, f: impl FnMut(&'a Sort)) {
+        self.walk_impl(Box::new(f))
+    }
+
+    /// This sort with every forall sort `f` gives a value to replaced by it.
+    pub fn subst_forall(&self, f: &impl Fn(ForallSortIdx) -> Option<Sort>) -> Sort {
+        match self {
+            Sort::Null
+            | Sort::Int
+            | Sort::BitVec { .. }
+            | Sort::Bool
+            | Sort::String
+            | Sort::Param(_) => self.clone(),
+            Sort::Forall(idx) => f(*idx).unwrap_or_else(|| self.clone()),
+            Sort::Box(s) => Sort::Box(Box::new(s.subst_forall(f))),
+            Sort::Mut(s) => Sort::Mut(Box::new(s.subst_forall(f))),
+            Sort::Seq(s) => Sort::Seq(Box::new(s.subst_forall(f))),
+            Sort::Tuple(ss) => Sort::Tuple(ss.iter().map(|s| s.subst_forall(f)).collect()),
+            Sort::Array(s1, s2) => {
+                Sort::Array(Box::new(s1.subst_forall(f)), Box::new(s2.subst_forall(f)))
+            }
+            Sort::Datatype(sort) => Sort::Datatype(DatatypeSort {
+                symbol: sort.symbol.clone(),
+                args: sort.args.iter().map(|s| s.subst_forall(f)).collect(),
+            }),
+        }
+    }
+
+    fn walk_impl<'a, 'b>(&'a self, mut f: Box<dyn FnMut(&'a Sort) + 'b>) {
+        f(self);
+        match self {
+            Sort::Null
+            | Sort::Int
+            | Sort::BitVec { .. }
+            | Sort::Bool
+            | Sort::String
+            | Sort::Param(_)
+            | Sort::Forall(_) => {}
+            Sort::Box(s) | Sort::Mut(s) | Sort::Seq(s) => s.walk(Box::new(&mut f)),
+            Sort::Tuple(ss) => {
+                for s in ss {
+                    s.walk(Box::new(&mut f));
+                }
+            }
+            Sort::Array(s1, s2) => {
+                s1.walk(Box::new(&mut f));
+                s2.walk(Box::new(&mut f));
+            }
+            Sort::Datatype(sort) => {
+                for s in &sort.args {
+                    s.walk(Box::new(&mut f));
+                }
+            }
+        }
+    }
+
+    pub fn deref(self) -> Self {
+        match self {
+            Sort::Box(s) => *s,
+            Sort::Mut(s) => *s,
+            _ => panic!("invalid deref"),
+        }
+    }
+
+    pub fn tuple_elem(self, index: usize) -> Self {
+        match self {
+            Sort::Tuple(ss) => ss[index].clone(),
+            _ => panic!("invalid tuple_elem"),
+        }
+    }
+
+    pub fn as_tuple(&self) -> Option<&[Sort]> {
+        match self {
+            Sort::Tuple(ss) => Some(ss),
+            _ => None,
+        }
+    }
+
+    pub fn null() -> Self {
+        Sort::Null
+    }
+
+    pub fn int() -> Self {
+        Sort::Int
+    }
+
+    pub fn bit_vec(width: u32) -> Self {
+        Sort::BitVec { width }
+    }
+
+    pub fn string() -> Self {
+        Sort::String
+    }
+
+    pub fn bool() -> Self {
+        Sort::Bool
+    }
+
+    pub fn param(i: usize) -> Self {
+        Sort::Param(i)
+    }
+
+    pub fn box_(sort: Sort) -> Self {
+        Sort::Box(Box::new(sort))
+    }
+
+    pub fn mut_(sort: Sort) -> Self {
+        Sort::Mut(Box::new(sort))
+    }
+
+    pub fn tuple(sorts: Vec<Sort>) -> Self {
+        Sort::Tuple(sorts)
+    }
+
+    pub fn array(from: Sort, to: Sort) -> Self {
+        Sort::Array(Box::new(from), Box::new(to))
+    }
+
+    pub fn seq(elem: Sort) -> Self {
+        Sort::Seq(Box::new(elem))
+    }
+
+    pub fn datatype(symbol: DatatypeSymbol, args: Vec<Sort>) -> Self {
+        Sort::Datatype(DatatypeSort { symbol, args })
+    }
+
+    pub fn forall(index: ForallSortIdx) -> Self {
+        Sort::Forall(index)
+    }
+
+    pub fn into_datatype(self) -> Option<DatatypeSort> {
+        match self {
+            Sort::Datatype(sort) => Some(sort),
+            _ => None,
+        }
+    }
+
+    pub fn as_datatype(&self) -> Option<&DatatypeSort> {
+        match self {
+            Sort::Datatype(sort) => Some(sort),
+            _ => None,
+        }
+    }
+
+    pub fn is_singleton(&self) -> bool {
+        match self {
+            Sort::Null => true,
+            Sort::Tuple(ts) => ts.iter().all(Sort::is_singleton),
+            Sort::Box(s) => s.is_singleton(),
+            Sort::Mut(s) => s.is_singleton(),
+            Sort::Array(_, s) => s.is_singleton(),
+            _ => false,
+        }
+    }
+
+    pub fn instantiate_params<F>(&mut self, args: &[Sort], forall_sort_resolver: &F)
+    where
+        F: Fn(crate::chc::ForallSortIdx) -> Option<usize>,
+    {
+        match self {
+            Sort::Param(i) => *self = args[*i].clone(),
+            Sort::Forall(idx) => {
+                if let Some(local_idx) = forall_sort_resolver(*idx) {
+                    *self = args[local_idx].clone();
+                }
+            }
+            Sort::Box(s) => s.instantiate_params(args, forall_sort_resolver),
+            Sort::Mut(s) => s.instantiate_params(args, forall_sort_resolver),
+            Sort::Seq(s) => s.instantiate_params(args, forall_sort_resolver),
+            Sort::Tuple(ss) => {
+                for s in ss {
+                    s.instantiate_params(args, forall_sort_resolver);
+                }
+            }
+            Sort::Array(s1, s2) => {
+                s1.instantiate_params(args, forall_sort_resolver);
+                s2.instantiate_params(args, forall_sort_resolver);
+            }
+            Sort::Datatype(sort) => {
+                for s in &mut sort.args {
+                    s.instantiate_params(args, forall_sort_resolver);
+                }
+            }
+            Sort::Null | Sort::Int | Sort::BitVec { .. } | Sort::Bool | Sort::String => {}
+        }
+    }
+}
+
+rustc_index::newtype_index! {
+    /// An index representing term-level variable.
+    ///
+    /// We manage term-level variables using indices that are unique in each clause.
+    /// [`Clause`] contains `IndexVec<TermVarIdx, Sort>` that manages the indices and the sorts of the variables.
+    #[orderable]
+    #[debug_format = "v{}"]
+    pub struct TermVarIdx { }
+}
+
+impl std::fmt::Display for TermVarIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "v{}", self.index())
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &TermVarIdx
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self).annotate(TermVarIdx::color_spec())
+    }
+}
+
+impl TermVarIdx {
+    fn color_spec() -> termcolor::ColorSpec {
+        termcolor::ColorSpec::new()
+    }
+}
+
+/// Defines the constants of a known symbol type, `NAME = constructor("symbol");`, and `ALL`, the
+/// list of them, to read a symbol back by its name.
+macro_rules! known {
+    ($ty:ident, $($(#[$doc:meta])* $name:ident = $ctor:ident($symbol:literal $(, $negated:ident)?);)*) => {
+        $($(#[$doc])* pub const $name: $ty = $ty::$ctor($symbol)$(.$negated())?;)*
+        /// Every constant above.
+        pub const ALL: &'static [$ty] = &[$($ty::$name),*];
+    };
+}
+
+/// A known function symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Function {
+    name: &'static str,
+    is_infix: bool,
+}
+
+impl std::fmt::Display for Function {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &Function
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self).annotate(Function::color_spec())
+    }
+}
+
+impl Function {
+    fn color_spec() -> termcolor::ColorSpec {
+        termcolor::ColorSpec::new()
+    }
+
+    const fn new(name: &'static str) -> Self {
+        Function {
+            name,
+            is_infix: false,
+        }
+    }
+
+    const fn infix(name: &'static str) -> Self {
+        Function {
+            name,
+            is_infix: true,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.name
+    }
+
+    pub fn is_infix(&self) -> bool {
+        self.is_infix
+    }
+
+    /// How tightly an infix function binds its arguments, for printing: `*` over `+` and `-`
+    /// over the comparisons over `and` and `or`.
+    fn precedence(&self) -> u8 {
+        match *self {
+            Self::MUL => 3,
+            Self::ADD | Self::SUB => 2,
+            Self::AND | Self::OR => 0,
+            _ => 1,
+        }
+    }
+
+    fn sort<I>(&self, args: I) -> Sort
+    where
+        I: IntoIterator<Item = Sort>,
+    {
+        match *self {
+            Self::ADD => Sort::int(),
+            Self::SUB => Sort::int(),
+            Self::MUL => Sort::int(),
+            Self::MOD => Sort::int(),
+            Self::EUCLIDEAN_DIV => Sort::int(),
+            Self::EQ => Sort::bool(),
+            Self::GE => Sort::bool(),
+            Self::GT => Sort::bool(),
+            Self::LE => Sort::bool(),
+            Self::LT => Sort::bool(),
+            Self::AND => Sort::bool(),
+            Self::OR => Sort::bool(),
+            Self::NOT => Sort::bool(),
+            Self::NEG => Sort::int(),
+            Self::BVADD
+            | Self::BVSUB
+            | Self::BVMUL
+            | Self::BVAND
+            | Self::BVOR
+            | Self::BVXOR
+            | Self::BVSHL
+            | Self::BVLSHR
+            | Self::BVASHR
+            | Self::BVNOT
+            | Self::BVNEG => args.into_iter().next().unwrap(),
+            Self::BVULT
+            | Self::BVULE
+            | Self::BVUGT
+            | Self::BVUGE
+            | Self::BVSLT
+            | Self::BVSLE
+            | Self::BVSGT
+            | Self::BVSGE => Sort::bool(),
+            Self::UBV_TO_INT | Self::SBV_TO_INT => Sort::int(),
+            Self::STORE | Self::SEQ_CONCAT | Self::SEQ_EXTRACT | Self::SEQ_STORE => {
+                args.into_iter().next().unwrap()
+            }
+            Self::SEQ_LEN => Sort::int(),
+            Self::SEQ_UNIT => Sort::seq(args.into_iter().next().unwrap()),
+            Self::SEQ_NTH => {
+                let first = args.into_iter().next().unwrap();
+                let Sort::Seq(elem) = first else {
+                    panic!("invalid SEQ_NTH sort: {first:?}");
+                };
+                *elem
+            }
+            Self::SELECT => {
+                let Sort::Array(_, elem) = args.into_iter().next().unwrap() else {
+                    panic!("invalid SELECT sort");
+                };
+                *elem
+            }
+            Self::ITE => args.into_iter().nth(1).unwrap(),
+            _ => unimplemented!(),
+        }
+    }
+
+    known! {
+        Function,
+        ADD = infix("+");
+        SUB = infix("-");
+        MUL = infix("*");
+        /// SMT-LIB's integer modulus: never negative, so this is *not* Rust's `%`.
+        /// See [`Term::rem_trunc`].
+        MOD = new("mod");
+        /// SMT-LIB's integer division: the remainder it leaves is never negative, so this is
+        /// *not* Rust's `/`. See [`Term::div_trunc`].
+        EUCLIDEAN_DIV = new("div");
+        EQ = infix("=");
+        GE = infix(">=");
+        GT = infix(">");
+        LE = infix("<=");
+        LT = infix("<");
+        AND = infix("and");
+        OR = infix("or");
+        NOT = new("not");
+        NEG = new("-");
+        BVADD = new("bvadd");
+        BVSUB = new("bvsub");
+        BVMUL = new("bvmul");
+        BVAND = new("bvand");
+        BVOR = new("bvor");
+        BVXOR = new("bvxor");
+        BVSHL = new("bvshl");
+        BVLSHR = new("bvlshr");
+        BVASHR = new("bvashr");
+        BVNOT = new("bvnot");
+        BVNEG = new("bvneg");
+        BVULT = new("bvult");
+        BVULE = new("bvule");
+        BVUGT = new("bvugt");
+        BVUGE = new("bvuge");
+        BVSLT = new("bvslt");
+        BVSLE = new("bvsle");
+        BVSGT = new("bvsgt");
+        BVSGE = new("bvsge");
+        UBV_TO_INT = new("ubv_to_int");
+        SBV_TO_INT = new("sbv_to_int");
+        STORE = new("store");
+        SELECT = new("select");
+        SEQ_CONCAT = new("seq.++");
+        SEQ_EXTRACT = new("seq.extract");
+        SEQ_LEN = new("seq.len");
+        SEQ_UNIT = new("seq.unit");
+        SEQ_NTH = new("seq.nth");
+        SEQ_STORE = new("seq.store");
+        ITE = new("ite");
+    }
+
+    /// The function the SMT-LIB symbol `name` names at `arity` arguments, if it is known.
+    pub fn named(name: &str, arity: usize) -> Option<Function> {
+        if name == "-" && arity == 1 {
+            return Some(Function::NEG);
+        }
+        Function::ALL
+            .iter()
+            .find(|f| f.name == name && *f != &Function::NEG)
+            .copied()
+    }
+}
+
+/// A call to a user-defined function found by [`Term::guarded_calls`]: its callee and result
+/// sort, its arguments, and the conditions under which the call is evaluated.
+#[derive(Debug, Clone)]
+pub struct GuardedCall<V> {
+    pub callee: UserDefinedPred,
+    pub sort: Sort,
+    pub guards: Vec<Term<V>>,
+    pub args: Vec<Term<V>>,
+}
+
+/// A logical term.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Term<V = TermVarIdx> {
+    Null,
+    ForallDefault(ForallSortIdx),
+    Var(V),
+    Bool(bool),
+    Int(BigInt),
+    String(String),
+    Box(Box<Term<V>>),
+    Mut(Box<Term<V>>, Box<Term<V>>),
+    BoxCurrent(Box<Term<V>>),
+    MutCurrent(Box<Term<V>>),
+    MutFinal(Box<Term<V>>),
+    App(Function, Vec<Term<V>>),
+    ArrayEmpty(Sort, Sort),
+    SeqEmpty(Sort),
+    Tuple(Vec<Term<V>>),
+    TupleProj(Box<Term<V>>, usize),
+    DatatypeCtor(DatatypeSort, DatatypeSymbol, Vec<Term<V>>),
+    DatatypeDiscr(DatatypeSymbol, Box<Term<V>>),
+    /// The `index`-th field (of sort `Sort`) of a value of the datatype built by the constructor
+    /// (SMT-LIB's selector); a formula reads it under the constructor's tester.
+    DatatypeSelector(Box<Selector>, Box<Term<V>>),
+    /// A call to a function defined by a [`UserDefinedPredDef`] with a term body, and its result
+    /// sort.
+    UserDefinedFn(UserDefinedPred, Sort, Vec<Term<V>>),
+    /// An application of a [`ForallPred`] whose result is not `Bool`: a trait logic function read
+    /// at a type parameter.
+    ForallFn(ForallPred, Vec<Term<V>>),
+    IntToBitVec {
+        width: u32,
+        term: Box<Term<V>>,
+    },
+    /// Used in [`Formula`] to represent quantified variables appearing in annotations.
+    UserQuantifiedVar(Sort, UserQuantifiedVarId),
+    /// The array whose element at each index, bound to the variable (of the given index sort),
+    /// is the body (SMT-LIB's `lambda`).
+    ArrayLambda(UserQuantifiedVarId, Sort, Box<Term<V>>),
+}
+
+impl<'a, D, V> Pretty<'a, D, termcolor::ColorSpec> for &Term<V>
+where
+    V: Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match self {
+            Term::Null => allocator.text("null"),
+            Term::ForallDefault(idx) => allocator.text(format!("default_{idx}")),
+            Term::Var(var) => allocator.text(format!("{var:?}")),
+            Term::Int(n) => allocator.as_string(n),
+            Term::Bool(b) => allocator.as_string(b),
+            Term::String(s) => allocator.text(s.clone()).double_quotes(),
+            Term::Box(t) => t.pretty(allocator).angles(),
+            Term::Mut(t1, t2) => t1
+                .pretty(allocator)
+                .append(allocator.text(","))
+                .append(allocator.line())
+                .append(t2.pretty(allocator))
+                .angles()
+                .group(),
+            Term::BoxCurrent(t) | Term::MutCurrent(t) => {
+                allocator.text("*").append(t.pretty(allocator))
+            }
+            Term::MutFinal(t) => allocator.text("°").append(t.pretty(allocator)),
+            Term::ArrayLambda(v, _, t) => allocator
+                .text("λ")
+                .append(allocator.as_string(v))
+                .append(allocator.text(". "))
+                .append(t.pretty(allocator))
+                .parens(),
+            Term::App(f, args) if f.is_infix() => args[0]
+                .pretty_operand(allocator, f.precedence(), true)
+                .append(allocator.line())
+                .append(f.pretty(allocator))
+                .append(allocator.line())
+                .append(args[1].pretty_operand(allocator, f.precedence(), false))
+                .group(),
+            Term::App(f, args) => {
+                let inner = allocator.intersperse(
+                    args.iter().map(|t| t.pretty_atom(allocator)),
+                    allocator.line(),
+                );
+                let f = f.pretty(allocator);
+                if args.is_empty() {
+                    f
+                } else {
+                    f.append(allocator.line()).append(inner.nest(2)).group()
+                }
+            }
+            Term::ArrayEmpty(_, _) => allocator.text("[]"),
+            Term::SeqEmpty(_) => allocator.text("seq.empty"),
+            Term::Tuple(ts) => {
+                let separator = allocator.text(",").append(allocator.line());
+                let tuple = if ts.len() == 1 {
+                    ts[0].pretty(allocator).append(separator).parens()
+                } else {
+                    allocator
+                        .intersperse(ts.iter().map(|t| t.pretty(allocator)), separator)
+                        .parens()
+                };
+                tuple.group()
+            }
+            // A projection binds tighter than `*` and `°`: `(*x).0`.
+            Term::TupleProj(t, i) => {
+                let t = match &**t {
+                    Term::BoxCurrent(_) | Term::MutCurrent(_) | Term::MutFinal(_) => {
+                        t.pretty(allocator).parens()
+                    }
+                    _ => t.pretty_atom(allocator),
+                };
+                t.append(allocator.text(".")).append(allocator.as_string(i))
+            }
+            Term::DatatypeCtor(_, symbol, args) => {
+                let separator = allocator.text(",").append(allocator.line());
+                let args = allocator
+                    .intersperse(args.iter().map(|t| t.pretty(allocator)), separator)
+                    .parens();
+                symbol.pretty(allocator).append(args).group()
+            }
+            Term::DatatypeDiscr(_, t) => allocator
+                .text("discriminant")
+                .append(t.pretty(allocator).parens()),
+            Term::DatatypeSelector(sel, t) => sel
+                .ctor
+                .pretty(allocator)
+                .append(allocator.text(format!(".{}", sel.index)))
+                .append(t.pretty(allocator).parens()),
+
+            Term::UserDefinedFn(symbol, _, args) => {
+                let separator = allocator.text(",").append(allocator.line());
+                let args = allocator
+                    .intersperse(args.iter().map(|t| t.pretty(allocator)), separator)
+                    .parens();
+                symbol.pretty(allocator).append(args).group()
+            }
+            Term::ForallFn(pred, args) => {
+                let separator = allocator.text(",").append(allocator.line());
+                let args = allocator
+                    .intersperse(args.iter().map(|t| t.pretty(allocator)), separator)
+                    .parens();
+                pred.pretty(allocator).append(args).group()
+            }
+            Term::IntToBitVec { width, term } => allocator
+                .text(format!("int_to_bv{width}"))
+                .append(term.pretty(allocator).parens()),
+            Term::UserQuantifiedVar(_, var) => allocator.as_string(var),
+        }
+    }
+}
+
+/// The `index`-th field, of sort `field`, of the constructor `ctor` of the datatype `sort`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Selector {
+    pub sort: DatatypeSort,
+    pub ctor: DatatypeSymbol,
+    pub index: usize,
+    pub field: Sort,
+}
+
+/// The value `t`, the datatype and the constructor `C` of a conjunct `t = C(vars)` (or
+/// `C(vars) = t`) with `C` applied to exactly the variables `vars` in their order, and `t` free
+/// of them; `vars` are then the fields of `t` (see [`Formula::exists_over_payload`]).
+fn payload_equality<V: Clone>(
+    formula: &Formula<V>,
+    vars: &[(UserQuantifiedVarId, Sort)],
+) -> Option<(Term<V>, DatatypeSort, DatatypeSymbol)> {
+    let Formula::Atom(atom) = formula else {
+        return None;
+    };
+    if atom.guard.is_some() || atom.pred != Pred::Known(KnownPred::EQUAL) || atom.args.len() != 2 {
+        return None;
+    }
+    let bound: HashSet<UserQuantifiedVarId> = vars.iter().map(|(v, _)| *v).collect();
+    let names_bound = |t: &Term<V>| {
+        t.preorder()
+            .into_iter()
+            .any(|s| matches!(s, Term::UserQuantifiedVar(_, v) if bound.contains(v)))
+    };
+    let fields_are_vars = |t: &Term<V>| match t {
+        Term::DatatypeCtor(sort, ctor, args)
+            if args.len() == vars.len()
+                && args
+                    .iter()
+                    .zip(vars)
+                    .all(|(a, (v, _))| matches!(a, Term::UserQuantifiedVar(_, w) if w == v)) =>
+        {
+            Some((sort.clone(), ctor.clone()))
+        }
+        _ => None,
+    };
+    let (a, b) = (&atom.args[0], &atom.args[1]);
+    if let Some((sort, ctor)) = fields_are_vars(b).filter(|_| !names_bound(a)) {
+        return Some((a.clone(), sort, ctor));
+    }
+    if let Some((sort, ctor)) = fields_are_vars(a).filter(|_| !names_bound(b)) {
+        return Some((b.clone(), sort, ctor));
+    }
+    None
+}
+
+/// The user-defined predicates and functions a rewrite replaces, by the symbol replacing each.
+pub type UserDefinedRenaming = HashMap<UserDefinedPred, UserDefinedPred>;
+
+impl<V> Term<V> {
+    /// Replaces the user-defined functions `renaming` maps, in this term and its subterms.
+    pub fn rename_user_defined(&mut self, renaming: &UserDefinedRenaming) {
+        match self {
+            Term::UserDefinedFn(symbol, _, args) => {
+                if let Some(to) = renaming.get(symbol) {
+                    *symbol = to.clone();
+                }
+                args.iter_mut()
+                    .for_each(|t| t.rename_user_defined(renaming));
+            }
+            Term::Box(t)
+            | Term::BoxCurrent(t)
+            | Term::MutCurrent(t)
+            | Term::MutFinal(t)
+            | Term::TupleProj(t, _)
+            | Term::DatatypeDiscr(_, t)
+            | Term::DatatypeSelector(.., t)
+            | Term::ArrayLambda(_, _, t)
+            | Term::IntToBitVec { term: t, .. } => t.rename_user_defined(renaming),
+            Term::Mut(t1, t2) => {
+                t1.rename_user_defined(renaming);
+                t2.rename_user_defined(renaming);
+            }
+            Term::App(_, args)
+            | Term::Tuple(args)
+            | Term::DatatypeCtor(_, _, args)
+            | Term::ForallFn(_, args) => {
+                args.iter_mut()
+                    .for_each(|t| t.rename_user_defined(renaming));
+            }
+            Term::Null
+            | Term::ForallDefault(_)
+            | Term::Var(_)
+            | Term::Bool(_)
+            | Term::Int(_)
+            | Term::String(_)
+            | Term::ArrayEmpty(..)
+            | Term::SeqEmpty(_)
+            | Term::UserQuantifiedVar(..) => {}
+        }
+    }
+
+    fn pretty_atom<'b, 'a, D>(
+        &'b self,
+        allocator: &'a D,
+    ) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec>
+    where
+        V: Var,
+        D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+        D::Doc: Clone,
+    {
+        match &self {
+            Term::App(_f, args) if !args.is_empty() => self.pretty(allocator).parens(),
+            _ => self.pretty(allocator),
+        }
+    }
+
+    /// The term as an operand of an infix function of precedence `outer`, on its `left`: an
+    /// infix application binding tighter, or as tightly on the left of arithmetic, needs no
+    /// parentheses (`2 * n + r`, `a - b - c`).
+    fn pretty_operand<'b, 'a, D>(
+        &'b self,
+        allocator: &'a D,
+        outer: u8,
+        left: bool,
+    ) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec>
+    where
+        V: Var,
+        D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+        D::Doc: Clone,
+    {
+        match self {
+            Term::App(f, args) if f.is_infix() && args.len() == 2 => {
+                let inner = f.precedence();
+                if inner > outer || (inner == outer && left && inner >= 2) {
+                    self.pretty(allocator)
+                } else {
+                    self.pretty(allocator).parens()
+                }
+            }
+            _ => self.pretty_atom(allocator),
+        }
+    }
+
+    // TODO: ?
+    fn subst_var_impl<W>(self, mut f: Box<dyn FnMut(V) -> Term<W> + '_>) -> Term<W> {
+        match self {
+            Term::Null => Term::Null,
+            Term::ForallDefault(idx) => Term::ForallDefault(idx),
+            Term::Var(v) => f(v),
+            Term::Bool(b) => Term::Bool(b),
+            Term::Int(n) => Term::Int(n),
+            Term::String(s) => Term::String(s),
+            Term::Box(t) => Term::Box(Box::new(t.subst_var(f))),
+            Term::Mut(t1, t2) => {
+                Term::Mut(Box::new(t1.subst_var(&mut f)), Box::new(t2.subst_var(f)))
+            }
+            Term::BoxCurrent(t) => Term::BoxCurrent(Box::new(t.subst_var(f))),
+            Term::MutCurrent(t) => Term::MutCurrent(Box::new(t.subst_var(f))),
+            Term::MutFinal(t) => Term::MutFinal(Box::new(t.subst_var(f))),
+            Term::ArrayLambda(v, s, t) => Term::ArrayLambda(v, s, Box::new(t.subst_var(f))),
+            Term::App(fun, args) => {
+                Term::App(fun, args.into_iter().map(|t| t.subst_var(&mut f)).collect())
+            }
+            Term::ArrayEmpty(s1, s2) => Term::ArrayEmpty(s1, s2),
+            Term::SeqEmpty(s) => Term::SeqEmpty(s),
+            Term::Tuple(ts) => Term::Tuple(ts.into_iter().map(|t| t.subst_var(&mut f)).collect()),
+            Term::TupleProj(t, i) => Term::TupleProj(Box::new(t.subst_var(f)), i),
+            Term::DatatypeCtor(sort, c_sym, args) => Term::DatatypeCtor(
+                sort,
+                c_sym,
+                args.into_iter().map(|t| t.subst_var(&mut f)).collect(),
+            ),
+            Term::DatatypeDiscr(d_sym, t) => Term::DatatypeDiscr(d_sym, Box::new(t.subst_var(f))),
+            Term::DatatypeSelector(sel, t) => Term::DatatypeSelector(sel, Box::new(t.subst_var(f))),
+
+            Term::UserDefinedFn(symbol, sort, args) => Term::UserDefinedFn(
+                symbol,
+                sort,
+                args.into_iter().map(|t| t.subst_var(&mut f)).collect(),
+            ),
+            Term::ForallFn(pred, args) => Term::ForallFn(
+                pred,
+                args.into_iter().map(|t| t.subst_var(&mut f)).collect(),
+            ),
+            Term::IntToBitVec { width, term } => Term::IntToBitVec {
+                width,
+                term: Box::new(term.subst_var(f)),
+            },
+            Term::UserQuantifiedVar(sort, var) => Term::UserQuantifiedVar(sort, var),
+        }
+    }
+
+    pub fn subst_var<F, W>(self, f: F) -> Term<W>
+    where
+        F: FnMut(V) -> Term<W>,
+    {
+        self.subst_var_impl::<W>(Box::new(f))
+    }
+
+    pub fn map_var<F, W>(self, mut f: F) -> Term<W>
+    where
+        F: FnMut(V) -> W,
+    {
+        self.subst_var(|v| Term::Var(f(v)))
+    }
+
+    fn sort<F>(&self, mut var_sort: F) -> Sort
+    where
+        F: FnMut(&V) -> Sort,
+    {
+        match self {
+            Term::Null => Sort::null(),
+            Term::ForallDefault(idx) => Sort::forall(*idx),
+            Term::Var(v) => var_sort(v),
+            Term::Bool(_) => Sort::bool(),
+            Term::Int(_) => Sort::int(),
+            Term::String(_) => Sort::string(),
+            Term::Box(t) => Sort::box_(t.sort(var_sort)),
+            Term::Mut(t, _) => Sort::mut_(t.sort(var_sort)),
+            Term::BoxCurrent(t) => t.sort(var_sort).deref(),
+            Term::MutCurrent(t) => t.sort(var_sort).deref(),
+            Term::MutFinal(t) => t.sort(var_sort).deref(),
+            Term::ArrayLambda(_, s, t) => Sort::array(s.clone(), t.sort(var_sort)),
+            Term::App(fun, args) => {
+                // TODO: remove this
+                let mut var_sort: Box<dyn FnMut(&V) -> Sort> = Box::new(var_sort);
+                fun.sort(args.iter().map(|t| t.sort(&mut var_sort)))
+            }
+            Term::ArrayEmpty(index, elem) => Sort::array(index.clone(), elem.clone()),
+            Term::SeqEmpty(elem) => Sort::seq(elem.clone()),
+            Term::Tuple(ts) => {
+                // TODO: remove this
+                let mut var_sort: Box<dyn FnMut(&V) -> Sort> = Box::new(var_sort);
+                Sort::tuple(ts.iter().map(|t| t.sort(&mut var_sort)).collect())
+            }
+            Term::TupleProj(t, i) => t.sort(var_sort).tuple_elem(*i),
+            Term::DatatypeCtor(sort, _, _) => sort.clone().into(),
+            Term::DatatypeDiscr(_, _) => Sort::int(),
+            Term::DatatypeSelector(sel, _) => sel.field.clone(),
+
+            Term::UserDefinedFn(_, sort, _) => sort.clone(),
+            Term::ForallFn(pred, _) => pred.result.clone(),
+            Term::IntToBitVec { width, .. } => Sort::bit_vec(*width),
+            Term::UserQuantifiedVar(sort, _) => sort.clone(),
+        }
+    }
+
+    fn fv_impl(&self) -> Box<dyn Iterator<Item = &V> + '_> {
+        match self {
+            Term::Var(v) => Box::new(std::iter::once(v)),
+            Term::Null
+            | Term::ForallDefault(_)
+            | Term::Bool(_)
+            | Term::Int(_)
+            | Term::String(_)
+            | Term::ArrayEmpty { .. }
+            | Term::UserQuantifiedVar { .. } => Box::new(std::iter::empty()),
+            Term::Box(t) => t.fv_impl(),
+            Term::Mut(t1, t2) => Box::new(t1.fv_impl().chain(t2.fv_impl())),
+            Term::BoxCurrent(t) => t.fv_impl(),
+            Term::MutCurrent(t) => t.fv_impl(),
+            Term::MutFinal(t) => t.fv_impl(),
+            Term::ArrayLambda(_, _, t) => t.fv_impl(),
+            Term::App(_, args) => Box::new(args.iter().flat_map(|t| t.fv_impl())),
+            Term::SeqEmpty(_) => Box::new(std::iter::empty()),
+            Term::Tuple(ts) => Box::new(ts.iter().flat_map(|t| t.fv_impl())),
+            Term::TupleProj(t, _) => t.fv_impl(),
+            Term::DatatypeCtor(_, _, args) => Box::new(args.iter().flat_map(|t| t.fv_impl())),
+            Term::DatatypeDiscr(_, t)
+            | Term::DatatypeSelector(.., t)
+            | Term::IntToBitVec { term: t, .. } => t.fv_impl(),
+            Term::UserDefinedFn(_, _, args) | Term::ForallFn(_, args) => {
+                Box::new(args.iter().flat_map(|t| t.fv_impl()))
+            }
+        }
+    }
+
+    /// The immediate subterms of this term, in order.
+    fn subterms(&self) -> Vec<&Term<V>> {
+        match self {
+            Term::Box(t)
+            | Term::BoxCurrent(t)
+            | Term::MutCurrent(t)
+            | Term::MutFinal(t)
+            | Term::TupleProj(t, _)
+            | Term::DatatypeDiscr(_, t)
+            | Term::DatatypeSelector(.., t)
+            | Term::ArrayLambda(_, _, t)
+            | Term::IntToBitVec { term: t, .. } => vec![&**t],
+            Term::Mut(t1, t2) => vec![&**t1, &**t2],
+            Term::App(_, args)
+            | Term::Tuple(args)
+            | Term::DatatypeCtor(_, _, args)
+            | Term::UserDefinedFn(_, _, args)
+            | Term::ForallFn(_, args) => args.iter().collect(),
+            Term::Null
+            | Term::ForallDefault(_)
+            | Term::Var(_)
+            | Term::Bool(_)
+            | Term::Int(_)
+            | Term::String(_)
+            | Term::ArrayEmpty(_, _)
+            | Term::SeqEmpty(_)
+            | Term::UserQuantifiedVar(_, _) => Vec::new(),
+        }
+    }
+
+    /// This term and all its subterms, each before its own subterms.
+    fn preorder(&self) -> Vec<&Term<V>> {
+        let mut terms = vec![self];
+        for t in self.subterms() {
+            terms.extend(t.preorder());
+        }
+        terms
+    }
+
+    /// The forall functions applied anywhere in this term.
+    pub fn forall_fns(&self) -> Vec<&ForallPred> {
+        self.preorder()
+            .into_iter()
+            .filter_map(|t| match t {
+                Term::ForallFn(pred, _) => Some(pred),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The user-defined functions called anywhere in this term.
+    fn user_defined_fns(&self) -> Vec<&UserDefinedPred> {
+        self.preorder()
+            .into_iter()
+            .filter_map(|t| match t {
+                Term::UserDefinedFn(symbol, _, _) => Some(symbol),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The calls to user-defined functions in this term outside `lambda`s, each with the `ite`
+    /// conditions on the way to it.
+    pub fn guarded_calls(&self) -> Vec<GuardedCall<V>>
+    where
+        V: Clone,
+    {
+        let mut calls = Vec::new();
+        self.collect_guarded_calls(&mut Vec::new(), &mut calls);
+        calls
+    }
+
+    /// Whether a `lambda` in this term calls `symbol`, which [`Self::guarded_calls`] does not see.
+    pub fn calls_under_lambda(&self, symbol: &UserDefinedPred) -> bool {
+        self.preorder().into_iter().any(|t| {
+            matches!(t, Term::ArrayLambda(_, _, body) if body.user_defined_fns().contains(&symbol))
+        })
+    }
+
+    fn collect_guarded_calls(&self, guards: &mut Vec<Term<V>>, calls: &mut Vec<GuardedCall<V>>)
+    where
+        V: Clone,
+    {
+        match self {
+            Term::App(fun, args) if *fun == Function::ITE => {
+                let [cond, then_, else_] = &args[..] else {
+                    panic!("ite takes three arguments");
+                };
+                cond.collect_guarded_calls(guards, calls);
+                guards.push(cond.clone());
+                then_.collect_guarded_calls(guards, calls);
+                *guards.last_mut().unwrap() = cond.clone().not();
+                else_.collect_guarded_calls(guards, calls);
+                guards.pop();
+                return;
+            }
+            Term::ArrayLambda(_, _, _) => return,
+            Term::UserDefinedFn(callee, sort, args) => {
+                calls.push(GuardedCall {
+                    callee: callee.clone(),
+                    sort: sort.clone(),
+                    guards: guards.clone(),
+                    args: args.clone(),
+                });
+            }
+            _ => {}
+        }
+        for t in self.subterms() {
+            t.collect_guarded_calls(guards, calls);
+        }
+    }
+
+    pub fn fv(&self) -> impl Iterator<Item = &V> {
+        self.fv_impl()
+    }
+
+    pub fn null() -> Self {
+        Term::Null
+    }
+
+    pub fn var(v: V) -> Self {
+        Term::Var(v)
+    }
+
+    pub fn int(n: impl Into<BigInt>) -> Self {
+        Term::Int(n.into())
+    }
+
+    pub fn bool(b: bool) -> Self {
+        Term::Bool(b)
+    }
+
+    pub fn string(s: String) -> Self {
+        Term::String(s)
+    }
+
+    /// Some canonical value of the given sort. The exact value is unspecified;
+    /// callers must only use it where any well-typed value would do (e.g. the
+    /// element value of an [`Term::ArrayEmpty`]).
+    pub fn default_for(sort: &Sort) -> Self {
+        match sort {
+            Sort::Null => Term::Null,
+            Sort::Forall(idx) => Term::ForallDefault(*idx),
+            Sort::Int => Term::int(0),
+            Sort::BitVec { width } => Term::int(0).int_to_bit_vec(*width),
+            Sort::Bool => Term::Bool(false),
+            Sort::String => Term::String(String::new()),
+            Sort::Box(s) => Term::Box(Box::new(Self::default_for(s))),
+            Sort::Mut(s) => Term::Mut(
+                Box::new(Self::default_for(s)),
+                Box::new(Self::default_for(s)),
+            ),
+            Sort::Tuple(ts) => Term::Tuple(ts.iter().map(Self::default_for).collect()),
+            Sort::Array(i, e) => Term::ArrayEmpty((**i).clone(), (**e).clone()),
+            Sort::Seq(elem) => Term::SeqEmpty((**elem).clone()),
+            // TODO: defaults for Datatype and Param.
+            Sort::Datatype(_) | Sort::Param(_) => {
+                unimplemented!("no default value for sort {sort:?}")
+            }
+        }
+    }
+
+    pub fn box_(t: Term<V>) -> Self {
+        Term::Box(Box::new(t))
+    }
+
+    pub fn mut_(t1: Term<V>, t2: Term<V>) -> Self {
+        Term::Mut(Box::new(t1), Box::new(t2))
+    }
+
+    pub fn array_empty(index: Sort, elem: Sort) -> Self {
+        Term::ArrayEmpty(index, elem)
+    }
+
+    pub fn seq_empty(elem: Sort) -> Self {
+        Term::SeqEmpty(elem)
+    }
+
+    pub fn seq_unit(self) -> Self {
+        Term::App(Function::SEQ_UNIT, vec![self])
+    }
+
+    pub fn seq_concat(self, other: Self) -> Self {
+        Term::App(Function::SEQ_CONCAT, vec![self, other])
+    }
+
+    pub fn seq_extract(self, start: Self, length: Self) -> Self {
+        Term::App(Function::SEQ_EXTRACT, vec![self, start, length])
+    }
+
+    pub fn seq_len(self) -> Self {
+        Term::App(Function::SEQ_LEN, vec![self])
+    }
+
+    pub fn seq_nth(self, index: Self) -> Self {
+        Term::App(Function::SEQ_NTH, vec![self, index])
+    }
+
+    pub fn seq_store(self, index: Self, elem: Self) -> Self {
+        Term::App(Function::SEQ_STORE, vec![self, index, elem])
+    }
+
+    pub fn boxed(self) -> Self {
+        Term::Box(Box::new(self))
+    }
+
+    pub fn box_current(self) -> Self {
+        Term::BoxCurrent(Box::new(self))
+    }
+
+    pub fn mut_current(self) -> Self {
+        Term::MutCurrent(Box::new(self))
+    }
+
+    pub fn mut_final(self) -> Self {
+        Term::MutFinal(Box::new(self))
+    }
+
+    pub fn add(self, other: Self) -> Self {
+        Term::App(Function::ADD, vec![self, other])
+    }
+
+    pub fn sub(self, other: Self) -> Self {
+        Term::App(Function::SUB, vec![self, other])
+    }
+
+    pub fn mul(self, other: Self) -> Self {
+        Term::App(Function::MUL, vec![self, other])
+    }
+
+    pub fn mod_(self, other: Self) -> Self {
+        Term::App(Function::MOD, vec![self, other])
+    }
+
+    /// Rust's `/`, which truncates toward zero.
+    ///
+    /// See [`Term::reflect_nonnegative_dividend`] for why this is not SMT-LIB's `div`.
+    pub fn div_trunc(self, other: Self) -> Self
+    where
+        V: Clone,
+    {
+        Term::reflect_nonnegative_dividend(Function::EUCLIDEAN_DIV, self, other)
+    }
+
+    /// Rust's `%`, whose result takes the sign of the dividend.
+    ///
+    /// See [`Term::reflect_nonnegative_dividend`] for why this is not SMT-LIB's `mod`.
+    pub fn rem_trunc(self, other: Self) -> Self
+    where
+        V: Clone,
+    {
+        Term::reflect_nonnegative_dividend(Function::MOD, self, other)
+    }
+
+    /// Express a truncating integer operation through its Euclidean counterpart.
+    ///
+    /// Rust truncates toward zero and lets `%` take the sign of the dividend, while SMT-LIB
+    /// rounds so that the remainder is never negative. The two coincide exactly when the
+    /// dividend is non-negative: there the truncated quotient and remainder already satisfy
+    /// `a = b*q + r` with `0 <= r < |b|`, and that pair is what Euclidean division uniquely
+    /// denotes.
+    ///
+    /// Both operations are odd in the dividend -- truncation is, so `(-a)/b == -(a/b)`, and
+    /// `(-a)%b == -(a%b)` follows -- so a negative dividend is reflected through zero to land
+    /// in the agreeing range and the result reflected back. That holds for a divisor of
+    /// either sign, which an `abs` on the divisor alone would not achieve.
+    ///
+    /// A zero divisor is deliberately left alone: SMT-LIB leaves division by zero
+    /// unspecified, and rustc emits an assertion that has to be discharged before the
+    /// division is reached.
+    fn reflect_nonnegative_dividend(f: Function, dividend: Self, divisor: Self) -> Self
+    where
+        V: Clone,
+    {
+        let direct = |a, b| Term::App(f, vec![a, b]);
+        // A literal dividend settles the sign test here rather than leaving an `ite` behind.
+        if let Term::Int(n) = &dividend {
+            if *n >= BigInt::from(0) {
+                return direct(dividend, divisor);
+            }
+            let m = -n.clone();
+            return direct(Term::int(m), divisor).neg();
+        }
+        Term::ite(
+            dividend.clone().ge(Term::int(0)),
+            direct(dividend.clone(), divisor.clone()),
+            direct(dividend.neg(), divisor).neg(),
+        )
+    }
+
+    pub fn eq(self, other: Self) -> Self {
+        Term::App(Function::EQ, vec![self, other])
+    }
+
+    pub fn ne(self, other: Self) -> Self {
+        Term::App(
+            Function::NOT,
+            vec![Term::App(Function::EQ, vec![self, other])],
+        )
+    }
+
+    pub fn ge(self, other: Self) -> Self {
+        Term::App(Function::GE, vec![self, other])
+    }
+
+    pub fn gt(self, other: Self) -> Self {
+        Term::App(Function::GT, vec![self, other])
+    }
+
+    pub fn le(self, other: Self) -> Self {
+        Term::App(Function::LE, vec![self, other])
+    }
+
+    pub fn lt(self, other: Self) -> Self {
+        Term::App(Function::LT, vec![self, other])
+    }
+
+    pub fn and(self, other: Self) -> Self {
+        Term::App(Function::AND, vec![self, other])
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        Term::App(Function::OR, vec![self, other])
+    }
+
+    pub fn not(self) -> Self {
+        Term::App(Function::NOT, vec![self])
+    }
+
+    pub fn neg(self) -> Self {
+        Term::App(Function::NEG, vec![self])
+    }
+
+    pub fn select(self, index: Self) -> Self
+    where
+        V: Clone,
+    {
+        // Peephole 1: when both indices are concrete integer literals, reduce `select(store(a, i,
+        // v), j)` to `v` (`i == j`) or `select(a, j)` (`i != j`). Same motivation as the
+        // `tuple_proj` simplifier: keep datatype/array constructors from leaking into Spacer
+        // clauses where it can't reduce them. Non-literal indices are deferred to the solver via
+        // the general select-of-store axiom.
+        if let (Term::App(Function::STORE, _), Term::Int(j)) = (&self, &index) {
+            let Term::App(_, mut args) = self else {
+                unreachable!()
+            };
+            assert_eq!(args.len(), 3, "STORE takes 3 args");
+            let stored_value = args.pop().unwrap();
+            let stored_index = args.pop().unwrap();
+            let base = args.pop().unwrap();
+            if let Term::Int(i) = &stored_index {
+                return if i == j {
+                    stored_value
+                } else {
+                    base.select(index)
+                };
+            }
+            return Term::App(
+                Function::SELECT,
+                vec![
+                    Term::App(Function::STORE, vec![base, stored_index, stored_value]),
+                    index,
+                ],
+            );
+        }
+        Term::App(Function::SELECT, vec![self, index])
+    }
+
+    pub fn ite(cond: Self, then_: Self, else_: Self) -> Self {
+        Term::App(Function::ITE, vec![cond, then_, else_])
+    }
+
+    pub fn store(self, index: Self, elem: Self) -> Self {
+        Term::App(Function::STORE, vec![self, index, elem])
+    }
+
+    pub fn tuple(ts: Vec<Term<V>>) -> Self {
+        Term::Tuple(ts)
+    }
+
+    pub fn tuple_proj(self, i: usize) -> Self {
+        // Spacer doesn't unfold tuple projections of literal constructors.
+        if let Term::Tuple(mut ts) = self {
+            assert!(i < ts.len(), "tuple_proj index out of bounds");
+            return ts.swap_remove(i);
+        }
+        Term::TupleProj(Box::new(self), i)
+    }
+
+    pub fn datatype_ctor(
+        d_sym: DatatypeSymbol,
+        d_args: Vec<Sort>,
+        c_sym: DatatypeSymbol,
+        args: Vec<Term<V>>,
+    ) -> Self {
+        Term::DatatypeCtor(DatatypeSort::new(d_sym, d_args), c_sym, args)
+    }
+
+    pub fn int_to_bit_vec(self, width: u32) -> Self {
+        Term::IntToBitVec {
+            width,
+            term: Box::new(self),
+        }
+    }
+
+    /// The `index`-th field, of sort `field`, of `t` built by the constructor `ctor` of `sort`.
+    pub fn datatype_selector(
+        sort: DatatypeSort,
+        ctor: DatatypeSymbol,
+        index: usize,
+        field: Sort,
+        t: Term<V>,
+    ) -> Self {
+        let sel = Selector {
+            sort,
+            ctor,
+            index,
+            field,
+        };
+        Term::DatatypeSelector(Box::new(sel), Box::new(t))
+    }
+
+    pub fn datatype_discr(d_sym: DatatypeSymbol, t: Term<V>) -> Self {
+        Term::DatatypeDiscr(d_sym, Box::new(t))
+    }
+
+    pub fn user_defined_fn(symbol: UserDefinedPred, sort: Sort, args: Vec<Term<V>>) -> Self {
+        Term::UserDefinedFn(symbol, sort, args)
+    }
+
+    pub fn equal_to(self, other: Self) -> Atom<V> {
+        Atom::new(KnownPred::EQUAL.into(), vec![self, other])
+    }
+
+    pub fn not_equal_to(self, other: Self) -> Atom<V> {
+        Atom::new(KnownPred::NOT_EQUAL.into(), vec![self, other])
+    }
+}
+
+rustc_index::newtype_index! {
+    /// An identifier of a variable bound by `forall`/`exists` in an annotation.
+    #[debug_format = "q${}"]
+    pub struct UserQuantifiedVarId { }
+}
+
+impl std::fmt::Display for UserQuantifiedVarId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "q${}", self.index())
+    }
+}
+
+rustc_index::newtype_index! {
+    /// An index representing predicate variables.
+    ///
+    /// We manage predicate variables using indices that are unique in a CHC system.
+    /// [`System`] contains `IndexVec<PredVarId, PredVarDef>` that manages the indices
+    /// and signatures of the predicate variables.
+    #[debug_format = "p{}"]
+    pub struct PredVarId { }
+}
+
+impl std::fmt::Display for PredVarId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "p{}", self.index())
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &PredVarId
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self).annotate(PredVarId::color_spec())
+    }
+}
+
+impl PredVarId {
+    fn color_spec() -> termcolor::ColorSpec {
+        let mut spec = termcolor::ColorSpec::new();
+        spec.set_fg(Some(termcolor::Color::Cyan));
+        spec
+    }
+}
+
+/// A known predicate.
+///
+/// A known predicate is a predicate that has a fixed meaning, such as `true`, `false`, `=`, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KnownPred {
+    name: &'static str,
+    is_negative: bool,
+    is_infix: bool,
+}
+
+impl std::fmt::Display for KnownPred {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if self.is_negative {
+            f.write_str("!")?;
+        }
+        f.write_str(self.name)
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &KnownPred
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self).annotate(KnownPred::color_spec())
+    }
+}
+
+impl KnownPred {
+    fn color_spec() -> termcolor::ColorSpec {
+        let mut spec = termcolor::ColorSpec::new();
+        spec.set_fg(Some(termcolor::Color::Red));
+        spec
+    }
+
+    const fn new(name: &'static str) -> Self {
+        KnownPred {
+            name,
+            is_negative: false,
+            is_infix: false,
+        }
+    }
+
+    const fn infix(name: &'static str) -> Self {
+        KnownPred {
+            name,
+            is_negative: false,
+            is_infix: true,
+        }
+    }
+
+    const fn negated(mut self) -> Self {
+        self.is_negative = true;
+        self
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn is_negative(&self) -> bool {
+        self.is_negative
+    }
+
+    pub fn is_infix(&self) -> bool {
+        self.is_infix
+    }
+
+    pub fn is_top(&self) -> bool {
+        self == &KnownPred::TOP
+    }
+
+    pub fn is_bottom(&self) -> bool {
+        self == &KnownPred::BOTTOM
+    }
+
+    known! {
+        KnownPred,
+        TOP = new("true");
+        BOTTOM = new("false");
+        EQUAL = infix("=");
+        NOT_EQUAL = infix("=", negated);
+        LESS_THAN_OR_EQUAL = infix("<=");
+        GREATER_THAN_OR_EQUAL = infix(">=");
+        LESS_THAN = infix("<");
+        GREATER_THAN = infix(">");
+    }
+
+    /// The comparison the SMT-LIB symbol `name` names, if it is one.
+    pub fn named(name: &str) -> Option<KnownPred> {
+        KnownPred::ALL
+            .iter()
+            .find(|p| p.name == name && !p.is_negative && p.is_infix)
+            .copied()
+    }
+}
+
+/// A matcher predicate.
+///
+/// A matcher predicate is a predicate that relates a value of a datatype with its contents.
+/// For example, given the following `enum` datatype:
+///
+/// ```rust
+/// pub enum X {
+///     A(i64),
+///     B(bool),
+/// }
+/// ```
+///
+/// The corresponding matcher predicate is defined as:
+///
+/// ```smtlib2
+/// (define-fun matcher_pred<X> ((x0 Int) (x1 Bool) (v X)) Bool (or (= v (X.A x0)) (= v (X.B x1))))
+/// ```
+///
+/// See the implementation in the [`smtlib2`] module for the details.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MatcherPred {
+    datatype_symbol: DatatypeSymbol,
+    datatype_args: Vec<Sort>,
+}
+
+impl std::fmt::Display for MatcherPred {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "matcher_pred")
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &MatcherPred
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let args = allocator.intersperse(
+            self.datatype_args.iter().map(|a| a.pretty(allocator)),
+            allocator.text(", "),
+        );
+        allocator
+            .text("matcher_pred")
+            .append(
+                self.datatype_symbol
+                    .pretty(allocator)
+                    .append(args.angles())
+                    .angles(),
+            )
+            .group()
+    }
+}
+
+impl MatcherPred {
+    pub fn new(datatype_symbol: DatatypeSymbol, datatype_args: Vec<Sort>) -> Self {
+        MatcherPred {
+            datatype_symbol,
+            datatype_args,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        "matcher_pred"
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UserDefinedPred {
+    inner: String,
+    /// The sorts this predicate was emitted at. Empty for the definition read
+    /// straight off the source, whose parameter sorts are the declaring item's
+    /// own; non-empty for a copy emitted at one instantiation of them.
+    instance: Vec<Sort>,
+    /// The path of the item it was read from, which the printer shows in place of `inner`;
+    /// not part of its identity.
+    name: Option<String>,
+}
+
+impl PartialEq for UserDefinedPred {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.inner, &self.instance) == (&other.inner, &other.instance)
+    }
+}
+
+impl Eq for UserDefinedPred {}
+
+impl Hash for UserDefinedPred {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (&self.inner, &self.instance).hash(state)
+    }
+}
+
+impl std::fmt::Display for UserDefinedPred {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // SMT2 identifiers produced by Thrust come from Rust names (e.g.
+        // `Map<I, F>_step`), which the backed solver rejects because
+        // `,` and ` ` are not allowed inside an identifier. Sanitize at the
+        // display boundary so the existing human-readable naming convention
+        // is preserved (`Map<I, F>_step` → `Map<I-F>_step`).
+        for c in self.inner.chars() {
+            match c {
+                ',' => f.write_str("-")?,
+                ' ' | '\t' | '\n' | '\r' => {}
+                c => f.write_str(c.encode_utf8(&mut [0; 4]))?,
+            }
+        }
+        f.write_str(&format_context::format_sort_symbols(&self.instance))
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &UserDefinedPred
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.text(self.name.clone().unwrap_or_else(|| self.inner.clone()))
+    }
+}
+
+impl UserDefinedPred {
+    pub fn new(inner: String) -> Self {
+        Self {
+            inner,
+            instance: Vec::new(),
+            name: None,
+        }
+    }
+
+    pub fn at_instance(inner: String, instance: Vec<Sort>) -> Self {
+        Self {
+            inner,
+            instance,
+            name: None,
+        }
+    }
+
+    /// This predicate, printed as `name`, the path of the item it was read from.
+    pub fn named(self, name: String) -> Self {
+        Self {
+            name: Some(name),
+            ..self
+        }
+    }
+
+    pub fn instance(&self) -> &[Sort] {
+        &self.instance
+    }
+
+    /// The symbol of a defined copy ([`System::reveal_in`]) for the revealed set `tag` names:
+    /// `<symbol>_def_<tag>`, shown as `<name> (revealed)` so that a report tells it from the
+    /// universal symbol.
+    pub fn defined_copy(&self, tag: &str) -> Self {
+        let inner = format!("{}_def_{}", self.inner, tag);
+        Self {
+            inner,
+            name: self.name.as_ref().map(|name| format!("{name} (revealed)")),
+            ..self.clone()
+        }
+    }
+}
+
+// `Ord` orders by `inner` (a def-path-derived stable name, see
+// `refine::stable_def_id_symbol`) and then by the sort lists, so the
+// ordering is a function of the pred's own content rather than of any
+// hash or allocation order. `declare-forall-fun` emission order and the
+// `declare-dep-exists-fun` dependency lists rely on this to stay stable
+// across runs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ForallPred {
+    inner: String,
+    /// The `<...>` suffix of the symbol, which names the generic arguments it stands at.
+    type_arguments: String,
+    type_parameters: Vec<Sort>,
+    params: Vec<Sort>,
+    /// `Bool` for a predicate; the result sort of a trait logic function read at a type
+    /// parameter, which [`Term::ForallFn`] applies.
+    result: Sort,
+}
+
+impl std::fmt::Display for ForallPred {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &ForallPred
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let args = allocator.intersperse(
+            self.type_parameters.iter().map(|a| a.pretty(allocator)),
+            allocator.text(", "),
+        );
+        allocator
+            .text("forall_pred")
+            .append(
+                allocator
+                    .as_string(&self.inner)
+                    .append(args.angles())
+                    .angles(),
+            )
+            .group()
+    }
+}
+
+impl ForallPred {
+    pub fn new(
+        inner: String,
+        type_arguments: String,
+        type_parameters: Vec<Sort>,
+        params: Vec<Sort>,
+    ) -> Self {
+        Self::function(inner, type_arguments, type_parameters, params, Sort::bool())
+    }
+
+    pub fn function(
+        inner: String,
+        type_arguments: String,
+        type_parameters: Vec<Sort>,
+        params: Vec<Sort>,
+        result: Sort,
+    ) -> Self {
+        Self {
+            inner,
+            type_arguments,
+            type_parameters,
+            params,
+            result,
+        }
+    }
+
+    pub fn result(&self) -> &Sort {
+        &self.result
+    }
+
+    /// The symbol without the `<...>` that names the generic arguments it stands at.
+    pub fn inner(&self) -> &str {
+        &self.inner
+    }
+
+    pub fn type_arguments(&self) -> &str {
+        &self.type_arguments
+    }
+
+    pub fn type_parameters(&self) -> &[Sort] {
+        &self.type_parameters
+    }
+
+    pub fn params(&self) -> &[Sort] {
+        &self.params
+    }
+}
+
+/// A predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Pred {
+    Known(KnownPred),
+    Var(PredVarId),
+    Matcher(MatcherPred),
+    UserDefined(UserDefinedPred),
+    ForallPred(ForallPred),
+    /// The datatype tester `(_ is C)` of the constructor `C`, applied to one argument.
+    Tester(DatatypeSymbol),
+}
+
+impl std::fmt::Display for Pred {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Pred::Known(p) => p.fmt(f),
+            Pred::Var(p) => p.fmt(f),
+            Pred::Matcher(p) => p.fmt(f),
+            Pred::UserDefined(p) => p.fmt(f),
+            Pred::ForallPred(p) => p.fmt(f),
+            Pred::Tester(c) => write!(f, "is<{c}>"),
+        }
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &Pred
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match self {
+            Pred::Known(p) => p.pretty(allocator),
+            Pred::Var(p) => p.pretty(allocator),
+            Pred::Matcher(p) => p.pretty(allocator),
+            Pred::UserDefined(p) => p.pretty(allocator),
+            Pred::ForallPred(p) => p.pretty(allocator),
+            Pred::Tester(c) => allocator.text("is").append(c.pretty(allocator).angles()),
+        }
+    }
+}
+
+impl From<KnownPred> for Pred {
+    fn from(p: KnownPred) -> Pred {
+        Pred::Known(p)
+    }
+}
+
+impl From<PredVarId> for Pred {
+    fn from(p: PredVarId) -> Pred {
+        Pred::Var(p)
+    }
+}
+
+impl From<MatcherPred> for Pred {
+    fn from(p: MatcherPred) -> Pred {
+        Pred::Matcher(p)
+    }
+}
+
+impl From<UserDefinedPred> for Pred {
+    fn from(p: UserDefinedPred) -> Pred {
+        Pred::UserDefined(p)
+    }
+}
+
+impl From<ForallPred> for Pred {
+    fn from(p: ForallPred) -> Self {
+        Pred::ForallPred(p)
+    }
+}
+
+impl Pred {
+    pub fn name(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Pred::Known(p) => p.name().into(),
+            Pred::Var(p) => p.to_string().into(),
+            Pred::Matcher(p) => p.name().into(),
+            Pred::UserDefined(p) => p.to_string().into(),
+            Pred::ForallPred(p) => p.to_string().into(),
+            Pred::Tester(c) => format!("is<{c}>").into(),
+        }
+    }
+
+    pub fn is_negative(&self) -> bool {
+        match self {
+            Pred::Known(p) => p.is_negative(),
+            Pred::Var(_) => false,
+            Pred::Matcher(_) => false,
+            Pred::UserDefined(_) => false,
+            Pred::ForallPred(_) => false,
+            Pred::Tester(_) => false,
+        }
+    }
+
+    pub fn is_infix(&self) -> bool {
+        match self {
+            Pred::Known(p) => p.is_infix(),
+            Pred::Var(_) => false,
+            Pred::Matcher(_) => false,
+            Pred::UserDefined(_) => false,
+            Pred::ForallPred(_) => false,
+            Pred::Tester(_) => false,
+        }
+    }
+
+    pub fn is_top(&self) -> bool {
+        match self {
+            Pred::Known(p) => p.is_top(),
+            Pred::Var(_) => false,
+            Pred::Matcher(_) => false,
+            Pred::UserDefined(_) => false,
+            Pred::ForallPred(_) => false,
+            Pred::Tester(_) => false,
+        }
+    }
+
+    pub fn is_bottom(&self) -> bool {
+        match self {
+            Pred::Known(p) => p.is_bottom(),
+            Pred::Var(_) => false,
+            Pred::Matcher(_) => false,
+            Pred::UserDefined(_) => false,
+            Pred::ForallPred(_) => false,
+            Pred::Tester(_) => false,
+        }
+    }
+}
+
+impl TryFrom<Pred> for ForallPred {
+    type Error = String;
+    fn try_from(value: Pred) -> Result<Self, Self::Error> {
+        if let Pred::ForallPred(forall_pred) = value {
+            Ok(forall_pred)
+        } else {
+            Err(format!(
+                "expected the variant `Pred::ForallPred`, got {value:#?}."
+            ))
+        }
+    }
+}
+
+/// An atom is a predicate applied to a list of terms.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Atom<V = TermVarIdx> {
+    /// With `guard`, this represents `guard => pred(args)`.
+    ///
+    /// As long as there is no pvar in the `guard`, it forms a valid CHC. However, in that case,
+    /// it becomes odd to call this an `Atom`... It is our TODO to clean this up by either
+    /// getting rid of the `guard` or renaming `Atom`.
+    pub guard: Option<Box<Formula<V>>>,
+    pub pred: Pred,
+    pub args: Vec<Term<V>>,
+}
+
+impl<'a, D, V> Pretty<'a, D, termcolor::ColorSpec> for &Atom<V>
+where
+    V: Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        // An infix predicate is a comparison, of the comparisons' precedence.
+        let atom = if self.pred.is_infix() {
+            self.args[0]
+                .pretty_operand(allocator, 1, true)
+                .append(allocator.line())
+                .append(self.pred.pretty(allocator))
+                .append(allocator.line())
+                .append(self.args[1].pretty_operand(allocator, 1, false))
+                .group()
+        } else {
+            let inner = allocator.intersperse(
+                self.args.iter().map(|t| t.pretty_atom(allocator)),
+                allocator.line(),
+            );
+            let p = self.pred.pretty(allocator);
+            if self.args.is_empty() {
+                p
+            } else {
+                p.append(allocator.line()).append(inner.nest(2)).group()
+            }
+        };
+        if let Some(guard) = &self.guard {
+            guard
+                .pretty(allocator)
+                .append(allocator.text(" ⇒"))
+                .append(allocator.line())
+                .append(atom)
+                .group()
+        } else {
+            atom
+        }
+    }
+}
+
+impl<V> Atom<V> {
+    /// Replaces the user-defined predicates and functions `renaming` maps.
+    pub fn rename_user_defined(&mut self, renaming: &UserDefinedRenaming) {
+        if let Pred::UserDefined(symbol) = &mut self.pred {
+            if let Some(to) = renaming.get(symbol) {
+                *symbol = to.clone();
+            }
+        }
+        if let Some(guard) = &mut self.guard {
+            guard.rename_user_defined(renaming);
+        }
+        self.args
+            .iter_mut()
+            .for_each(|t| t.rename_user_defined(renaming));
+    }
+
+    pub fn new(pred: Pred, args: Vec<Term<V>>) -> Self {
+        Atom {
+            guard: None,
+            pred,
+            args,
+        }
+    }
+
+    pub fn with_guard(guard: Formula<V>, pred: Pred, args: Vec<Term<V>>) -> Self {
+        Atom {
+            guard: Some(Box::new(guard)),
+            pred,
+            args,
+        }
+    }
+
+    pub fn top() -> Self {
+        Atom::new(KnownPred::TOP.into(), vec![])
+    }
+
+    pub fn bottom() -> Self {
+        Atom::new(KnownPred::BOTTOM.into(), vec![])
+    }
+
+    pub fn is_top(&self) -> bool {
+        if let Some(guard) = &self.guard {
+            guard.is_bottom() || self.pred.is_top()
+        } else {
+            self.pred.is_top()
+        }
+    }
+
+    pub fn is_bottom(&self) -> bool {
+        if let Some(guard) = &self.guard {
+            guard.is_top() && self.pred.is_bottom()
+        } else {
+            self.pred.is_bottom()
+        }
+    }
+
+    pub fn subst_var<F, W>(self, mut f: F) -> Atom<W>
+    where
+        F: FnMut(V) -> Term<W>,
+    {
+        Atom {
+            guard: self.guard.map(|fo| Box::new(fo.subst_var(&mut f))),
+            pred: self.pred,
+            args: self.args.into_iter().map(|t| t.subst_var(&mut f)).collect(),
+        }
+    }
+
+    pub fn map_var<F, W>(self, mut f: F) -> Atom<W>
+    where
+        F: FnMut(V) -> W,
+    {
+        Atom {
+            guard: self.guard.map(|fo| Box::new(fo.map_var(&mut f))),
+            pred: self.pred,
+            args: self.args.into_iter().map(|t| t.map_var(&mut f)).collect(),
+        }
+    }
+
+    pub fn fv(&self) -> impl Iterator<Item = &V> {
+        let guard_fvs: Box<dyn Iterator<Item = &V>> = if let Some(guard) = &self.guard {
+            Box::new(guard.fv())
+        } else {
+            Box::new(std::iter::empty())
+        };
+        self.args.iter().flat_map(|t| t.fv()).chain(guard_fvs)
+    }
+
+    pub fn guarded(self, new_guard: Formula<V>) -> Atom<V> {
+        let Atom {
+            guard: self_guard,
+            pred,
+            args,
+        } = self;
+        let guard = if let Some(self_guard) = self_guard {
+            self_guard.and(new_guard)
+        } else {
+            new_guard
+        };
+        Atom {
+            guard: Some(Box::new(guard)),
+            pred,
+            args,
+        }
+    }
+}
+
+/// An arbitrary formula built with atoms and logical connectives.
+///
+/// While it allows arbitrary [`Atom`] in its `Atom` variant, we only expect atoms with known
+/// predicates (i.e., predicates other than `Pred::Var`) to appear in formulas. It is our TODO to
+/// enforce this restriction statically. Also see the definition of [`Body`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Formula<V = TermVarIdx> {
+    Atom(Atom<V>),
+    Not(Box<Formula<V>>),
+    And(Vec<Formula<V>>),
+    Or(Vec<Formula<V>>),
+    Implies(Box<Formula<V>>, Box<Formula<V>>),
+    Exists(Vec<(UserQuantifiedVarId, Sort)>, Box<Formula<V>>),
+    Forall(Vec<(UserQuantifiedVarId, Sort)>, Box<Formula<V>>),
+}
+
+impl<V> Default for Formula<V> {
+    fn default() -> Self {
+        Formula::top()
+    }
+}
+
+impl<V> From<Atom<V>> for Formula<V> {
+    fn from(atom: Atom<V>) -> Formula<V> {
+        Formula::Atom(atom)
+    }
+}
+
+impl<'a, D, V> Pretty<'a, D, termcolor::ColorSpec> for &Formula<V>
+where
+    V: Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match self {
+            Formula::Atom(atom) => atom.pretty(allocator),
+            // `¬` binds tighter than an infix predicate: `¬(x = y)`.
+            Formula::Not(fo) => {
+                let inner = match &**fo {
+                    Formula::Atom(atom) if atom.pred.is_infix() => fo.pretty(allocator).parens(),
+                    _ => fo.pretty_atom(allocator),
+                };
+                allocator.text("¬").append(inner).group()
+            }
+            Formula::And(fs) => {
+                let inner = allocator.intersperse(
+                    fs.iter().map(|f| f.pretty_atom(allocator)),
+                    allocator
+                        .text("∧")
+                        .enclose(allocator.line(), allocator.space()),
+                );
+                inner.group()
+            }
+            Formula::Or(fs) => {
+                let inner = allocator.intersperse(
+                    fs.iter().map(|f| f.pretty_atom(allocator)),
+                    allocator
+                        .text("∨")
+                        .enclose(allocator.line(), allocator.space()),
+                );
+                inner.group()
+            }
+            Formula::Implies(lhs, rhs) => lhs
+                .pretty_atom(allocator)
+                .append(allocator.space())
+                .append(allocator.text("==>"))
+                .append(allocator.line())
+                .append(rhs.pretty_atom(allocator))
+                .group(),
+            Formula::Exists(vars, fo) => {
+                let vars = allocator.intersperse(
+                    vars.iter().map(|(var, sort)| {
+                        allocator
+                            .as_string(var)
+                            .append(allocator.text(":"))
+                            .append(allocator.text(" "))
+                            .append(sort.pretty(allocator))
+                    }),
+                    allocator.text(", ").append(allocator.line()),
+                );
+                allocator
+                    .text("∃")
+                    .append(vars)
+                    .append(allocator.text("."))
+                    .append(allocator.line())
+                    .append(fo.pretty(allocator).nest(2))
+                    .group()
+            }
+            Formula::Forall(vars, fo) => {
+                let vars = allocator.intersperse(
+                    vars.iter().map(|(var, sort)| {
+                        allocator
+                            .as_string(var)
+                            .append(allocator.text(":"))
+                            .append(allocator.text(" "))
+                            .append(sort.pretty(allocator))
+                    }),
+                    allocator.text(", ").append(allocator.line()),
+                );
+                allocator
+                    .text("∀")
+                    .append(vars)
+                    .append(allocator.text("."))
+                    .append(allocator.line())
+                    .append(fo.pretty(allocator).nest(2))
+                    .group()
+            }
+        }
+    }
+}
+
+impl<V> Formula<V> {
+    /// Replaces the user-defined predicates and functions `renaming` maps.
+    pub fn rename_user_defined(&mut self, renaming: &UserDefinedRenaming) {
+        match self {
+            Formula::Atom(atom) => atom.rename_user_defined(renaming),
+            Formula::Not(f) | Formula::Exists(_, f) | Formula::Forall(_, f) => {
+                f.rename_user_defined(renaming)
+            }
+            Formula::And(fs) | Formula::Or(fs) => {
+                fs.iter_mut().for_each(|f| f.rename_user_defined(renaming))
+            }
+            Formula::Implies(lhs, rhs) => {
+                lhs.rename_user_defined(renaming);
+                rhs.rename_user_defined(renaming);
+            }
+        }
+    }
+
+    fn pretty_atom<'a, 'b, D>(
+        &'b self,
+        allocator: &'a D,
+    ) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec>
+    where
+        V: Var,
+        D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+        D::Doc: Clone,
+    {
+        match self {
+            Formula::And(_)
+            | Formula::Or(_)
+            | Formula::Implies { .. }
+            | Formula::Exists { .. }
+            | Formula::Forall { .. } => self.pretty(allocator).parens(),
+            _ => self.pretty(allocator),
+        }
+    }
+
+    pub fn top() -> Self {
+        Formula::Atom(Atom::top())
+    }
+
+    pub fn bottom() -> Self {
+        Formula::Atom(Atom::bottom())
+    }
+
+    pub fn is_top(&self) -> bool {
+        match self {
+            Formula::Atom(atom) => atom.is_top(),
+            Formula::Not(fo) => fo.is_bottom(),
+            Formula::And(fs) => fs.iter().all(Formula::is_top),
+            Formula::Or(fs) => fs.iter().any(Formula::is_top),
+            Formula::Implies(lhs, rhs) => lhs.is_bottom() || rhs.is_top(),
+            Formula::Exists(_, fo) => fo.is_top(),
+            Formula::Forall(_, fo) => fo.is_top(),
+        }
+    }
+
+    pub fn is_bottom(&self) -> bool {
+        match self {
+            Formula::Atom(atom) => atom.is_bottom(),
+            Formula::Not(fo) => fo.is_top(),
+            Formula::And(fs) => fs.iter().any(Formula::is_bottom),
+            Formula::Or(fs) => fs.iter().all(Formula::is_bottom),
+            Formula::Implies(lhs, rhs) => lhs.is_top() && rhs.is_bottom(),
+            Formula::Exists(_, fo) => fo.is_bottom(),
+            Formula::Forall(_, fo) => fo.is_bottom(),
+        }
+    }
+
+    pub fn not(self) -> Self {
+        match self {
+            Formula::Not(fo) => *fo,
+            _ => Formula::Not(Box::new(self)),
+        }
+    }
+
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Formula::And(mut fs), Formula::And(others)) => {
+                fs.extend(others);
+                Formula::And(fs)
+            }
+            (f1, f2) => Formula::And(vec![f1, f2]),
+        }
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Formula::Or(mut fs), Formula::Or(others)) => {
+                fs.extend(others);
+                Formula::Or(fs)
+            }
+            (f1, f2) => Formula::Or(vec![f1, f2]),
+        }
+    }
+
+    pub fn implies(self, other: Self) -> Self {
+        Formula::Implies(Box::new(self), Box::new(other))
+    }
+
+    pub fn exists(vars: Vec<(UserQuantifiedVarId, Sort)>, body: Self) -> Self {
+        Formula::Exists(vars, Box::new(body))
+    }
+
+    /// `∃vars. body`, written without the quantifier when a conjunct of `body` is `t = C(vars)`
+    /// with `C` applied to exactly the variables `vars`, in order, and `t` free of them: the
+    /// equality determines each variable as a selector of `t`, so the formula is
+    /// `is_C(t) ∧ body'`, `body'` the other conjuncts with each variable replaced by its
+    /// selector. Otherwise the existential as written.
+    pub fn exists_over_payload(vars: Vec<(UserQuantifiedVarId, Sort)>, body: Self) -> Self
+    where
+        V: Clone,
+    {
+        fn flatten<V>(f: Formula<V>, out: &mut Vec<Formula<V>>) {
+            match f {
+                Formula::And(fs) => fs.into_iter().for_each(|f| flatten(f, out)),
+                f => out.push(f),
+            }
+        }
+        let mut conjuncts = Vec::new();
+        flatten(body, &mut conjuncts);
+        let Some(pos) = conjuncts
+            .iter()
+            .position(|f| payload_equality(f, &vars).is_some())
+        else {
+            return Formula::exists(vars, Formula::And(conjuncts));
+        };
+        let (value, sort, ctor) = payload_equality(&conjuncts[pos], &vars).unwrap();
+        let selectors: HashMap<UserQuantifiedVarId, Term<V>> = vars
+            .iter()
+            .enumerate()
+            .map(|(index, (var, field))| {
+                let selector = Term::datatype_selector(
+                    sort.clone(),
+                    ctor.clone(),
+                    index,
+                    field.clone(),
+                    value.clone(),
+                );
+                (*var, selector)
+            })
+            .collect();
+        let tester = Atom::new(Pred::Tester(ctor), vec![value]);
+        let rest = conjuncts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i != pos)
+            .map(|(_, f)| f.subst_quantified(&selectors));
+        std::iter::once(Formula::Atom(tester))
+            .chain(rest)
+            .fold(Formula::top(), Formula::and)
+    }
+
+    pub fn forall(vars: Vec<(UserQuantifiedVarId, Sort)>, body: Self) -> Self {
+        Formula::Forall(vars, Box::new(body))
+    }
+
+    /// The formula with each quantified variable `terms` maps replaced by its term.
+    pub fn subst_quantified(self, terms: &HashMap<UserQuantifiedVarId, Term<V>>) -> Self
+    where
+        V: Clone,
+    {
+        candidate_atoms::map_formula_terms(self, &mut |t| match t {
+            Term::UserQuantifiedVar(_, var) if terms.contains_key(&var) => terms[&var].clone(),
+            t => t,
+        })
+    }
+
+    pub fn subst_var<F, W>(self, f: F) -> Formula<W>
+    where
+        F: FnMut(V) -> Term<W>,
+    {
+        // TODO: remove this
+        let mut f: Box<dyn FnMut(V) -> Term<W>> = Box::new(f);
+        match self {
+            Formula::Atom(atom) => Formula::Atom(atom.subst_var(f)),
+            Formula::Not(fo) => Formula::Not(Box::new(fo.subst_var(f))),
+            Formula::And(fs) => {
+                Formula::And(fs.into_iter().map(|fo| fo.subst_var(&mut f)).collect())
+            }
+            Formula::Or(fs) => Formula::Or(fs.into_iter().map(|fo| fo.subst_var(&mut f)).collect()),
+            Formula::Implies(lhs, rhs) => {
+                Formula::Implies(Box::new(lhs.subst_var(&mut f)), Box::new(rhs.subst_var(f)))
+            }
+            Formula::Exists(vars, fo) => Formula::Exists(vars, Box::new(fo.subst_var(f))),
+            Formula::Forall(vars, fo) => Formula::Forall(vars, Box::new(fo.subst_var(f))),
+        }
+    }
+
+    pub fn map_var<F, W>(self, f: F) -> Formula<W>
+    where
+        F: FnMut(V) -> W,
+    {
+        // TODO: remove this
+        let mut f: Box<dyn FnMut(V) -> W> = Box::new(f);
+        match self {
+            Formula::Atom(atom) => Formula::Atom(atom.map_var(f)),
+            Formula::Not(fo) => Formula::Not(Box::new(fo.map_var(&mut f))),
+            Formula::And(fs) => Formula::And(fs.into_iter().map(|fo| fo.map_var(&mut f)).collect()),
+            Formula::Or(fs) => Formula::Or(fs.into_iter().map(|fo| fo.map_var(&mut f)).collect()),
+            Formula::Implies(lhs, rhs) => {
+                Formula::Implies(Box::new(lhs.map_var(&mut f)), Box::new(rhs.map_var(f)))
+            }
+            Formula::Exists(vars, fo) => Formula::Exists(vars, Box::new(fo.map_var(f))),
+            Formula::Forall(vars, fo) => Formula::Forall(vars, Box::new(fo.map_var(f))),
+        }
+    }
+
+    pub fn fv(&self) -> impl Iterator<Item = &V> {
+        self.fv_impl()
+    }
+
+    fn fv_impl(&self) -> Box<dyn Iterator<Item = &V> + '_> {
+        match self {
+            Formula::Atom(atom) => Box::new(atom.fv()),
+            Formula::Not(fo) => Box::new(fo.fv()),
+            Formula::And(fs) => Box::new(fs.iter().flat_map(Formula::fv)),
+            Formula::Or(fs) => Box::new(fs.iter().flat_map(Formula::fv)),
+            Formula::Implies(lhs, rhs) => Box::new(lhs.fv().chain(rhs.fv())),
+            Formula::Exists(_, fo) => Box::new(fo.fv()),
+            Formula::Forall(_, fo) => Box::new(fo.fv()),
+        }
+    }
+
+    pub fn iter_atoms(&self) -> impl Iterator<Item = &Atom<V>> {
+        self.iter_atoms_impl()
+    }
+
+    fn iter_atoms_impl(&self) -> Box<dyn Iterator<Item = &Atom<V>> + '_> {
+        match self {
+            Formula::Atom(atom) => Box::new(std::iter::once(atom)),
+            Formula::Not(fo) => Box::new(fo.iter_atoms()),
+            Formula::And(fs) => Box::new(fs.iter().flat_map(Formula::iter_atoms)),
+            Formula::Or(fs) => Box::new(fs.iter().flat_map(Formula::iter_atoms)),
+            Formula::Implies(lhs, rhs) => Box::new(lhs.iter_atoms().chain(rhs.iter_atoms())),
+            Formula::Exists(_, fo) => Box::new(fo.iter_atoms()),
+            Formula::Forall(_, fo) => Box::new(fo.iter_atoms()),
+        }
+    }
+
+    pub fn push_conj(&mut self, other: Self) {
+        match self {
+            Formula::And(fs) => {
+                fs.push(other);
+            }
+            _ => {
+                let orig = std::mem::take(self);
+                *self = Formula::And(vec![orig, other]);
+            }
+        }
+    }
+
+    /// Removes each conjunct of `self`, at any depth of its conjunctions, that is one of
+    /// `conjuncts`.
+    pub fn remove_conjuncts(&mut self, conjuncts: &[Formula<V>])
+    where
+        V: PartialEq,
+    {
+        if conjuncts.contains(self) {
+            *self = Formula::top();
+            return;
+        }
+        if let Formula::And(fs) = self {
+            for f in &mut *fs {
+                f.remove_conjuncts(conjuncts);
+            }
+            fs.retain(|f| !f.is_top());
+        }
+    }
+
+    pub fn simplify(&mut self) {
+        match self {
+            Formula::Atom(_atom) => {}
+            Formula::Not(fo) => fo.simplify(),
+            Formula::Implies(lhs, rhs) => {
+                lhs.simplify();
+                rhs.simplify();
+                if lhs.is_bottom() || rhs.is_top() {
+                    *self = Formula::top();
+                } else if lhs.is_top() {
+                    *self = std::mem::take(&mut **rhs);
+                } else if rhs.is_bottom() {
+                    *self = std::mem::take(&mut **lhs).not();
+                }
+            }
+            Formula::And(fs) => {
+                for fo in &mut *fs {
+                    fo.simplify();
+                }
+                fs.retain(|f| !f.is_top());
+                if fs.is_empty() {
+                    *self = Formula::top();
+                } else if fs.len() == 1 {
+                    *self = fs.pop().unwrap();
+                }
+            }
+            Formula::Or(fs) => {
+                for fo in &mut *fs {
+                    fo.simplify();
+                }
+                fs.retain(|f| !f.is_bottom());
+                if fs.is_empty() {
+                    *self = Formula::bottom();
+                } else if fs.len() == 1 {
+                    *self = fs.pop().unwrap();
+                }
+            }
+            Formula::Exists(_, fo) => {
+                fo.simplify();
+            }
+            Formula::Forall(_, fo) => {
+                fo.simplify();
+            }
+        }
+    }
+}
+
+/// The body part of a clause, consisting of atoms and a formula.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Body<V = TermVarIdx> {
+    pub atoms: Vec<Atom<V>>,
+    /// NOTE: This doesn't contain predicate variables. Also see [`Formula`].
+    pub formula: Formula<V>,
+}
+
+impl<V> Default for Body<V> {
+    fn default() -> Self {
+        Body {
+            atoms: Default::default(),
+            formula: Default::default(),
+        }
+    }
+}
+
+impl<V> From<Atom<V>> for Body<V> {
+    fn from(atom: Atom<V>) -> Self {
+        Body {
+            atoms: vec![atom],
+            formula: Formula::top(),
+        }
+    }
+}
+
+impl<V> From<Vec<Atom<V>>> for Body<V> {
+    fn from(atoms: Vec<Atom<V>>) -> Self {
+        Body {
+            atoms,
+            formula: Formula::top(),
+        }
+    }
+}
+
+impl<V> From<Formula<V>> for Body<V> {
+    fn from(formula: Formula<V>) -> Self {
+        Body {
+            atoms: vec![],
+            formula,
+        }
+    }
+}
+
+impl<V> Body<V> {
+    /// Replaces the user-defined predicates and functions `renaming` maps.
+    pub fn rename_user_defined(&mut self, renaming: &UserDefinedRenaming) {
+        self.atoms
+            .iter_mut()
+            .for_each(|a| a.rename_user_defined(renaming));
+        self.formula.rename_user_defined(renaming);
+    }
+
+    pub fn new(atoms: Vec<Atom<V>>, formula: Formula<V>) -> Self {
+        Body { atoms, formula }
+    }
+
+    pub fn top() -> Self {
+        Body {
+            atoms: vec![],
+            formula: Formula::top(),
+        }
+    }
+
+    pub fn bottom() -> Self {
+        Body {
+            atoms: vec![],
+            formula: Formula::bottom(),
+        }
+    }
+
+    pub fn is_top(&self) -> bool {
+        self.formula.is_top() && self.atoms.iter().all(|a| a.is_top())
+    }
+
+    pub fn is_bottom(&self) -> bool {
+        self.formula.is_bottom() || self.atoms.iter().any(|a| a.is_bottom())
+    }
+
+    pub fn has_pred_var(&self) -> bool {
+        self.atoms.iter().any(|a| matches!(a.pred, Pred::Var(_)))
+    }
+
+    /// The body as one formula; it must have no predicate variable.
+    pub fn into_formula(self) -> Formula<V> {
+        assert!(!self.has_pred_var(), "a formula has no predicate variable");
+        let Body { atoms, formula } = self;
+        atoms
+            .into_iter()
+            .map(Formula::Atom)
+            .fold(formula, Formula::and)
+    }
+
+    pub fn push_conj(&mut self, other: impl Into<Body<V>>) {
+        let Body { atoms, formula } = other.into();
+        self.atoms.extend(atoms);
+        self.formula.push_conj(formula);
+    }
+
+    pub fn map_var<F, W>(self, mut f: F) -> Body<W>
+    where
+        F: FnMut(V) -> W,
+    {
+        Body {
+            atoms: self.atoms.into_iter().map(|a| a.map_var(&mut f)).collect(),
+            formula: self.formula.map_var(f),
+        }
+    }
+
+    pub fn subst_var<F, W>(self, mut f: F) -> Body<W>
+    where
+        F: FnMut(V) -> Term<W>,
+    {
+        Body {
+            atoms: self
+                .atoms
+                .into_iter()
+                .map(|a| a.subst_var(&mut f))
+                .collect(),
+            formula: self.formula.subst_var(f),
+        }
+    }
+
+    pub fn simplify(&mut self) {
+        self.formula.simplify();
+        self.atoms.retain(|a| !a.is_top());
+        if self.is_bottom() {
+            self.atoms = vec![Atom::bottom()];
+            self.formula = Formula::top();
+        }
+    }
+
+    pub fn iter_atoms(&self) -> impl Iterator<Item = &Atom<V>> {
+        self.formula.iter_atoms().chain(&self.atoms)
+    }
+}
+
+impl<V> Body<V>
+where
+    V: Var,
+{
+    pub fn guarded(self, guard: Formula<V>) -> Body<V> {
+        let Body { atoms, formula } = self;
+        Body {
+            atoms: atoms
+                .into_iter()
+                .map(|a| a.guarded(guard.clone()))
+                .collect(),
+            formula: guard.implies(formula),
+        }
+    }
+}
+
+impl<'a, D, V> Pretty<'a, D, termcolor::ColorSpec> for &Body<V>
+where
+    V: Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let atoms = allocator.intersperse(
+            &self.atoms,
+            allocator
+                .text("∧")
+                .enclose(allocator.line(), allocator.space()),
+        );
+        let formula = self.formula.pretty(allocator);
+        if self.atoms.is_empty() {
+            formula
+        } else if self.formula.is_top() {
+            atoms.group()
+        } else {
+            atoms
+                .append(allocator.line())
+                .append(allocator.text("∧"))
+                .append(allocator.line())
+                .append(formula)
+                .group()
+        }
+    }
+}
+
+/// A constrained Horn clause.
+///
+/// A constrained Horn clause is a formula of the form `∀vars. body ⇒ head` where `body` is a conjunction of
+/// atoms and underlying logical formula, and `head` is an atom.
+#[derive(Debug, Clone)]
+pub struct Clause {
+    pub origin: debug::origin::ClauseOrigin,
+    pub vars: IndexVec<TermVarIdx, Sort>,
+    pub head: Atom<TermVarIdx>,
+    pub body: Body<TermVarIdx>,
+    pub debug_info: DebugInfo,
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &Clause
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let vars = allocator
+            .intersperse(
+                self.vars
+                    .iter_enumerated()
+                    .map(|(v, s)| v.pretty(allocator).append(allocator.text(":")).append(s)),
+                allocator.text(",").append(allocator.line()),
+            )
+            .group();
+        let body = self.body.pretty(allocator);
+        let imp = self
+            .head
+            .pretty(allocator)
+            .append(allocator.line())
+            .append(allocator.text("⇐"))
+            .group()
+            .append(allocator.line().append(body).nest(2))
+            .group();
+        allocator
+            .text("∀")
+            .append(vars.nest(2))
+            .append(allocator.text("."))
+            .append(allocator.line().append(imp).nest(2))
+            .group()
+    }
+}
+
+impl Clause {
+    /// Replaces the user-defined predicates and functions `renaming` maps.
+    pub fn rename_user_defined(&mut self, renaming: &UserDefinedRenaming) {
+        self.head.rename_user_defined(renaming);
+        self.body.rename_user_defined(renaming);
+    }
+
+    pub fn is_nop(&self) -> bool {
+        self.head.is_top() || self.body.is_bottom()
+    }
+}
+
+/// A command specified using `thrust::raw_command` attribute
+///
+/// Those will be directly inserted into the generated SMT-LIB2 file.
+#[derive(Debug, Clone)]
+pub struct RawCommand {
+    pub command: String,
+}
+
+/// A selector for a datatype constructor.
+///
+/// A selector is a function that extracts a field from a datatype value.
+/// Through currently we don't use selectors to access datatype fields in [`Term`]s,
+/// we require the symbol as selector name to emit SMT-LIB2 representation of datatypes.
+#[derive(Debug, Clone)]
+pub struct DatatypeSelector {
+    pub symbol: DatatypeSymbol,
+    pub sort: Sort,
+}
+
+/// A datatype constructor.
+#[derive(Debug, Clone)]
+pub struct DatatypeCtor {
+    pub symbol: DatatypeSymbol,
+    pub selectors: Vec<DatatypeSelector>,
+    pub discriminant: BigInt,
+}
+
+/// A datatype definition.
+#[derive(Debug, Clone)]
+pub struct Datatype {
+    pub symbol: DatatypeSymbol,
+    pub params: usize,
+    pub ctors: Vec<DatatypeCtor>,
+}
+
+impl Datatype {
+    pub fn selectors(&self) -> impl Iterator<Item = &DatatypeSelector> {
+        self.ctors.iter().flat_map(|ctor| ctor.selectors.iter())
+    }
+}
+
+rustc_index::newtype_index! {
+    /// An index of [`Clause`].
+    ///
+    /// [`System`] contains `IndexVec<ClauseId, Clause>` that manages the indices and the clauses.
+    #[debug_format = "c{}"]
+    pub struct ClauseId { }
+}
+
+pub type PredSig = Vec<Sort>;
+
+/// A predicate variable definition.
+#[derive(Debug, Clone)]
+pub struct PredVarDef {
+    pub sig: PredSig,
+    /// We may attach a debug information to include in the resulting SMT-LIB2 file to indicate the
+    /// origin of predicate variables.
+    pub debug_info: DebugInfo,
+}
+
+pub type UserDefinedPredSig = Vec<(String, Sort)>;
+
+/// The body of a user-defined predicate.
+///
+/// A predicate can be defined either by a raw SMT-LIB2 string (inserted into the
+/// generated `define-fun` verbatim) or by a [`Formula`] translated from a Rust
+/// expression via the `formula_fn` infrastructure. A [`Term`] body, with its sort, defines a
+/// function instead, which [`Term::UserDefinedFn`] calls.
+#[derive(Debug, Clone)]
+pub enum UserDefinedPredBody {
+    Raw(String),
+    Formula(Formula<TermVarIdx>),
+    Term(Sort, Term<TermVarIdx>),
+    /// No body: an unknown of the system, a `#[thrust_macros::predicate(derived)]` of a trait at
+    /// an impl that leaves it out, inferred like a loop invariant (`analyze::derived_pred`).
+    Derived,
+}
+
+impl UserDefinedPredBody {
+    /// Replaces the user-defined predicates and functions `renaming` maps. A raw SMT-LIB2 body
+    /// is left as written.
+    fn rename_user_defined(&mut self, renaming: &UserDefinedRenaming) {
+        match self {
+            UserDefinedPredBody::Formula(formula) => formula.rename_user_defined(renaming),
+            UserDefinedPredBody::Term(_, term) => term.rename_user_defined(renaming),
+            UserDefinedPredBody::Raw(_) | UserDefinedPredBody::Derived => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UserDefinedPredDef {
+    symbol: UserDefinedPred,
+    sig: UserDefinedPredSig,
+    body: UserDefinedPredBody,
+    /// Forall sorts to replace in `body` when the definition is emitted. A copy
+    /// of a generic item's predicate emitted at one instantiation keeps the
+    /// source's body text and carries the substitution here, because the sort
+    /// names a binder needs are only settled once the datatype renaming is.
+    pub sort_subst: Vec<(ForallSortIdx, Sort)>,
+    /// `ForallPred`s referenced from `body`. Populated just before dependency
+    /// analysis by `System::populate_user_defined_pred_dependencies`.
+    pub dependencies: HashSet<ForallPred>,
+    /// The variant of a recursive logic function, emitted as the `:decreases` annotation of its
+    /// body so that the solver can take the function as total.
+    pub decreases: Option<Term<TermVarIdx>>,
+    /// The facts of a logic function's result type stated of its value, a formula over its
+    /// parameters that its definition makes true at every argument. Emitted as the `:law` of the
+    /// function's declaration when it is opaque ([`System::make_opaque`]), which would otherwise
+    /// lose them with the definition.
+    pub result_facts: Option<Formula<TermVarIdx>>,
+}
+
+/// The forall predicates and functions `atoms` apply, as predicates or in their arguments, and in
+/// their guards, as `user_defined_in` reads them.
+fn forall_in<'a, V: 'a>(atoms: impl Iterator<Item = &'a Atom<V>>) -> Vec<&'a ForallPred> {
+    atoms
+        .flat_map(|atom| {
+            let pred = match &atom.pred {
+                Pred::ForallPred(pred) => Some(pred),
+                _ => None,
+            };
+            let in_guard = atom
+                .guard
+                .iter()
+                .flat_map(|guard| forall_in(guard.iter_atoms()));
+            pred.into_iter()
+                .chain(atom.args.iter().flat_map(Term::forall_fns))
+                .chain(in_guard)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `atoms` and the atoms of their guards, recursively.
+fn atoms_with_guards<'a, V: 'a>(atoms: impl Iterator<Item = &'a Atom<V>>) -> Vec<&'a Atom<V>> {
+    atoms
+        .flat_map(|atom| {
+            let in_guard = atom
+                .guard
+                .iter()
+                .flat_map(|guard| atoms_with_guards(guard.iter_atoms()));
+            std::iter::once(atom).chain(in_guard).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The unknowns `atoms` apply, in their guards too.
+fn pred_vars_in<'a, V: 'a>(atoms: impl Iterator<Item = &'a Atom<V>>) -> Vec<PredVarId> {
+    atoms
+        .flat_map(|atom| {
+            let applied = match atom.pred {
+                Pred::Var(p) => Some(p),
+                _ => None,
+            };
+            let in_guard = atom
+                .guard
+                .iter()
+                .flat_map(|guard| pred_vars_in(guard.iter_atoms()));
+            applied.into_iter().chain(in_guard).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The user-defined predicates and functions `atoms` apply, as predicates or in their arguments.
+fn user_defined_in<'a, V: 'a>(
+    atoms: impl Iterator<Item = &'a Atom<V>>,
+) -> Vec<&'a UserDefinedPred> {
+    atoms
+        .flat_map(|atom| {
+            let pred = match &atom.pred {
+                Pred::UserDefined(pred) => Some(pred),
+                _ => None,
+            };
+            let in_guard = atom
+                .guard
+                .iter()
+                .flat_map(|guard| user_defined_in(guard.iter_atoms()));
+            pred.into_iter()
+                .chain(atom.args.iter().flat_map(Term::user_defined_fns))
+                .chain(in_guard)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+impl UserDefinedPredDef {
+    /// The user-defined predicates and functions the body calls.
+    fn callees(&self) -> Vec<&UserDefinedPred> {
+        match &self.body {
+            UserDefinedPredBody::Raw(_) | UserDefinedPredBody::Derived => Vec::new(),
+            UserDefinedPredBody::Formula(formula) => user_defined_in(formula.iter_atoms()),
+            UserDefinedPredBody::Term(_, term) => term.user_defined_fns(),
+        }
+    }
+
+    /// Whether this is a derived predicate, an unknown with no body.
+    pub fn is_derived(&self) -> bool {
+        matches!(self.body, UserDefinedPredBody::Derived)
+    }
+
+    /// Whether the body calls the definition itself, which makes it a `define-fun-rec`.
+    pub fn is_recursive(&self) -> bool {
+        self.callees().contains(&&self.symbol)
+    }
+}
+
+/// A short name of a set of revealed predicates, sorted: an FNV-1a hash of their symbols and
+/// instances, stable across runs.
+fn revealed_set_tag(revealed: &[&UserDefinedPred]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for pred in revealed {
+        for byte in format!("{};{:?}|", pred.inner, pred.instance).bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+pub fn compute_transitive_closure<T>(direct_deps: &HashMap<T, HashSet<T>>) -> HashMap<T, HashSet<T>>
+where
+    T: Clone + Eq + Hash,
+{
+    let mut closure = HashMap::new();
+
+    for start_id in direct_deps.keys() {
+        let mut visited = HashSet::new();
+        let mut stack = vec![start_id.clone()];
+
+        // Search by DFS
+        while let Some(current_id) = stack.pop() {
+            if let Some(deps) = direct_deps.get(&current_id) {
+                for next_id in deps {
+                    if visited.insert(next_id.clone()) {
+                        stack.push(next_id.clone());
+                    }
+                }
+            }
+        }
+
+        closure.insert(start_id.clone(), visited);
+    }
+
+    closure
+}
+
+/// A thing that can be referenced from a clause body and contribute to the
+/// transitive dependency closure: a predicate variable, or a user-defined
+/// predicate whose body may call `ForallPred`s.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub enum ExistsDep {
+    PredVar(PredVarId),
+    UserDefined(UserDefinedPred),
+}
+
+/// Whether predicate variables are reachable from a formula through the definitions of the
+/// user-defined predicates it calls: `found` when one is, `undefined` when a called predicate has
+/// no definition yet (an instance queued for emission), so that its body is not known.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PredVarReach {
+    pub found: bool,
+    pub undefined: bool,
+}
+
+impl PredVarReach {
+    pub fn join(&mut self, other: PredVarReach) {
+        self.found |= other.found;
+        self.undefined |= other.undefined;
+    }
+}
+
+/// A CHC system.
+#[derive(Debug, Clone, Default)]
+pub struct System {
+    pub raw_commands: Vec<RawCommand>,
+    pub datatypes: Vec<Datatype>,
+    pub user_defined_pred_defs: Vec<UserDefinedPredDef>,
+    pub clauses: IndexVec<ClauseId, Clause>,
+    pub pred_vars: IndexVec<PredVarId, PredVarDef>,
+    pub forall_sorts: Vec<ForallSortDef>,
+    pub num_forall_sort_idx: ForallSortIdx,
+    /// Reverse map from [`ForallSortIdx`] to the local index of the type
+    /// parameter it was issued for, populated by the analyzer. Used during
+    /// datatype monomorphization to substitute `Sort::Forall` placeholders
+    /// in ADT field types with the corresponding generic argument.
+    ///
+    /// Only entries for `analyze::TypeParam::GenericType` are recorded.
+    /// `analyze::TypeParam::AssocType` forall sorts are intentionally omitted
+    /// and remain as opaque forall sorts in the SMT output.
+    pub type_params_reverse: HashMap<ForallSortIdx, u32>,
+    // A `BTreeSet`, not a `HashSet`: iterated directly to emit
+    // `declare-forall-fun` blocks in `smtlib2::System::fmt`, so its
+    // iteration order is the emitted order.
+    forall_pred_vars: BTreeSet<ForallPred>,
+    /// The laws stated of each forall predicate: closed formulas that hold of
+    /// every interpretation the clauses are meant for. They are emitted as the
+    /// `:law` of the predicate's `declare-forall-fun`, which the solver inserts
+    /// as a premise into every clause that mentions the predicate.
+    laws: BTreeMap<ForallPred, Vec<Formula<TermVarIdx>>>,
+    /// Candidate atoms of loop heads' predicate variables (`THRUST_CANDIDATE_ATOMS`), emitted
+    /// as `(set-info :candidates ...)` and never asserted.
+    candidate_atoms: Vec<CandidateAtoms>,
+    user_quantified_var_count: usize,
+    /// Predicate variables pushed together with every clause that defines them, independently of
+    /// any analysis of a body at an instance: a reachability check for unknowns
+    /// ([`System::pred_var_reach_of`]) does not count them. The `hist_inv!` relation of an
+    /// `FnMut` closure's by-value captures is one: its laws come with it and each call's step
+    /// from the closure's own body.
+    self_defined_pred_vars: HashSet<PredVarId>,
+    /// The source name of each quantified variable issued with one, named in a comment of the
+    /// SMT-LIB2 output when logging is on.
+    user_quantified_var_names: BTreeMap<usize, String>,
+    /// The defined predicates and logic functions emitted without their definition, as universal
+    /// functions (`#[thrust::opaque]`, see [`System::make_opaque`]).
+    opaque_preds: HashSet<UserDefinedPred>,
+    /// The defined copies [`System::reveal_in`] made, which are not copied again.
+    defined_copies: HashSet<UserDefinedPred>,
+}
+
+impl System {
+    /// Emits `pred`, a defined predicate or logic function, as a universal function of its
+    /// parameters, without its definition, to a solver that reads universal functions
+    /// (`Capabilities::dependency_aware_declarations`). The clauses then have to hold for every
+    /// interpretation of it, so a solution is also one for its definition: a strengthening, as
+    /// any opaque function of Dafny, Verus or Creusot is. Every unknown may depend on it, as it
+    /// may on the definition. Only a closed definition may be hidden so
+    /// ([`System::definition_applies_unknown`]).
+    pub fn make_opaque(&mut self, pred: UserDefinedPred) {
+        self.opaque_preds.insert(pred);
+    }
+
+    pub fn is_opaque(&self, pred: &UserDefinedPred) -> bool {
+        self.opaque_preds.contains(pred)
+    }
+
+    /// Lets the clauses `ids` read the definitions of the opaque `preds`. Each is replaced there by
+    /// a defined copy, and so is every definition that applies one of them, directly or through
+    /// other definitions. A copy is the same definition under another name, reading the copies in
+    /// turn, so that the revealed definition is the whole one, as through a transparent function
+    /// under Dafny's and Verus's `reveal`. The copies are named after the revealed set
+    /// (`<symbol>_def_<tag>`), so that two reveals of different sets never share a copy whose body
+    /// reads the other's. Every other clause keeps the universal symbol. Instantiating the
+    /// universal symbols with their definitions makes every copy equal to its original, so the
+    /// reveal adds only true definitions. This is the scope of Dafny's and Verus's `reveal`: the
+    /// proof it is written in.
+    pub fn reveal_in(&mut self, ids: &[ClauseId], preds: &[UserDefinedPred]) {
+        let mut revealed: Vec<&UserDefinedPred> = preds
+            .iter()
+            .filter(|p| self.opaque_preds.contains(p) && self.is_pred_defined(p))
+            .collect();
+        if revealed.is_empty() {
+            return;
+        }
+        revealed.sort_by(|a, b| {
+            a.inner
+                .cmp(&b.inner)
+                .then_with(|| a.instance.cmp(&b.instance))
+        });
+        revealed.dedup();
+        let tag = revealed_set_tag(&revealed);
+        let mut renaming: UserDefinedRenaming = revealed
+            .iter()
+            .map(|&p| (p.clone(), p.defined_copy(&tag)))
+            .collect();
+        // The transparent definitions that reach a revealed one; an opaque one that is not
+        // revealed stays universal.
+        loop {
+            let reaching: Vec<UserDefinedPred> = self
+                .user_defined_pred_defs
+                .iter()
+                .filter(|d| {
+                    !renaming.contains_key(&d.symbol)
+                        && !self.opaque_preds.contains(&d.symbol)
+                        && !self.defined_copies.contains(&d.symbol)
+                })
+                .filter(|d| d.callees().into_iter().any(|c| renaming.contains_key(c)))
+                .map(|d| d.symbol.clone())
+                .collect();
+            if reaching.is_empty() {
+                break;
+            }
+            for symbol in reaching {
+                let copy = symbol.defined_copy(&tag);
+                renaming.insert(symbol, copy);
+            }
+        }
+        let copies: Vec<UserDefinedPredDef> = self
+            .user_defined_pred_defs
+            .iter()
+            .filter(|d| {
+                renaming.contains_key(&d.symbol) && !self.is_pred_defined(&renaming[&d.symbol])
+            })
+            .map(|d| {
+                let mut copy = d.clone();
+                copy.symbol = renaming[&d.symbol].clone();
+                copy.body.rename_user_defined(&renaming);
+                copy
+            })
+            .collect();
+        self.defined_copies
+            .extend(copies.iter().map(|c| c.symbol.clone()));
+        self.user_defined_pred_defs.extend(copies);
+        for &id in ids {
+            self.clauses[id].rename_user_defined(&renaming);
+        }
+    }
+
+    /// Visits the atoms of the formula definitions of `symbol`, their guards' included, and of the
+    /// user-defined predicates and functions they apply (as atoms, in guards or in term
+    /// arguments, `UserDefinedPredDef::callees`), each once; `None` for a symbol without a
+    /// definition. A raw SMT-LIB2 body names no predicate variable, since those are numbered by
+    /// the analysis, and a term body applies none, since a predicate call is an atom and only a
+    /// logic function becomes a term (`analyze::annot_fn`); its callees are still followed.
+    fn walk_definitions<'a>(
+        &'a self,
+        symbol: &'a UserDefinedPred,
+        mut visit: impl FnMut(Option<&'a Atom<TermVarIdx>>),
+    ) {
+        let mut pending = vec![symbol];
+        let mut seen: HashSet<&UserDefinedPred> = HashSet::new();
+        while let Some(symbol) = pending.pop() {
+            if !seen.insert(symbol) {
+                continue;
+            }
+            let mut defs = self
+                .user_defined_pred_defs
+                .iter()
+                .filter(|d| &d.symbol == symbol)
+                .peekable();
+            if defs.peek().is_none() {
+                visit(None);
+            }
+            for def in defs {
+                pending.extend(def.callees());
+                let UserDefinedPredBody::Formula(formula) = &def.body else {
+                    continue;
+                };
+                for atom in atoms_with_guards(formula.iter_atoms()) {
+                    visit(Some(atom));
+                }
+            }
+        }
+    }
+
+    /// Whether the definition of `pred` applies an unknown, directly or through the definitions
+    /// it applies. A derived predicate (`UserDefinedPredBody::Derived`) is declared before the
+    /// opaque functions (`smtlib2::System`), so it cannot depend on them, and a definition that
+    /// applies one is closed for this purpose.
+    pub fn definition_applies_unknown(&self, pred: &UserDefinedPred) -> bool {
+        let mut found = false;
+        self.walk_definitions(pred, |atom| {
+            found |= matches!(
+                atom,
+                Some(Atom {
+                    pred: Pred::Var(_),
+                    ..
+                })
+            );
+        });
+        found
+    }
+
+    fn user_defined_preds_in_dependency_order(&self) -> Vec<&UserDefinedPredDef> {
+        let mut remaining: Vec<_> = self.user_defined_pred_defs.iter().collect();
+        let mut ordered = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let next = remaining
+                .iter()
+                .position(|def| {
+                    def.callees().into_iter().all(|callee| {
+                        *callee == def.symbol
+                            || !remaining
+                                .iter()
+                                .any(|dependency| dependency.symbol == *callee)
+                    })
+                })
+                .expect("mutually recursive definitions are not supported");
+            ordered.push(remaining.remove(next));
+        }
+        ordered
+    }
+
+    pub fn new_pred_var(&mut self, sig: PredSig, debug_info: DebugInfo) -> PredVarId {
+        self.pred_vars.push(PredVarDef { sig, debug_info })
+    }
+
+    pub fn register_forall_pred(&mut self, pred: ForallPred) {
+        self.forall_pred_vars.insert(pred);
+    }
+
+    pub fn forall_preds(&self) -> impl Iterator<Item = &ForallPred> {
+        self.forall_pred_vars.iter()
+    }
+
+    pub fn add_law(&mut self, pred: ForallPred, law: Formula<TermVarIdx>) {
+        self.laws.entry(pred).or_default().push(law);
+    }
+
+    pub fn push_candidate_atoms(&mut self, pred: PredVarId, atoms: Vec<Formula<TermVarIdx>>) {
+        self.candidate_atoms.push(CandidateAtoms { pred, atoms });
+    }
+
+    pub fn laws_of(&self, pred: &ForallPred) -> &[Formula<TermVarIdx>] {
+        self.laws.get(pred).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn new_forall_sort(&mut self, debug_info: DebugInfo) -> ForallSortIdx {
+        let new_idx = self.num_forall_sort_idx;
+        self.num_forall_sort_idx += 1;
+        self.forall_sorts
+            .push(ForallSortDef::new(new_idx, debug_info));
+        new_idx
+    }
+
+    pub fn new_user_quantified_var(&mut self) -> UserQuantifiedVarId {
+        let var = UserQuantifiedVarId::from_usize(self.user_quantified_var_count);
+        self.user_quantified_var_count += 1;
+        var
+    }
+
+    /// A quantified variable standing for `name` in the source or in a law.
+    pub fn new_named_user_quantified_var(
+        &mut self,
+        name: impl Into<String>,
+    ) -> UserQuantifiedVarId {
+        let var = self.new_user_quantified_var();
+        self.user_quantified_var_names
+            .insert(var.index(), name.into());
+        var
+    }
+
+    pub fn user_quantified_var_names(
+        &self,
+    ) -> impl Iterator<Item = (UserQuantifiedVarId, &str)> + '_ {
+        self.user_quantified_var_names
+            .iter()
+            .map(|(idx, name)| (UserQuantifiedVarId::from_usize(*idx), name.as_str()))
+    }
+
+    pub fn push_raw_command(&mut self, raw_command: RawCommand) {
+        self.raw_commands.push(raw_command)
+    }
+
+    pub fn push_pred_define(
+        &mut self,
+        symbol: UserDefinedPred,
+        sig: UserDefinedPredSig,
+        body: String,
+    ) {
+        self.push_pred_define_with_deps(symbol, sig, body, HashSet::new())
+    }
+
+    pub fn push_pred_define_with_deps(
+        &mut self,
+        symbol: UserDefinedPred,
+        sig: UserDefinedPredSig,
+        body: String,
+        dependencies: HashSet<ForallPred>,
+    ) {
+        self.user_defined_pred_defs.push(UserDefinedPredDef {
+            symbol,
+            sig,
+            body: UserDefinedPredBody::Raw(body),
+            sort_subst: Vec::new(),
+            dependencies,
+            decreases: None,
+            result_facts: None,
+        })
+    }
+
+    pub fn push_pred_define_formula(
+        &mut self,
+        symbol: UserDefinedPred,
+        arg_sorts: IndexVec<TermVarIdx, Sort>,
+        formula: Formula<TermVarIdx>,
+    ) {
+        let sig = arg_sorts
+            .into_iter_enumerated()
+            .map(|(var, sort)| (var.to_string(), sort))
+            .collect();
+        self.user_defined_pred_defs.push(UserDefinedPredDef {
+            symbol,
+            sig,
+            body: UserDefinedPredBody::Formula(formula),
+            sort_subst: Vec::new(),
+            dependencies: HashSet::new(),
+            decreases: None,
+            result_facts: None,
+        })
+    }
+
+    pub fn push_fn_define_term(
+        &mut self,
+        symbol: UserDefinedPred,
+        arg_sorts: IndexVec<TermVarIdx, Sort>,
+        ret_sort: Sort,
+        body: Term<TermVarIdx>,
+        decreases: Option<Term<TermVarIdx>>,
+    ) {
+        let sig = arg_sorts
+            .into_iter_enumerated()
+            .map(|(var, sort)| (var.to_string(), sort))
+            .collect();
+        self.user_defined_pred_defs.push(UserDefinedPredDef {
+            symbol,
+            sig,
+            body: UserDefinedPredBody::Term(ret_sort, body),
+            sort_subst: Vec::new(),
+            dependencies: HashSet::new(),
+            decreases,
+            result_facts: None,
+        })
+    }
+
+    /// States `facts`, a formula over the parameters of the logic function `symbol` defined
+    /// before, of its value at every argument ([`UserDefinedPredDef::result_facts`]).
+    pub fn set_result_facts(&mut self, symbol: &UserDefinedPred, facts: Formula<TermVarIdx>) {
+        let def = self
+            .user_defined_pred_defs
+            .iter_mut()
+            .find(|def| &def.symbol == symbol)
+            .expect("the logic function is defined");
+        def.result_facts = Some(facts);
+    }
+
+    /// Declares `symbol` as an unknown of the system ([`UserDefinedPredBody::Derived`]).
+    pub fn push_derived_pred(&mut self, symbol: UserDefinedPred, sig: UserDefinedPredSig) {
+        self.user_defined_pred_defs.push(UserDefinedPredDef {
+            symbol,
+            sig,
+            body: UserDefinedPredBody::Derived,
+            sort_subst: Vec::new(),
+            dependencies: HashSet::new(),
+            decreases: None,
+            result_facts: None,
+        })
+    }
+
+    /// Defines `symbol` as `body` read under `sort_subst`, the substitution that
+    /// takes the declaring item's forall sorts to one instantiation of them.
+    pub fn push_pred_define_at_instance(
+        &mut self,
+        symbol: UserDefinedPred,
+        sig: UserDefinedPredSig,
+        body: String,
+        sort_subst: Vec<(ForallSortIdx, Sort)>,
+    ) {
+        self.user_defined_pred_defs.push(UserDefinedPredDef {
+            symbol,
+            sig,
+            body: UserDefinedPredBody::Raw(body),
+            sort_subst,
+            dependencies: HashSet::new(),
+            decreases: None,
+            result_facts: None,
+        })
+    }
+
+    /// Records that `id` comes with every clause that defines it; see `self_defined_pred_vars`.
+    pub fn mark_self_defined(&mut self, id: PredVarId) {
+        self.self_defined_pred_vars.insert(id);
+    }
+
+    pub fn is_self_defined(&self, id: PredVarId) -> bool {
+        self.self_defined_pred_vars.contains(&id)
+    }
+
+    /// Whether `symbol` is a derived predicate, applies one through its definition, or is not
+    /// defined yet (a predicate instance emitted at the end, a derived one among them). When the
+    /// system has a derived predicate, a raw SMT-LIB2 body counts as applying one: its text may
+    /// name the derived predicate's symbol, and it is not read.
+    pub fn reaches_derived(&self, symbol: &UserDefinedPred) -> bool {
+        let has_derived = self.user_defined_pred_defs.iter().any(|d| d.is_derived());
+        let mut pending = vec![symbol];
+        let mut seen: HashSet<&UserDefinedPred> = HashSet::new();
+        while let Some(symbol) = pending.pop() {
+            if !seen.insert(symbol) {
+                continue;
+            }
+            let mut defs = self
+                .user_defined_pred_defs
+                .iter()
+                .filter(|d| &d.symbol == symbol)
+                .peekable();
+            if defs.peek().is_none() {
+                return true;
+            }
+            for def in defs {
+                match &def.body {
+                    UserDefinedPredBody::Derived => return true,
+                    UserDefinedPredBody::Formula(formula) => {
+                        pending.extend(user_defined_in(formula.iter_atoms()))
+                    }
+                    UserDefinedPredBody::Term(_, term) => pending.extend(term.user_defined_fns()),
+                    UserDefinedPredBody::Raw(_) if has_derived => return true,
+                    UserDefinedPredBody::Raw(_) => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// What the definition of `symbol`, and those of the user-defined predicates it calls, say
+    /// about predicate variables. A raw SMT-LIB2 body read off the source names none, since the
+    /// variables are numbered by the analysis.
+    pub fn pred_var_reach_of(&self, symbol: &UserDefinedPred) -> PredVarReach {
+        let mut reach = PredVarReach::default();
+        self.walk_definitions(symbol, |atom| match atom {
+            None => reach.undefined = true,
+            Some(Atom {
+                pred: Pred::Var(id),
+                ..
+            }) if !self.is_self_defined(*id) => reach.found = true,
+            Some(_) => {}
+        });
+        reach
+    }
+
+    /// The predicate variables some user-defined predicate's formula body applies, as the
+    /// contract of a closure left to inference does in a predicate instantiated at that closure.
+    pub fn pred_vars_in_definitions(&self) -> Vec<PredVarId> {
+        let mut ids: Vec<_> = self
+            .user_defined_pred_defs
+            .iter()
+            .filter_map(|def| match &def.body {
+                UserDefinedPredBody::Formula(formula) => Some(formula),
+                UserDefinedPredBody::Raw(_)
+                | UserDefinedPredBody::Term(..)
+                | UserDefinedPredBody::Derived => None,
+            })
+            .flat_map(|formula| pred_vars_in(formula.iter_atoms()))
+            .collect();
+        ids.sort_by_key(|id| id.index());
+        ids.dedup();
+        ids
+    }
+
+    pub fn is_pred_defined(&self, symbol: &UserDefinedPred) -> bool {
+        self.user_defined_pred_defs
+            .iter()
+            .any(|d| &d.symbol == symbol)
+    }
+
+    /// Scans every [`UserDefinedPredDef`]'s body for references to registered
+    /// [`ForallPred`]s and records the matches in `dependencies`.
+    ///
+    /// A formula body is scanned for `ForallPred` atoms directly. A raw
+    /// SMT-LIB2 body of a `#[thrust_macros::predicate]` is opaque to the
+    /// analyzer, so to still let dependency analysis see transitive
+    /// `ForallPred` uses, we look for the SMT-LIB2 representation of every
+    /// registered `ForallPred` as a substring of it. Must be called after every `ForallPred` has been registered
+    /// (i.e. after `crate::refine::template` and trait/closure pre/post
+    /// construction finish) and before [`System::compute_dependency`].
+    pub fn populate_user_defined_pred_dependencies(&mut self) {
+        use crate::chc::format_context::format_forall_pred_name;
+
+        let forall_names: Vec<(ForallPred, String)> = self
+            .forall_pred_vars
+            .iter()
+            .map(|pred| (pred.clone(), format_forall_pred_name(pred)))
+            .collect();
+
+        let mut user_defined_pred_defs = std::mem::take(&mut self.user_defined_pred_defs);
+        for udpd in &mut user_defined_pred_defs {
+            match &udpd.body {
+                UserDefinedPredBody::Raw(body) => {
+                    for (pred, name) in &forall_names {
+                        if body.contains(name.as_str()) {
+                            udpd.dependencies.insert(pred.clone());
+                        }
+                    }
+                }
+                UserDefinedPredBody::Term(_, term) => {
+                    udpd.dependencies
+                        .extend(term.forall_fns().into_iter().cloned());
+                    if let Some(decreases) = &udpd.decreases {
+                        udpd.dependencies
+                            .extend(decreases.forall_fns().into_iter().cloned());
+                    }
+                }
+                UserDefinedPredBody::Formula(formula) => {
+                    udpd.dependencies
+                        .extend(forall_in(formula.iter_atoms()).into_iter().cloned());
+                }
+                // Independent of every forall predicate: declared before them.
+                UserDefinedPredBody::Derived => {}
+            }
+        }
+        let callees: HashMap<UserDefinedPred, HashSet<UserDefinedPred>> = user_defined_pred_defs
+            .iter()
+            .map(|def| {
+                (
+                    def.symbol.clone(),
+                    def.callees().into_iter().cloned().collect(),
+                )
+            })
+            .collect();
+        let direct: HashMap<UserDefinedPred, HashSet<ForallPred>> = user_defined_pred_defs
+            .iter()
+            .map(|def| (def.symbol.clone(), def.dependencies.clone()))
+            .collect();
+        let reachable = compute_transitive_closure(&callees);
+        for udpd in &mut user_defined_pred_defs {
+            for callee in &reachable[&udpd.symbol] {
+                udpd.dependencies
+                    .extend(direct.get(callee).into_iter().flatten().cloned());
+            }
+        }
+        let with_laws: Vec<HashSet<ForallPred>> = {
+            let udp_deps = Self::udp_deps(&user_defined_pred_defs);
+            user_defined_pred_defs
+                .iter()
+                .map(|def| self.with_law_dependencies(def.dependencies.clone(), &udp_deps))
+                .collect()
+        };
+        for (udpd, deps) in user_defined_pred_defs.iter_mut().zip(with_laws) {
+            udpd.dependencies = deps;
+        }
+        self.user_defined_pred_defs = user_defined_pred_defs;
+    }
+
+    fn udp_deps(defs: &[UserDefinedPredDef]) -> HashMap<&UserDefinedPred, &HashSet<ForallPred>> {
+        defs.iter()
+            .map(|def| (&def.symbol, &def.dependencies))
+            .collect()
+    }
+
+    /// The forall predicates an atom applies: its predicate, or the body of the user-defined
+    /// predicate it applies, and its arguments (see [`Self::term_forall_preds`]).
+    fn atom_forall_preds<'a>(
+        atom: &'a Atom<TermVarIdx>,
+        udp_deps: &'a HashMap<&UserDefinedPred, &HashSet<ForallPred>>,
+    ) -> impl Iterator<Item = ForallPred> + 'a {
+        let pred: Vec<ForallPred> = match &atom.pred {
+            Pred::UserDefined(p) => udp_deps
+                .get(p)
+                .into_iter()
+                .flat_map(|deps| deps.iter().cloned())
+                .collect(),
+            pred => pred.clone().try_into().ok().into_iter().collect(),
+        };
+        pred.into_iter().chain(
+            atom.args
+                .iter()
+                .flat_map(|arg| Self::term_forall_preds(arg, udp_deps)),
+        )
+    }
+
+    /// The forall predicates a term applies, directly or through the bodies of the user-defined
+    /// functions it calls (`udp_deps`, closed over the definitions they call in turn).
+    fn term_forall_preds<'a>(
+        term: &'a Term<TermVarIdx>,
+        udp_deps: &'a HashMap<&UserDefinedPred, &HashSet<ForallPred>>,
+    ) -> impl Iterator<Item = ForallPred> + 'a {
+        let through_defs = term
+            .user_defined_fns()
+            .into_iter()
+            .filter_map(|f| udp_deps.get(f))
+            .flat_map(|deps| deps.iter());
+        term.forall_fns().into_iter().chain(through_defs).cloned()
+    }
+
+    /// The set of forall sorts whose default value is referenced (via
+    /// [`Term::ForallDefault`]) in some clause. Only these need a
+    /// `declare-forall-fun default_` definition in the SMT-LIB2 output.
+    pub fn used_forall_default_sorts(&self) -> HashSet<ForallSortIdx> {
+        let mut used = HashSet::new();
+        let clause_atoms = self.clauses.iter().flat_map(|clause| {
+            clause
+                .body
+                .iter_atoms()
+                .chain(std::iter::once(&clause.head))
+        });
+        let law_atoms = self.laws.values().flatten().flat_map(Formula::iter_atoms);
+        for atom in clause_atoms.chain(law_atoms) {
+            for arg in &atom.args {
+                collect_forall_defaults(arg, &mut used);
+            }
+        }
+        used
+    }
+
+    /// The set of forall sorts the SMT-LIB2 output actually mentions. Only these
+    /// need a `declare-forall-sort` line.
+    ///
+    /// `declare-forall-sort` is a CoAR extension. A solver that does not know it
+    /// answers `unsupported` for the line, and because a verdict is read by
+    /// matching the solver's whole output against `sat`/`unsat`, that stray word
+    /// turns an otherwise good answer into `Unknown` with nothing to point at.
+    /// Declaring a sort nothing refers to therefore costs a query its portability
+    /// and buys nothing, so leave those lines out.
+    ///
+    /// A sort counts as mentioned when it appears in a declared signature, in a
+    /// clause, in a datatype the output monomorphizes, or as the sort of a
+    /// `default_` constant. [`format_context::collect_sorts`] gathers the first
+    /// three from the same system the emitter reads. It can still report a sort
+    /// the finished query never names, because monomorphizing a datatype
+    /// substitutes the `Sort::Forall` standing in for one of its parameters, so
+    /// the answer errs towards keeping a declaration and never towards dropping
+    /// one the query goes on to use.
+    ///
+    /// The raw SMT-LIB2 bodies of `#[thrust_macros::predicate]` and
+    /// `#![thrust::raw_command]` are never parsed by the analyzer (a formula body's
+    /// sorts are collected like a clause's). They are searched for the
+    /// sort's printed name as a plain substring, the way
+    /// [`Self::populate_user_defined_pred_dependencies`] searches them for
+    /// `ForallPred` names. A substring match also fires on names that merely
+    /// contain the sort's, which keeps a declaration that could have been
+    /// dropped -- the harmless direction of a wrong guess.
+    pub fn used_forall_sorts(&self) -> HashSet<ForallSortIdx> {
+        let mut used = self.used_forall_default_sorts();
+
+        for sort in format_context::collect_sorts(self) {
+            sort.walk(|s| {
+                if let Sort::Forall(idx) = s {
+                    used.insert(*idx);
+                }
+            });
+        }
+
+        let opaque: Vec<&str> = self
+            .user_defined_pred_defs
+            .iter()
+            .filter_map(|d| match &d.body {
+                UserDefinedPredBody::Raw(body) => Some(body.as_str()),
+                UserDefinedPredBody::Formula(_)
+                | UserDefinedPredBody::Term(..)
+                | UserDefinedPredBody::Derived => None,
+            })
+            .chain(self.raw_commands.iter().map(|c| c.command.as_str()))
+            .collect();
+        if !opaque.is_empty() {
+            for def in &self.forall_sorts {
+                let name = def.idx.to_string();
+                if opaque.iter().any(|body| body.contains(name.as_str())) {
+                    used.insert(def.idx);
+                }
+            }
+        }
+
+        used
+    }
+
+    pub fn push_clause(&mut self, clause: Clause) -> Option<ClauseId> {
+        if clause.is_nop() {
+            return None;
+        }
+        tracing::debug!(clause = %clause.display(), id = ?self.clauses.next_index(), "push_clause");
+        Some(self.clauses.push(clause))
+    }
+
+    fn compute_forall_dependency(
+        &self,
+        clause: &Clause,
+        udp_deps: &HashMap<&UserDefinedPred, &HashSet<ForallPred>>,
+    ) -> HashSet<ForallPred> {
+        let mut preds: HashSet<ForallPred> = clause
+            .body
+            .iter_atoms()
+            .filter_map(|atom| atom.pred.clone().try_into().ok())
+            .collect();
+        let atoms = clause
+            .body
+            .iter_atoms()
+            .chain(std::iter::once(&clause.head));
+        preds.extend(
+            atoms
+                .flat_map(|atom| &atom.args)
+                .flat_map(|arg| Self::term_forall_preds(arg, udp_deps)),
+        );
+        self.with_law_dependencies(preds, udp_deps)
+    }
+
+    /// Adds the forall predicates named by the laws of `preds`, directly or through the
+    /// definitions they apply: a law is a premise of every clause that mentions its predicate,
+    /// so the unknowns of that clause depend on them.
+    fn with_law_dependencies(
+        &self,
+        mut preds: HashSet<ForallPred>,
+        udp_deps: &HashMap<&UserDefinedPred, &HashSet<ForallPred>>,
+    ) -> HashSet<ForallPred> {
+        let in_laws: Vec<ForallPred> = preds
+            .iter()
+            .flat_map(|pred| self.laws_of(pred))
+            .flat_map(|law| law.iter_atoms())
+            .flat_map(|atom| Self::atom_forall_preds(atom, udp_deps))
+            .collect();
+        preds.extend(in_laws);
+        preds
+    }
+
+    /// The predicate variables a clause defines: its head, and each one that occurs negatively
+    /// in its body. A body `φ ∧ ¬ψ` is the clause `φ ⇒ ψ`, which is how a call's quantified
+    /// precondition (`∀c x. pre(c, x)`) is put, so a predicate variable in `ψ` is solved from
+    /// the rest of the clause as a head is. The polarity is followed into the formula bodies of
+    /// the user-defined predicates the clause applies (`bodies`), which may apply predicate
+    /// variables in turn.
+    fn head_pred_vars<'a>(
+        clause: &'a Clause,
+        bodies: &HashMap<&'a UserDefinedPred, &'a Formula>,
+    ) -> Vec<PredVarId> {
+        struct Walk<'a, 'b> {
+            bodies: &'b HashMap<&'a UserDefinedPred, &'a Formula>,
+            entered: HashSet<(&'a UserDefinedPred, bool)>,
+            heads: Vec<PredVarId>,
+        }
+        impl<'a> Walk<'a, '_> {
+            fn atom(&mut self, atom: &'a Atom<TermVarIdx>, positive: bool) {
+                match &atom.pred {
+                    Pred::Var(id) if !positive => self.heads.push(*id),
+                    Pred::UserDefined(pred) => {
+                        let Some(body) = self.bodies.get(pred).copied() else {
+                            return;
+                        };
+                        if self.entered.insert((pred, positive)) {
+                            self.formula(body, positive);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn formula(&mut self, formula: &'a Formula, positive: bool) {
+                match formula {
+                    Formula::Atom(atom) => self.atom(atom, positive),
+                    Formula::Not(f) => self.formula(f, !positive),
+                    Formula::And(fs) | Formula::Or(fs) => {
+                        fs.iter().for_each(|f| self.formula(f, positive))
+                    }
+                    Formula::Implies(lhs, rhs) => {
+                        self.formula(lhs, !positive);
+                        self.formula(rhs, positive);
+                    }
+                    Formula::Exists(_, f) | Formula::Forall(_, f) => self.formula(f, positive),
+                }
+            }
+        }
+        let mut walk = Walk {
+            bodies,
+            entered: HashSet::new(),
+            heads: Vec::new(),
+        };
+        if let Pred::Var(head_id) = clause.head.pred {
+            walk.heads.push(head_id);
+        }
+        clause
+            .body
+            .atoms
+            .iter()
+            .for_each(|atom| walk.atom(atom, true));
+        walk.formula(&clause.body.formula, true);
+        let mut seen = HashSet::new();
+        walk.heads.retain(|id| seen.insert(*id));
+        walk.heads
+    }
+
+    /// The forall predicates of what a clause concludes: its head, and the part of its body
+    /// that occurs negatively (`φ ∧ ¬ψ`, the clause `φ ⇒ ψ`, which is how an ensures is
+    /// checked). A user-defined predicate or function there contributes the forall predicates of
+    /// its body.
+    fn conclusion_forall_preds(
+        &self,
+        clause: &Clause,
+        udp_deps: &HashMap<&UserDefinedPred, &HashSet<ForallPred>>,
+    ) -> HashSet<ForallPred> {
+        fn walk(
+            formula: &Formula,
+            positive: bool,
+            udp_deps: &HashMap<&UserDefinedPred, &HashSet<ForallPred>>,
+            preds: &mut HashSet<ForallPred>,
+        ) {
+            match formula {
+                Formula::Atom(atom) if !positive => {
+                    preds.extend(System::atom_forall_preds(atom, udp_deps))
+                }
+                Formula::Atom(_) => {}
+                Formula::Not(f) => walk(f, !positive, udp_deps, preds),
+                Formula::And(fs) | Formula::Or(fs) => {
+                    fs.iter().for_each(|f| walk(f, positive, udp_deps, preds))
+                }
+                Formula::Implies(lhs, rhs) => {
+                    walk(lhs, !positive, udp_deps, preds);
+                    walk(rhs, positive, udp_deps, preds);
+                }
+                Formula::Exists(_, f) | Formula::Forall(_, f) => walk(f, positive, udp_deps, preds),
+            }
+        }
+        let mut preds: HashSet<ForallPred> =
+            Self::atom_forall_preds(&clause.head, udp_deps).collect();
+        walk(&clause.body.formula, true, udp_deps, &mut preds);
+        self.with_law_dependencies(preds, udp_deps)
+    }
+
+    /// The forall predicates each predicate variable needs to imply what follows it: an
+    /// unknown in the body of a clause must be strong enough for the clause's conclusion, and
+    /// so for the conclusions of the clauses its successors (the predicate variables the clause
+    /// defines) occur in, transitively. Without these, a loop head could not name a forall
+    /// predicate that only the enclosing function's ensures mentions.
+    fn compute_conclusion_dependency(
+        &self,
+        bodies: &HashMap<&UserDefinedPred, &Formula>,
+        udp_deps: &HashMap<&UserDefinedPred, &HashSet<ForallPred>>,
+    ) -> HashMap<PredVarId, BTreeSet<ForallPred>> {
+        let mut direct: HashMap<PredVarId, BTreeSet<ForallPred>> = HashMap::new();
+        let mut successors: HashMap<PredVarId, HashSet<PredVarId>> = HashMap::new();
+        for clause in &self.clauses {
+            let heads = Self::head_pred_vars(clause, bodies);
+            let conclusion = self.conclusion_forall_preds(clause, udp_deps);
+            let sources = clause.body.iter_atoms().filter_map(|atom| match atom.pred {
+                Pred::Var(id) if !heads.contains(&id) => Some(id),
+                _ => None,
+            });
+            for source in sources {
+                direct
+                    .entry(source)
+                    .or_default()
+                    .extend(conclusion.iter().cloned());
+                successors
+                    .entry(source)
+                    .or_default()
+                    .extend(heads.iter().copied());
+            }
+        }
+        compute_transitive_closure(&successors)
+            .into_iter()
+            .map(|(pred, reachable)| {
+                let mut deps = direct.get(&pred).cloned().unwrap_or_default();
+                for r in &reachable {
+                    deps.extend(direct.get(r).into_iter().flatten().cloned());
+                }
+                (pred, deps)
+            })
+            .collect()
+    }
+
+    fn compute_exists_dependency(clause: &Clause) -> HashSet<ExistsDep> {
+        clause
+            .body
+            .iter_atoms()
+            .filter_map(|atom| match &atom.pred {
+                Pred::Var(id) => Some(ExistsDep::PredVar(*id)),
+                Pred::UserDefined(p) => Some(ExistsDep::UserDefined(p.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // The value sets are `BTreeSet`, not `HashSet`: they end up as the
+    // `dependencies` of a `DepExistsPredVarDef`, which iterates them
+    // directly at print time to list a `declare-dep-exists-fun`'s
+    // dependencies, so their iteration order is the emitted order.
+    fn compute_dependency(&self) -> HashMap<PredVarId, BTreeSet<ForallPred>> {
+        let mut exists_deps: HashMap<ExistsDep, HashSet<ExistsDep>> = HashMap::new();
+        let mut forall_deps: HashMap<ExistsDep, BTreeSet<ForallPred>> = HashMap::new();
+
+        let bodies: HashMap<&UserDefinedPred, &Formula> = self
+            .user_defined_pred_defs
+            .iter()
+            .filter_map(|def| match &def.body {
+                UserDefinedPredBody::Formula(formula) => Some((&def.symbol, formula)),
+                _ => None,
+            })
+            .collect();
+        let udp_deps = Self::udp_deps(&self.user_defined_pred_defs);
+        for (clause_idx, clause) in self.clauses.iter_enumerated() {
+            let heads = Self::head_pred_vars(clause, &bodies);
+            if heads.is_empty() {
+                continue;
+            }
+
+            let exists = Self::compute_exists_dependency(clause);
+            let forall = self.compute_forall_dependency(clause, &udp_deps);
+
+            for head_id in heads {
+                tracing::debug!(
+                    "exists deps for {:?} at {:?}: {:?}",
+                    head_id,
+                    clause_idx,
+                    exists
+                );
+                let head_dep = ExistsDep::PredVar(head_id);
+                let mut exists = exists.clone();
+                exists.remove(&head_dep);
+                exists_deps
+                    .entry(head_dep.clone())
+                    .or_default()
+                    .extend(exists);
+                forall_deps
+                    .entry(head_dep)
+                    .or_default()
+                    .extend(forall.iter().cloned());
+            }
+        }
+        // Each `UserDefinedPred`'s body may call `ForallPred`s. We populate
+        // these lazily via `populate_user_defined_pred_dependencies`; thread
+        // them into the forall map so transitive propagation sees them.
+        // A formula body may also call other `UserDefinedPred`s and apply
+        // predicate variables, whose `ForallPred` uses then propagate through it.
+        for udpd in &self.user_defined_pred_defs {
+            if let UserDefinedPredBody::Formula(formula) = &udpd.body {
+                let callees: HashSet<_> = formula
+                    .iter_atoms()
+                    .filter_map(|atom| match &atom.pred {
+                        Pred::Var(id) => Some(ExistsDep::PredVar(*id)),
+                        Pred::UserDefined(p) => Some(ExistsDep::UserDefined(p.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if !callees.is_empty() {
+                    exists_deps
+                        .entry(ExistsDep::UserDefined(udpd.symbol.clone()))
+                        .or_default()
+                        .extend(callees);
+                }
+            }
+            if !udpd.dependencies.is_empty() {
+                forall_deps
+                    .entry(ExistsDep::UserDefined(udpd.symbol.clone()))
+                    .or_default()
+                    .extend(udpd.dependencies.iter().cloned());
+            }
+        }
+        tracing::debug!("direct forall dependencies: {:#?}", forall_deps);
+        tracing::debug!("direct exists dependencies: {:#?}", exists_deps);
+
+        let transitive_exists_deps = compute_transitive_closure(&exists_deps);
+        tracing::debug!("transitive exists dependencies: {:#?}", exists_deps);
+
+        let mut propagated_forall_deps = HashMap::new();
+
+        for (dep, reachable) in transitive_exists_deps {
+            let ExistsDep::PredVar(pred) = dep else {
+                // Only `PredVar` heads appear as `dep` keys here: a clause
+                // head is always `Pred::Var` (see the loop above). Other
+                // variants would only be reachable successors.
+                continue;
+            };
+
+            // Direct ForallPred deps of the head predicate variable (those
+            // `ForallPred` atoms that appear directly in the clause body of
+            // `pred`). The transitive-closure result excludes the start node
+            // itself, so we add this here explicitly.
+            let mut deps = forall_deps.get(&dep).cloned().unwrap_or_default();
+
+            // ForallPred deps contributed by each reachable successor
+            // (`PredVar` or `UserDefinedPred`).
+            for r in &reachable {
+                if let Some(foralls) = forall_deps.get(r) {
+                    deps.extend(foralls.iter().cloned());
+                }
+            }
+
+            propagated_forall_deps.insert(pred, deps);
+        }
+
+        // Only the unknowns some clause defines get a dependency list; one that only occurs in
+        // bodies stays undeclared as before.
+        for (pred, deps) in self.compute_conclusion_dependency(&bodies, &udp_deps) {
+            if let Some(propagated) = propagated_forall_deps.get_mut(&pred) {
+                propagated.extend(deps);
+            }
+        }
+
+        propagated_forall_deps
+    }
+
+    /// Each symbol the query declares for a datatype, with what it stands for (see
+    /// [`format_context::FormatContext::declared_symbols`]).
+    pub fn declared_symbols(
+        &self,
+        capabilities: Capabilities,
+    ) -> Vec<(String, format_context::DeclaredSymbol)> {
+        format_context::FormatContext::from_system(self, capabilities).declared_symbols()
+    }
+
+    pub fn smtlib2(&self, capabilities: Capabilities) -> smtlib2::System<'_> {
+        smtlib2::System::new(self, capabilities)
+    }
+
+    /// The query `config`'s solver is given, with the comments `config` decided on.
+    fn query(&self, config: &Config) -> smtlib2::System<'_> {
+        self.smtlib2(config.capabilities())
+            .with_comments(config.comments)
+    }
+
+    /// Solves the CHC using an external SMT solver.
+    ///
+    /// This method first performs some optimization of the CHC,
+    /// then formats it to SMT-LIB2, and finally calls the configured CHC solver.
+    /// The solver and its arguments can be configured using environment
+    /// variables
+    /// (see the README, Configuration).
+    pub fn solve(&self) -> Result<(), CheckSatError> {
+        self.solve_with(Requests::default()).result
+    }
+
+    /// Solves the system, also asking the solver for the evidence `requests` names (see
+    /// [`Config::answers`]).
+    pub fn solve_with(&self, requests: Requests) -> Answer {
+        let config = Config::from_env();
+        let system = self.clone().prepared();
+        if let Ok(file) = std::env::var("THRUST_PRETTY_OUTPUT") {
+            let mut f = std::fs::File::create(file).unwrap();
+            for (idx, c) in system.clauses.iter_enumerated() {
+                use crate::pretty::PrettyDisplayExt as _;
+                use std::io::Write as _;
+                writeln!(f, "{:?}: {}", idx, c.display()).unwrap();
+            }
+        }
+        let query = system.query(&config).to_string();
+        if let Err(err) = config.save_query("thrust_output.smt2", &query) {
+            return Answer::of(Err(err.into()));
+        }
+        self.answer(&config, query, requests)
+    }
+
+    /// Solves a part of the system (see [`System::part`]) once more for the evidence `requests`
+    /// names. Its query was saved when its verdict was taken ([`System::solve_parts`]), so this
+    /// writes no file.
+    pub fn solve_part_with(&self, config: &Config, requests: Requests) -> Answer {
+        let query = self.clone().part_query(config);
+        self.answer(config, query, requests)
+    }
+
+    /// The query `config`'s solver is given for a part ([`System::part`]) and for a refutation,
+    /// which declares only what its clauses use and numbers its names within it
+    /// ([`standalone::standalone_query`]).
+    fn part_query(self, config: &Config) -> String {
+        standalone::standalone_query(&self.prepared().query(config).to_string())
+    }
+
+    /// The answer to `query`, the system's, with the evidence `requests` names.
+    fn answer(&self, config: &Config, query: String, requests: Requests) -> Answer {
+        // A verdict alone may be that of an earlier run (`THRUST_CACHE_DIR`); the cache keeps no
+        // model or refutation.
+        let mut answer = if config.answers(requests) {
+            config.check_sat_with(&query, requests)
+        } else {
+            Answer::of(cache::solve(config, cache::Cache::from_env().as_ref(), &query).result)
+        };
+        if requests.model {
+            answer.query = Some(query);
+        }
+        // The refutation is asked of a second run on the system with its goals marked, so that
+        // the verdict is the one the query alone gets.
+        let refuted = matches!(answer.result, Err(CheckSatError::Unsat));
+        if requests.proof && refuted && config.answers(requests) {
+            self.refute(config, &mut answer);
+        }
+        if refuted && config.asks_z3_to_refute(requests) {
+            self.refute_by_z3(&mut answer);
+        }
+        answer
+    }
+
+    /// Asks `config`'s solver for the refutation of the system, which is refuted, with its
+    /// clauses tagged and its goals marked. The query is made as a part's is
+    /// ([`System::part_query`]), so a part is refuted on the text its verdict was taken of; a
+    /// whole query left with fewer declarations is refuted whenever the whole one is.
+    fn refute(&self, config: &Config, answer: &mut Answer) {
+        let mut marked = self.clone();
+        answer.clause_tags = marked.tag_clauses();
+        answer.goal_markers = marked.mark_goals();
+        match config.refute(marked.part_query(config)) {
+            Ok(proof) => answer.proof = Some(proof),
+            Err(refused) => answer.z3_refused = Some(refused),
+        }
+    }
+
+    /// Asks `z3` for the refutation of the system, which another solver refuted (PCSat, which
+    /// gives none), when `z3` reads its query.
+    pub fn refute_by_z3(&self, answer: &mut Answer) {
+        if !self.z3_reads_same_query() {
+            return;
+        }
+        self.refute(&Config::z3_in_place_of_solver(), answer);
+        answer.proof_by_z3 = true;
+    }
+
+    /// Whether the query uses what `z3` does not read: a forall sort or a sequence in a clause,
+    /// an unknown's signature or a definition's.
+    pub fn needs_pcsat(&self) -> bool {
+        let unread = |sort: &Sort| {
+            let mut found = false;
+            sort.walk(|s| found |= matches!(s, Sort::Seq(_) | Sort::Forall(_)));
+            found
+        };
+        let vars = self.clauses.iter().flat_map(|c| c.vars.iter());
+        let sigs = self.pred_vars.iter().flat_map(|p| p.sig.iter());
+        let definitions = self
+            .user_defined_pred_defs
+            .iter()
+            .flat_map(|def| def.sig.iter().map(|(_, sort)| sort));
+        vars.chain(sigs).chain(definitions).any(unread)
+    }
+
+    /// Whether z3 reads the query a dependency-aware solver gets: it can read it, and the system
+    /// (a part keeps the definitions its clauses reach) defines no opaque function, whose
+    /// definition z3's query keeps.
+    pub fn z3_reads_same_query(&self) -> bool {
+        !self.needs_pcsat()
+            && !self
+                .user_defined_pred_defs
+                .iter()
+                .any(|def| self.opaque_preds.contains(&def.symbol))
+    }
+
+    /// Solves each of `parts` on its own: the classes of clauses that share an unknown
+    /// ([`System::components`]) or the cones of the goals ([`System::goal_cones`]), `jobs` at a
+    /// time, reusing the verdicts `THRUST_CACHE_DIR` keeps. The system is satisfiable exactly when
+    /// every part is. `THRUST_OUTPUT_DIR` gets each part's query as `thrust_output_part<i>.smt2`,
+    /// numbered from 1 as the parts are named.
+    pub fn solve_parts(&self, jobs: usize, parts: Vec<Vec<ClauseId>>) -> Vec<Part> {
+        let config = Config::from_env();
+        let cache = cache::Cache::from_env();
+        let solve = |i: usize| {
+            let query = self.part(&parts[i]).part_query(&config);
+            let file = format!("thrust_output_part{}.smt2", i + 1);
+            if let Err(err) = config.save_query(&file, &query) {
+                return cache::Verdict {
+                    result: Err(err.into()),
+                    cached: false,
+                };
+            }
+            cache::solve(&config, cache.as_ref(), &query)
+        };
+        let verdicts = in_parallel(jobs, parts.len(), solve);
+        parts
+            .into_iter()
+            .zip(verdicts)
+            .map(|(clauses, verdict)| Part {
+                clauses,
+                result: verdict.result,
+                cached: verdict.cached,
+            })
+            .collect()
+    }
+
+    /// The system as the query states it.
+    fn prepared(mut self) -> System {
+        self.populate_user_defined_pred_dependencies();
+        let mut system = unbox(self);
+        // With `THRUST_FLAT_PRED_ARGS` set, the tuple, `Box` and `Mut` arguments of the loop
+        // heads are split into their components (see `flatten`); with `THRUST_DEDUP_PRED_ARGS`
+        // set, the loop heads' arguments inductively equal to another are removed (see `dedup`).
+        if flat_pred_args_enabled() {
+            system = flatten_recursive_pred_args(system);
+        }
+        if dedup_pred_args_enabled() {
+            system = dedup_pred_args(system);
+        }
+        system.populate_user_defined_pred_dependencies();
+        if CandidateAtomsMode::from_env() == CandidateAtomsMode::ContractsAndEntry {
+            system.add_entry_candidate_atoms();
+        }
+        system
+    }
+
+    /// Gives each clause a nullary predicate variable of its own as a premise, made true by a
+    /// fact: `t ⇐ true` and `head ⇐ t ∧ body`, which the system is satisfiable with exactly when
+    /// it is without. A refutation then shows, at each step, the clause the step applies. Returns
+    /// the tags with their clauses.
+    fn tag_clauses(&mut self) -> Vec<(PredVarId, ClauseId)> {
+        let ids: Vec<ClauseId> = self.clauses.indices().collect();
+        let mut tags = Vec::new();
+        for id in ids {
+            let tag = self.new_pred_var(PredSig::new(), DebugInfo::default());
+            self.clauses[id]
+                .body
+                .atoms
+                .push(Atom::new(tag.into(), vec![]));
+            self.clauses.push(Clause {
+                origin: debug::origin::ClauseOrigin {
+                    environment: Vec::new(),
+                    body: Vec::new(),
+                    head: debug::origin::Entry::described("tag of a clause".to_owned()),
+                },
+                vars: IndexVec::new(),
+                head: Atom::new(tag.into(), vec![]),
+                body: Body::new(Vec::new(), Formula::top()),
+                debug_info: DebugInfo::default(),
+            });
+            tags.push((tag, id));
+        }
+        tags
+    }
+
+    /// Gives each goal (a clause whose head is no predicate variable: `false`, or a formula the
+    /// clause checks) a predicate variable of its own over the goal's variables between its body
+    /// and `false`, which the system is satisfiable with exactly when it is without:
+    /// `g(x) ⇐ body ∧ ¬head` and `false ⇐ g(x)`. A refutation then derives the marker of the
+    /// goal it refutes, at the values of its variables. Returns the markers with their goals.
+    fn mark_goals(&mut self) -> Vec<(PredVarId, ClauseId)> {
+        let goals: Vec<ClauseId> = self
+            .clauses
+            .iter_enumerated()
+            .filter(|(_, clause)| {
+                !matches!(clause.head.pred, Pred::Var(_)) && !clause.head.is_top()
+            })
+            .map(|(id, _)| id)
+            .collect();
+        let mut markers = Vec::new();
+        for id in goals {
+            // The marker takes the goal's variables, so that the refutation's last fact gives the
+            // values they have where the goal fails.
+            let vars = self.clauses[id].vars.clone();
+            let args: Vec<Term> = vars.indices().map(Term::Var).collect();
+            let marker = self.new_pred_var(vars.raw.clone(), DebugInfo::default());
+            let clause = &mut self.clauses[id];
+            let marked = Atom::new(marker.into(), args.clone());
+            let head = std::mem::replace(&mut clause.head, marked);
+            if !head.is_bottom() {
+                clause.body.formula.push_conj(Formula::Atom(head).not());
+            }
+            self.clauses.push(Clause {
+                origin: debug::origin::ClauseOrigin {
+                    environment: Vec::new(),
+                    body: Vec::new(),
+                    head: debug::origin::Entry::described("marker of a goal".to_owned()),
+                },
+                vars,
+                head: Atom::bottom(),
+                body: Body::new(vec![Atom::new(marker.into(), args)], Formula::top()),
+                debug_info: DebugInfo::default(),
+            });
+            markers.push((marker, id));
+        }
+        markers
+    }
+}
+
+fn flat_pred_args_enabled() -> bool {
+    std::env::var_os("THRUST_FLAT_PRED_ARGS").is_some()
+}
+
+fn dedup_pred_args_enabled() -> bool {
+    std::env::var_os("THRUST_DEDUP_PRED_ARGS").is_some()
+}
+
+/// Whether the arguments of the loop heads' predicate variables are rewritten before the query is
+/// written (`THRUST_FLAT_PRED_ARGS`, `THRUST_DEDUP_PRED_ARGS`), so that a model of the query
+/// interprets them over other arguments than the system's.
+pub fn pred_args_rewritten() -> bool {
+    flat_pred_args_enabled() || dedup_pred_args_enabled()
+}
+
+/// `f` of `0..n`, `jobs` at a time, in that order.
+pub fn in_parallel<T: Send + Sync>(jobs: usize, n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let results: Vec<std::sync::OnceLock<T>> = (0..n).map(|_| std::sync::OnceLock::new()).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let _ = results[i].set(f(i));
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| result.into_inner().unwrap())
+        .collect()
+}
+
+/// A part of the system solved on its own.
+#[derive(Debug)]
+pub struct Part {
+    pub clauses: Vec<ClauseId>,
+    pub result: Result<(), CheckSatError>,
+    /// Whether the verdict was that of an earlier run (`THRUST_CACHE_DIR`).
+    pub cached: bool,
+}
+
+/// Collects the forall sorts referenced via [`Term::ForallDefault`] in `term`
+/// into `used`.
+fn collect_forall_defaults(term: &Term<TermVarIdx>, used: &mut HashSet<ForallSortIdx>) {
+    match term {
+        Term::ForallDefault(idx) => {
+            used.insert(*idx);
+        }
+        Term::Box(t) | Term::BoxCurrent(t) | Term::MutCurrent(t) | Term::MutFinal(t) => {
+            collect_forall_defaults(t, used)
+        }
+        Term::ArrayLambda(_, s, t) => {
+            collect_forall_defaults(&Term::default_for(s), used);
+            collect_forall_defaults(t, used)
+        }
+        Term::Mut(t1, t2) => {
+            collect_forall_defaults(t1, used);
+            collect_forall_defaults(t2, used);
+        }
+        Term::App(_, args) => {
+            for t in args {
+                collect_forall_defaults(t, used);
+            }
+        }
+        Term::Tuple(ts) => {
+            for t in ts {
+                collect_forall_defaults(t, used);
+            }
+        }
+        Term::TupleProj(t, _) => collect_forall_defaults(t, used),
+        // An empty array carries no default of its own in the AST: the SMT-LIB2
+        // writer synthesises `default_for(elem)` for it at print time, so ask the
+        // same function which defaults that will reference.
+        Term::ArrayEmpty(_, elem) => collect_forall_defaults(&Term::default_for(elem), used),
+        Term::SeqEmpty(_) => {}
+        Term::DatatypeCtor(_, _, args) => {
+            for t in args {
+                collect_forall_defaults(t, used);
+            }
+        }
+        Term::DatatypeDiscr(_, t)
+        | Term::DatatypeSelector(.., t)
+        | Term::IntToBitVec { term: t, .. } => collect_forall_defaults(t, used),
+        Term::UserDefinedFn(_, _, args) | Term::ForallFn(_, args) => {
+            for t in args {
+                collect_forall_defaults(t, used);
+            }
+        }
+        Term::Null
+        | Term::Var(_)
+        | Term::Bool(_)
+        | Term::Int(_)
+        | Term::String(_)
+        | Term::UserQuantifiedVar(_, _) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PCSAT: Capabilities = Capabilities {
+        dependency_aware_declarations: true,
+    };
+
+    fn test_origin(var: TermVarIdx, sort: &Sort) -> debug::origin::ClauseOrigin {
+        debug::origin::ClauseOrigin {
+            environment: Vec::new(),
+            body: Vec::new(),
+            head: debug::origin::Entry::parameter(var, sort),
+        }
+    }
+
+    #[test]
+    fn declares_forall_default_once() {
+        let mut system = System::default();
+        let idx = system.new_forall_sort(DebugInfo::default());
+        let default = Term::default_for(&Sort::forall(idx));
+        let body = Atom::new(
+            Pred::Known(KnownPred::EQUAL),
+            vec![default, Term::var(0usize.into())],
+        );
+        system.push_clause(Clause {
+            origin: test_origin(0usize.into(), &Sort::forall(idx)),
+            vars: [Sort::forall(idx)].into_iter().collect(),
+            head: Atom::new(Pred::UserDefined(UserDefinedPred::new("p".into())), vec![]),
+            body: body.into(),
+            debug_info: DebugInfo::default(),
+        });
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        assert_eq!(
+            smt.matches("(declare-forall-fun default_a0 () a0)").count(),
+            1
+        );
+        assert_eq!(smt.matches("default_a0").count(), 2);
+    }
+
+    #[test]
+    fn declares_forall_default_reached_only_through_an_empty_array() {
+        let mut system = System::default();
+        let idx = system.new_forall_sort(DebugInfo::default());
+        let seq_sort = Sort::array(Sort::int(), Sort::forall(idx));
+        let empty = Term::default_for(&seq_sort);
+        let body = Atom::new(
+            Pred::Known(KnownPred::EQUAL),
+            vec![empty, Term::var(0usize.into())],
+        );
+        system.push_clause(Clause {
+            origin: test_origin(0usize.into(), &seq_sort),
+            vars: [seq_sort].into_iter().collect(),
+            head: Atom::new(Pred::UserDefined(UserDefinedPred::new("p".into())), vec![]),
+            body: body.into(),
+            debug_info: DebugInfo::default(),
+        });
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        assert_eq!(
+            smt.matches("(declare-forall-fun default_a0 () a0)").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn does_not_declare_default_for_unused_forall_sort() {
+        let mut system = System::default();
+        system.new_forall_sort(DebugInfo::default());
+        system.new_forall_sort(DebugInfo::default());
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        assert_eq!(smt.matches("(declare-forall-fun default_").count(), 0);
+        assert_eq!(smt.matches("(declare-forall-sort").count(), 0);
+    }
+
+    /// Of `p(x) ⇐ x = 0`, `r(x) ⇐ p(x)`, `p(x) ⇒ x = 0` and `q(x) ⇒ x = 0`, only the
+    /// definition of `p` and its goal are emitted: `q` has no defining clause, and nothing reads
+    /// `r`.
+    #[test]
+    fn leaves_out_underivable_and_unused_clauses() {
+        let mut system = System::default();
+        let p = system.new_pred_var(vec![Sort::int()], DebugInfo::default());
+        let q = system.new_pred_var(vec![Sort::int()], DebugInfo::default());
+        let r = system.new_pred_var(vec![Sort::int()], DebugInfo::default());
+        let x = || vec![Term::var(0usize.into())];
+        let is_zero = Atom::new(
+            Pred::Known(KnownPred::EQUAL),
+            vec![Term::var(0usize.into()), Term::int(0)],
+        );
+        let clauses = [
+            (Atom::new(Pred::Var(p), x()), Body::from(is_zero.clone())),
+            (
+                Atom::new(Pred::Var(r), x()),
+                Atom::new(Pred::Var(p), x()).into(),
+            ),
+            (is_zero.clone(), Atom::new(Pred::Var(p), x()).into()),
+            (is_zero, Atom::new(Pred::Var(q), x()).into()),
+        ];
+        for (head, body) in clauses {
+            system.push_clause(Clause {
+                origin: test_origin(0usize.into(), &Sort::int()),
+                vars: [Sort::int()].into_iter().collect(),
+                head,
+                body,
+                debug_info: DebugInfo::default(),
+            });
+        }
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        assert_eq!(smt.matches("(assert ").count(), 2);
+        assert_eq!(smt.matches("(declare-dep-exists-fun p0 ").count(), 1);
+        assert!(!smt.contains("p1") && !smt.contains("p2"));
+    }
+
+    #[test]
+    fn declares_an_empty_dependency_set_explicitly_only_to_a_dependency_aware_solver() {
+        let mut system = System::default();
+        let p = system.new_pred_var(vec![Sort::int()], DebugInfo::default());
+        let body = Atom::new(
+            Pred::Known(KnownPred::EQUAL),
+            vec![Term::var(0usize.into()), Term::int(0)],
+        );
+        system.push_clause(Clause {
+            origin: test_origin(0usize.into(), &Sort::int()),
+            vars: [Sort::int()].into_iter().collect(),
+            head: Atom::new(Pred::Var(p), vec![Term::var(0usize.into())]),
+            body: body.clone().into(),
+            debug_info: DebugInfo::default(),
+        });
+        system.push_clause(Clause {
+            origin: test_origin(0usize.into(), &Sort::int()),
+            vars: [Sort::int()].into_iter().collect(),
+            head: body,
+            body: Atom::new(Pred::Var(p), vec![Term::var(0usize.into())]).into(),
+            debug_info: DebugInfo::default(),
+        });
+
+        let pcsat = system.smtlib2(PCSAT).to_string();
+        assert_eq!(
+            pcsat
+                .matches("(declare-dep-exists-fun p0 () (Int) Bool)")
+                .count(),
+            1
+        );
+        assert_eq!(pcsat.matches("(declare-fun p0 ").count(), 0);
+
+        let z3 = system.smtlib2(Config::default().capabilities()).to_string();
+        assert_eq!(z3.matches("(declare-fun p0 (Int) Bool)").count(), 1);
+        assert_eq!(z3.matches("declare-dep-exists-fun").count(), 0);
+    }
+
+    /// `p` is defined without `q`, but has to imply `q` where a clause checks it (`p(x) ∧ ¬q(x)`,
+    /// an `ensures` at a return), so its solution may need to name `q`.
+    #[test]
+    fn an_unknown_depends_on_the_forall_preds_of_what_follows_it() {
+        let mut system = System::default();
+        let q = ForallPred::new("q".into(), String::new(), vec![], vec![Sort::int()]);
+        system.register_forall_pred(q.clone());
+        let p = system.new_pred_var(vec![Sort::int()], DebugInfo::default());
+        let x = || Term::var(0usize.into());
+        system.push_clause(Clause {
+            origin: test_origin(0usize.into(), &Sort::int()),
+            vars: [Sort::int()].into_iter().collect(),
+            head: Atom::new(Pred::Var(p), vec![x()]),
+            body: Atom::new(Pred::Known(KnownPred::EQUAL), vec![x(), Term::int(0)]).into(),
+            debug_info: DebugInfo::default(),
+        });
+        system.push_clause(Clause {
+            origin: test_origin(0usize.into(), &Sort::int()),
+            vars: [Sort::int()].into_iter().collect(),
+            head: Atom::bottom(),
+            body: Body {
+                atoms: vec![Atom::new(Pred::Var(p), vec![x()])],
+                formula: Formula::Not(Box::new(Formula::Atom(Atom::new(
+                    q.clone().into(),
+                    vec![x()],
+                )))),
+            },
+            debug_info: DebugInfo::default(),
+        });
+
+        assert!(system.compute_dependency()[&p].contains(&q));
+    }
+
+    #[test]
+    fn declares_only_the_forall_sorts_something_refers_to() {
+        let mut system = System::default();
+        let used = system.new_forall_sort(DebugInfo::default());
+        system.new_forall_sort(DebugInfo::default());
+        system.register_forall_pred(ForallPred::new(
+            "q".into(),
+            String::new(),
+            vec![],
+            vec![Sort::forall(used)],
+        ));
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        assert_eq!(smt.matches("(declare-forall-sort a0)").count(), 1);
+        assert_eq!(smt.matches("(declare-forall-sort a1)").count(), 0);
+    }
+
+    #[test]
+    fn declares_a_forall_sort_named_only_by_a_raw_command() {
+        let mut system = System::default();
+        system.new_forall_sort(DebugInfo::default());
+        system.push_raw_command(RawCommand {
+            command: "(declare-fun opaque (a0) Bool)".to_string(),
+        });
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        assert_eq!(smt.matches("(declare-forall-sort a0)").count(), 1);
+    }
+
+    #[test]
+    fn emits_forall_sort_debug_info() {
+        let mut system = System::default();
+        let idx = system.new_forall_sort(
+            DebugInfo::default().with_context("type_param", "ParamTy T/#0 (decl=DefId(...))"),
+        );
+        system.register_forall_pred(ForallPred::new(
+            "q".into(),
+            String::new(),
+            vec![],
+            vec![Sort::forall(idx)],
+        ));
+
+        // The query carries the debug info in comments only at the full comment level.
+        let smt = system
+            .smtlib2(PCSAT)
+            .with_comments(smtlib2::Comments::Full)
+            .to_string();
+        assert!(smt.contains("; type_param=ParamTy T/#0 (decl=DefId(...))"));
+        assert!(smt.contains("(declare-forall-sort a0)"));
+    }
+
+    #[test]
+    fn declares_sorts_used_only_in_forall_pred_signatures() {
+        let mut system = System::default();
+        let idx = system.new_forall_sort(DebugInfo::default());
+        let tuple = Sort::tuple(vec![Sort::forall(idx), Sort::int()]);
+        system.register_forall_pred(ForallPred::new(
+            "q".into(),
+            format!("<{idx}>"),
+            vec![Sort::forall(idx)],
+            vec![tuple, Sort::int()],
+        ));
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        let declared = smt
+            .find("(A0_Tuple<a0-Int> 0)")
+            .expect("tuple datatype declared");
+        let used = smt
+            .find("(declare-forall-fun q<a0> (A0_Tuple<a0-Int> Int) Bool)")
+            .expect("forall pred declared with the renamed sort");
+        assert!(declared < used);
+        assert!(!smt.contains(" Tuple<a0-Int>"));
+        assert!(!smt.contains("(Tuple<a0-Int>"));
+    }
+
+    #[test]
+    fn declares_sorts_used_only_in_user_defined_pred_signatures() {
+        let mut system = System::default();
+        let tuple = Sort::tuple(vec![Sort::int(), Sort::int()]);
+        system.push_pred_define(
+            UserDefinedPred::new("p".into()),
+            vec![("self_".into(), tuple), ("x".into(), Sort::int())],
+            "true".into(),
+        );
+
+        let smt = system.smtlib2(PCSAT).to_string();
+        let declared = smt
+            .find("(A0_Tuple<Int-Int> 0)")
+            .expect("tuple datatype declared");
+        let used = smt
+            .find("(define-fun p ((self_ A0_Tuple<Int-Int>) (x Int)) Bool true)")
+            .expect("user-defined pred defined with the renamed sort");
+        assert!(declared < used);
+        assert!(!smt.contains(" Tuple<Int-Int>"));
+        assert!(!smt.contains("(Tuple<Int-Int>"));
+    }
+}

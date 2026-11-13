@@ -1,0 +1,39 @@
+--- a/tests/ui/pass/rustc_coroutine/values.rs
++++ b/tests/ui/fail/rustc_coroutine/values.rs
+@@ -1,5 +1,6 @@
+-//@check-pass
++//@error-in-other-file: Unsat
+ //@compile-flags: -Adead_code -C debug-assertions=off
++//@no-rustfix
+ //@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper THRUST_SOLVER_TIMEOUT_SECS=120 THRUST_TRY_SPECS=1
+ // Adapted from rust-lang/rust
+ // commit: 89a99936d9e76a50e8df622e7242190841fd871b
+@@ -105,6 +106,8 @@
+     }
+ 
+     #[inline]
++    // Trusted: Thrust panics on the `panic!` message (`unrefined_ty: *const ()`, src/refine/template.rs).
++    #[thrust::trusted]
+     #[thrust_macros::requires(Self::pointer_space_ok(*self, c))]
+     #[thrust_macros::ensures(Self::pointer_size_is(*self, c, result))]
+     pub fn pointer_size_in(&self, c: AddressSpace) -> Size {
+@@ -130,6 +133,8 @@
+     }
+ 
+     #[inline]
++    // Trusted: Thrust panics on the `panic!` message (`unrefined_ty: *const ()`, src/refine/template.rs).
++    #[thrust::trusted]
+     #[thrust_macros::requires(Self::pointer_space_ok(*self, c))]
+     #[thrust_macros::ensures(true)]
+     pub fn pointer_align_in(&self, c: AddressSpace) -> AbiAlign {
+@@ -888,7 +893,9 @@
+     // checks the address-space requires, and `Align::bytes` / `Size::bits`
+     // check their `ensures`.
+     assert!(dl.obj_size_bound() >= 1);
+-    let ptr = dl.pointer_size_in(AddressSpace(0));
++    // The fail twin: `AddressSpace(1)` is neither `dl.default_address_space` nor listed in
++    // `dl.address_space_info`, so the lookup of `pointer_size_in` falls through to its `panic!`.
++    let ptr = dl.pointer_size_in(AddressSpace(1));
+     assert!(ptr.bits() == ptr.bytes() * 8);
+     assert!(dl.i64_align.bytes() >= 1);
+     let _ = Integer::I32.size();

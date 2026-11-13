@@ -1,0 +1,56 @@
+file,scope,from,part
+hashes.rs,root,rustc_hashes,1
+values.rs,root,rustc_abi,1
+index.rs,root,rustc_index,2
+index.rs,root,rustc_index,3
+index.rs,root,rustc_index,4
+eligibility.rs,root,coroutine_saved_local_eligibility,5
+univariant.rs,root,univariant,6
+scalar_pair.rs,root,univariant_biased,6
+univariant_biased.rs,root,univariant_biased,6
+layout.rs,root,layout,7
+lemmas.rs,root,layout,7
+../../../rustc_coroutine/compiler/rustc_hashes/src/lib.rs,section,,1
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,section,,1
+../../../rustc_coroutine/compiler/rustc_index/src/idx.rs,section,,2
+../../../rustc_coroutine/compiler/rustc_index/src/idx.rs,section,/// Own iterator standing in for `(start..end).map(I::new)`,std
+../../../rustc_coroutine/compiler/rustc_index/src/idx.rs,section,pub trait IntoSliceIdx,2
+../../../rustc_coroutine/compiler/rustc_index/src/slice.rs,section,,2
+../../../rustc_coroutine/compiler/rustc_index/src/slice.rs,section,/// Own iterator standing in for,std
+../../../rustc_coroutine/compiler/rustc_index/src/slice.rs,section,impl<I: Idx, T> IndexSlice<I, T> {,2
+../../../rustc_coroutine/compiler/rustc_index/src/vec.rs,section,,2
+../../../rustc_coroutine/compiler/rustc_index/src/bit_set.rs,section,,3
+../../../rustc_coroutine/compiler/rustc_index/src/bit_set.rs,section,/// Own iterator standing in for `slice::Iter,std
+../../../rustc_coroutine/compiler/rustc_index/src/bit_set.rs,section,pub struct BitIter,3
+../../../rustc_coroutine/thrust/iter.rs,section,,std
+../../../rustc_coroutine/thrust/iter.rs,section,// Rewrite (rewrites.md R8): a local `Map`,std
+../../../rustc_coroutine/thrust/iter.rs,section,// Fallback: `Map::new` with its `requires` assumed,7
+../../../rustc_coroutine/thrust/iter.rs,section,// `IndexSlice::iter_enumerated` with a contract of its own,6
+../../../rustc_coroutine/thrust/iter.rs,helpers,// `IndexSlice::iter_enumerated` with a contract of its own,LayoutCalculator::univariant_biased
+../../../rustc_coroutine/thrust/lemmas.rs,section,,7
+../../../rustc_coroutine/thrust/counts.rs,section,,7
+../../../rustc_coroutine/thrust/models.rs,section,,model
+../../../rustc_coroutine/compiler/rustc_abi/src/layout/coroutine.rs,section,,5
+../../../rustc_coroutine/compiler/rustc_abi/src/layout/coroutine.rs,section,/// The members of the ineligible set below,7
+../../../rustc_coroutine/compiler/rustc_abi/src/layout/coroutine.rs,section,// The specification of stage 5,5
+../../../rustc_coroutine/compiler/rustc_abi/src/layout/coroutine.rs,section,/// Property 3 at the promoted fields,7
+../../../rustc_coroutine/compiler/rustc_abi/src/layout/coroutine.rs,section,// The specification of stage 7,7
+../../../rustc_coroutine/compiler/rustc_abi/src/layout.rs,section,,6
+../../../rustc_coroutine/compiler/rustc_abi/src/layout.rs,helpers,/// `1 << q` on 64-bit words,LayoutCalculator::univariant_biased
+../../../rustc_coroutine/compiler/rustc_abi/src/layout.rs,helpers,// Stage 6 spec (README.md,LayoutCalculator::univariant
+../../../rustc_coroutine/compiler/rustc_abi/src/layout.rs,helpers,    /// `univariant_biased`'s postcondition,LayoutCalculator::univariant_biased
+../../../rustc_coroutine/compiler/rustc_abi/src/layout/simple.rs,section,,6
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,compile-only,Endian::as_str,1
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,compile-only,AbiAlign::max,1
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,compile-only,AbiAlign::deref,1
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,compile-only,LayoutData::is_uninhabited,1
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,compile-only,LayoutData::is_zst,1
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,compile-only,VariantLayout::is_uninhabited,1
+../../../rustc_coroutine/compiler/rustc_index/src/slice.rs,unchecked,IndexSlice::index,2
+../../../rustc_coroutine/compiler/rustc_hashes/src/lib.rs,row,,rustc_hashes
+../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,row,,rustc_abi
+../../../rustc_coroutine/compiler/rustc_index/src/idx.rs,row,,rustc_index
+../../../rustc_coroutine/compiler/rustc_index/src/slice.rs,row,,rustc_index
+../../../rustc_coroutine/compiler/rustc_index/src/vec.rs,row,,rustc_index
+../../../rustc_coroutine/compiler/rustc_index/src/bit_set.rs,row,,rustc_index
+../../../rustc_coroutine/compiler/rustc_abi/src/layout/simple.rs,row,,LayoutCalculator::univariant_biased

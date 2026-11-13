@@ -1,0 +1,32 @@
+name: Setup Z3
+description: Sets up Z3 CLI in your GitHub Actions workflow.
+inputs:
+  z3-version:
+    description: The version of Z3 to install.
+    required: false
+    default: 5.0.0
+  z3-variant:
+    description: The variant of Z3 to install (includes arch, e.g. x64-glibc-2.39, arm64-glibc-2.38).
+    required: false
+    default: x64-glibc-2.39
+  z3-sha256sum:
+    description: Expected sha256sum of downloaded binary archive.
+    required: false
+    default: |
+      d4922cebc9f0a55629231ec0c62f0bbedf8006eddaed4e68199ad19626b697f6  z3-5.0.0-x64-glibc-2.39.zip
+      c9437ff7e419e715db76d20e4b2142bf60a206c8e1d2b380c0ce35dc8d07b1f4  z3-5.0.0-arm64-glibc-2.38.zip
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        wget -q "$RELEASE_URL/$RELEASE_NAME.zip"
+        echo "$INPUT_Z3_SHA256SUM" | grep "$RELEASE_NAME.zip" | sha256sum --check --strict
+        unzip "$RELEASE_NAME.zip"
+        rm -f "$RELEASE_NAME.zip"
+        mv "$RELEASE_NAME" ~/.setup-z3
+        echo ~/.setup-z3/bin >> $GITHUB_PATH
+      env:
+        RELEASE_URL: https://github.com/Z3Prover/z3/releases/download/z3-${{ inputs.z3-version }}
+        RELEASE_NAME: z3-${{ inputs.z3-version }}-${{ inputs.z3-variant }}
+        INPUT_Z3_SHA256SUM: ${{ inputs.z3-sha256sum }}

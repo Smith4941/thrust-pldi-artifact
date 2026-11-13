@@ -1,0 +1,8 @@
+stage,files,loc,functions_verified,generic,loops,contracts,predicates,trusted_functions,invariants_written,invariants_inferred,ignored_functions,unchecked_functions,assumes,opaque,reveals,assume_stmts,trusted_helpers,spec_lines,contracts_inferred,compile_only_functions,compile_only_loc,functions_checked,generic_functions_checked,generic_contracts_inferred,functions_extracted
+1,hashes.rs values.rs,623,39,13,0,40,14,5,0,0,5,0,0,4,4,0,0,366,12,6,29,39,13,3,5
+2,index.rs,207,27,23,1,29,17,3,0,1,1,1,0,0,0,0,0,173,11,0,0,27,23,9,0
+3,index.rs,187,17,15,1,52,24,0,1,0,0,0,0,13,43,0,0,753,6,0,0,17,15,6,2
+4,index.rs,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+5,eligibility.rs,68,1,1,7,2,0,0,6,1,0,0,0,0,0,0,0,302,0,0,0,1,1,0,2
+6,univariant.rs scalar_pair.rs univariant_biased.rs,259,2,2,0,15,18,0,0,0,0,0,1,8,10,10,1,1147,0,0,0,3,3,0,11
+7,layout.rs lemmas.rs,92,0,0,0,2,29,0,0,0,0,0,1,13,22,4,0,2016,0,0,0,1,1,0,7

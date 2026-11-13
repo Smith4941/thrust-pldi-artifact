@@ -1,0 +1,14 @@
+id,setting,side,expect,file,env,printed
+hashes,,pass,sat,tests/ui/pass/rustc_coroutine/hashes.rs,,yes
+values,,pass,sat,tests/ui/pass/rustc_coroutine/values.rs,,yes
+values,,fail,unsat,tests/ui/fail/rustc_coroutine/values.rs,,
+index,,pass,sat,tests/ui/pass/rustc_coroutine/index.rs,,yes
+index,,fail,unsat,tests/ui/fail/rustc_coroutine/index.rs,,
+eligibility,,pass,sat,tests/ui/pass/rustc_coroutine/eligibility.rs,,yes
+univariant,,pass,sat,tests/ui/pass/rustc_coroutine/univariant.rs,,yes
+scalar_pair,,pass,sat,tests/ui/pass/rustc_coroutine/scalar_pair.rs,,yes
+scalar_pair,,fail,unsat,tests/ui/fail/rustc_coroutine/scalar_pair.rs,,
+layout,,pass,sat,tests/ui/pass/rustc_coroutine/layout.rs,,yes
+univariant_biased,,pass,sat,tests/ui/pass/rustc_coroutine/univariant_biased.rs,,yes
+lemmas,,pass,sat,tests/ui/pass/rustc_coroutine/lemmas.rs,,yes
+lemmas,,fail,unsat,tests/ui/fail/rustc_coroutine/lemmas.rs,,

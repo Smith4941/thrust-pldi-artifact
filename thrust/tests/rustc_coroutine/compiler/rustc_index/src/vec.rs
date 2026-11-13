@@ -1,0 +1,173 @@
+use std::fmt;
+use crate::thrust_models;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
+use std::vec;
+
+use thrust_models::forall;
+
+use crate::rustc_index::{Idx, IndexSlice};
+use crate::{IntoIteratorSpec, IteratorSpec};
+use crate::case_study::USize;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct IndexVec<I: Idx, T> {
+    pub raw: Vec<T>,
+    pub(crate) _marker: PhantomData<fn(&I)>,
+}
+
+impl<I: Idx, T: fmt::Debug> fmt::Debug for IndexVec<I, T> {
+    #[thrust::ignored]
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.raw, fmt)
+    }
+}
+
+#[thrust_macros::context]
+impl<I: Idx, T> IndexVec<I, T> {
+    #[inline]
+    pub const fn new() -> Self {
+        IndexVec::from_raw(Vec::new())
+    }
+
+    #[inline]
+    pub const fn from_raw(raw: Vec<T>) -> Self {
+        IndexVec {
+            raw,
+            _marker: PhantomData,
+        }
+    }
+
+    // A written contract, so that the roots that do not select this module trust it rather than
+    // analyse it; where it is selected, its call of `vec![elem; n]` takes std.rs's specification,
+    // which bit_set.rs's `new_empty` takes too.
+    #[inline]
+    #[thrust_macros::requires(true)]
+    #[thrust_macros::ensures(result.len() == (*universe).len()
+        && forall(|k: USize| 0 <= k && k < result.len() ==> result[k] == elem))]
+    pub fn from_elem<S>(elem: T, universe: &IndexSlice<I, S>) -> Self
+    where
+        T: Clone,
+    {
+        IndexVec::from_raw(vec![elem; universe.len()])
+    }
+
+    #[inline]
+    pub fn from_elem_n(elem: T, n: usize) -> Self
+    where
+        T: Clone,
+    {
+        IndexVec::from_raw(vec![elem; n])
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &IndexSlice<I, T> {
+        IndexSlice::from_raw(&self.raw)
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut IndexSlice<I, T> {
+        IndexSlice::from_raw_mut(&mut self.raw)
+    }
+
+    #[inline]
+    pub fn push(&mut self, d: T) -> I {
+        let idx = self.next_index();
+        self.raw.push(d);
+        idx
+    }
+}
+
+impl<I: Idx, T> Deref for IndexVec<I, T> {
+    type Target = IndexSlice<I, T>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<I: Idx, T> DerefMut for IndexVec<I, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+// `Deref`/`DerefMut` are foreign traits, so their contracts are extern specs; they state what
+// `as_slice`'s and `as_mut_slice`'s contracts state. Written, they are not inferred from the
+// bodies, and calls of `deref` in one body do not share an inferred contract.
+#[thrust::extern_spec_fn]
+#[thrust_macros::requires(true)]
+#[thrust_macros::ensures(*result == *slf)]
+fn _extern_spec_index_vec_deref<I: Idx + thrust_models::Model, T: thrust_models::Model>(slf: &IndexVec<I, T>) -> &IndexSlice<I, T>
+{
+    <IndexVec<I, T> as Deref>::deref(slf)
+}
+
+#[thrust::extern_spec_fn]
+#[thrust_macros::requires(true)]
+#[thrust_macros::ensures(*result == *slf && !result == !slf && (!slf).len() == (*slf).len())]
+fn _extern_spec_index_vec_deref_mut<I: Idx + thrust_models::Model, T: thrust_models::Model>(slf: &mut IndexVec<I, T>) -> &mut IndexSlice<I, T>
+{
+    <IndexVec<I, T> as DerefMut>::deref_mut(slf)
+}
+
+impl<I: Idx, T> IntoIterator for IndexVec<I, T> {
+    type Item = T;
+    type IntoIter = vec::IntoIter<T>;
+
+    #[inline]
+    fn into_iter(self) -> vec::IntoIter<T> {
+        self.raw.into_iter()
+    }
+}
+
+impl<'a, I: Idx, T: thrust_models::Model> IntoIterator for &'a IndexVec<I, T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> std::slice::Iter<'a, T> {
+        self.iter()
+    }
+}
+
+impl<'a, I: Idx, T: thrust_models::Model> IntoIterator for &'a mut IndexVec<I, T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> std::slice::IterMut<'a, T> {
+        self.iter_mut()
+    }
+}
+
+// The iterators the three `into_iter`s start, as std.rs's `IntoIteratorSpec` of `Vec` says.
+#[thrust_macros::context]
+impl<I: Idx + thrust_models::Model, T: thrust_models::Model> IntoIteratorSpec for IndexVec<I, T>
+{
+    #[thrust_macros::predicate]
+    fn into_iter_is(self, it: vec::IntoIter<T>) -> bool {
+        it.0 == self && it.1 == 0 && <vec::IntoIter<T> as IteratorSpec>::inv(it)
+    }
+}
+
+#[thrust_macros::context]
+impl<'a, I: Idx + thrust_models::Model, T: thrust_models::Model + 'a> IntoIteratorSpec for &'a IndexVec<I, T>
+{
+    #[thrust_macros::predicate]
+    fn into_iter_is(self, it: std::slice::Iter<'a, T>) -> bool {
+        it.0 == *self && it.1 == 0 && <std::slice::Iter<'a, T> as IteratorSpec>::inv(it)
+    }
+}
+
+#[thrust_macros::context]
+impl<'a, I: Idx + thrust_models::Model, T: thrust_models::Model + 'a> IntoIteratorSpec for &'a mut IndexVec<I, T>
+{
+    #[thrust_macros::predicate]
+    fn into_iter_is(self, it: std::slice::IterMut<'a, T>) -> bool {
+        it.0 == *self && it.1 == !self && it.2 == 0 && (!self).len() == (*self).len()
+    }
+}

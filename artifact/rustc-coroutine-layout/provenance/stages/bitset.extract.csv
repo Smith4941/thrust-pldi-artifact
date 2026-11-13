@@ -1,0 +1,5 @@
+marker,source,lines
+,target.rs,"26,28,33,278-279,281,284,286"
+// //== ./../rustc_index/src/bit_set.rs,target.rs,"58-72,75-83,86-89,91-97,99-106,108-123,125-174,176-189,191-218,220-226,229-234,236-243,246-251,253-259,262-276"
+"// //== local to the case study: `vec![elem; n]` expands to `std::vec::from_elem`, which std.rs",target.rs,"26,32-33"
+// //== ./../rustc_index/src/idx.rs,target.rs,"281-309,322-354,365-367"

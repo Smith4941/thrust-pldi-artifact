@@ -1,0 +1,96 @@
+sat
+; solver: solver: tests/thrust-pcsat-wrapper ; preprocessor: ; salt: fptprove=44c298e58b config=./config/solver/pcsat_thrust.json
+(set-logic HORN)
+(declare-forall-sort a0)
+(declare-forall-sort a1)
+(declare-forall-sort a2)
+(declare-forall-sort a3)
+(declare-datatypes ((A0_Mut<Seq<a2>> 0)) (
+  (par () (
+    (mut<Seq<a2>> (mut_current<Seq<a2>> (Seq a2)) (mut_final<Seq<a2>> (Seq a2)))
+  ))
+))
+(declare-datatypes ((A1_Mut<Mut<Seq<a2>>> 0)) (
+  (par () (
+    (mut<Mut<Seq<a2>>> (mut_current<Mut<Seq<a2>>> A0_Mut<Seq<a2>>) (mut_final<Mut<Seq<a2>>> A0_Mut<Seq<a2>>))
+  ))
+))
+(declare-datatypes ((A2_Tuple<Mut<Seq<a2>>> 0)) (
+  (par () (
+    (tuple<Mut<Seq<a2>>> (tuple_proj<Mut<Seq<a2>>>.0 A0_Mut<Seq<a2>>))
+  ))
+))
+(declare-datatypes ((A3_Mut<Tuple<Mut<Seq<a2>>>> 0)) (
+  (par () (
+    (mut<Tuple<Mut<Seq<a2>>>> (mut_current<Tuple<Mut<Seq<a2>>>> A2_Tuple<Mut<Seq<a2>>>) (mut_final<Tuple<Mut<Seq<a2>>>> A2_Tuple<Mut<Seq<a2>>>))
+  ))
+))
+(declare-datatypes ((A4_Mut<Seq<a3>> 0)) (
+  (par () (
+    (mut<Seq<a3>> (mut_current<Seq<a3>> (Seq a3)) (mut_final<Seq<a3>> (Seq a3)))
+  ))
+))
+(declare-datatypes ((A5_Mut<a2> 0)) (
+  (par () (
+    (mut<a2> (mut_current<a2> a2) (mut_final<a2> a2))
+  ))
+))
+(declare-datatypes ((A6_Tuple 0)) (
+  (par () (
+    (tuple )
+  ))
+))
+(declare-datatypes ((A7_Tuple<Mut<Seq<a3>>> 0)) (
+  (par () (
+    (tuple<Mut<Seq<a3>>> (tuple_proj<Mut<Seq<a3>>>.0 A4_Mut<Seq<a3>>))
+  ))
+))
+(declare-datatypes ((A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>> 0)) (
+  (par () (
+    (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Mut<a2>> )
+    (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Mut<a2>> (_getd_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some.0<Mut<a2>> A5_Mut<a2>))
+  ))
+))
+(define-fun datatype_discr<A0_Mut<Seq<a2>>> ((x A0_Mut<Seq<a2>>)) Int (ite ((_ is mut<Seq<a2>>) x) 0 (- 1)))
+(define-fun matcher_pred<A0_Mut<Seq<a2>>> ((x0 (Seq a2)) (x1 (Seq a2)) (v A0_Mut<Seq<a2>>)) Bool (or (= v (mut<Seq<a2>> x0 x1))))
+(define-fun datatype_discr<A1_Mut<Mut<Seq<a2>>>> ((x A1_Mut<Mut<Seq<a2>>>)) Int (ite ((_ is mut<Mut<Seq<a2>>>) x) 0 (- 1)))
+(define-fun matcher_pred<A1_Mut<Mut<Seq<a2>>>> ((x0 A0_Mut<Seq<a2>>) (x1 A0_Mut<Seq<a2>>) (v A1_Mut<Mut<Seq<a2>>>)) Bool (or (= v (mut<Mut<Seq<a2>>> x0 x1))))
+(define-fun datatype_discr<A2_Tuple<Mut<Seq<a2>>>> ((x A2_Tuple<Mut<Seq<a2>>>)) Int (ite ((_ is tuple<Mut<Seq<a2>>>) x) 0 (- 1)))
+(define-fun matcher_pred<A2_Tuple<Mut<Seq<a2>>>> ((x0 A0_Mut<Seq<a2>>) (v A2_Tuple<Mut<Seq<a2>>>)) Bool (or (= v (tuple<Mut<Seq<a2>>> x0))))
+(define-fun datatype_discr<A3_Mut<Tuple<Mut<Seq<a2>>>>> ((x A3_Mut<Tuple<Mut<Seq<a2>>>>)) Int (ite ((_ is mut<Tuple<Mut<Seq<a2>>>>) x) 0 (- 1)))
+(define-fun matcher_pred<A3_Mut<Tuple<Mut<Seq<a2>>>>> ((x0 A2_Tuple<Mut<Seq<a2>>>) (x1 A2_Tuple<Mut<Seq<a2>>>) (v A3_Mut<Tuple<Mut<Seq<a2>>>>)) Bool (or (= v (mut<Tuple<Mut<Seq<a2>>>> x0 x1))))
+(define-fun datatype_discr<A4_Mut<Seq<a3>>> ((x A4_Mut<Seq<a3>>)) Int (ite ((_ is mut<Seq<a3>>) x) 0 (- 1)))
+(define-fun matcher_pred<A4_Mut<Seq<a3>>> ((x0 (Seq a3)) (x1 (Seq a3)) (v A4_Mut<Seq<a3>>)) Bool (or (= v (mut<Seq<a3>> x0 x1))))
+(define-fun datatype_discr<A5_Mut<a2>> ((x A5_Mut<a2>)) Int (ite ((_ is mut<a2>) x) 0 (- 1)))
+(define-fun matcher_pred<A5_Mut<a2>> ((x0 a2) (x1 a2) (v A5_Mut<a2>)) Bool (or (= v (mut<a2> x0 x1))))
+(define-fun datatype_discr<A6_Tuple> ((x A6_Tuple)) Int (ite ((_ is tuple) x) 0 (- 1)))
+(define-fun matcher_pred<A6_Tuple> ((v A6_Tuple)) Bool (or (= v tuple)))
+(define-fun datatype_discr<A7_Tuple<Mut<Seq<a3>>>> ((x A7_Tuple<Mut<Seq<a3>>>)) Int (ite ((_ is tuple<Mut<Seq<a3>>>) x) 0 (- 1)))
+(define-fun matcher_pred<A7_Tuple<Mut<Seq<a3>>>> ((x0 A4_Mut<Seq<a3>>) (v A7_Tuple<Mut<Seq<a3>>>)) Bool (or (= v (tuple<Mut<Seq<a3>>> x0))))
+(define-fun datatype_discr<A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>> ((x A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>)) Int (ite ((_ is d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Mut<a2>>) x) 0 (ite ((_ is d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Mut<a2>>) x) 1 (- 1))))
+(define-fun matcher_pred<A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>> ((x0 A5_Mut<a2>) (v A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>)) Bool (or (= v d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Mut<a2>>) (= v (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Mut<a2>> x0))))
+(declare-forall-fun q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> (a0 (Seq a1) a0) Bool :law (and (forall ((q$3 a0)) (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$3 (as seq.empty (Seq a1)) q$3)) (forall ((q$4 a0) (q$5 (Seq a1)) (q$6 a0) (q$7 (Seq a1)) (q$8 a0)) (=> (and (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$4 q$5 q$6) (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$6 q$7 q$8)) (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$4 (seq.++ q$5 q$7) q$8))) (forall ((q$9 a0)) (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$9 (as seq.empty (Seq a1)) q$9)) (forall ((q$10 a0) (q$11 (Seq a1)) (q$12 a0) (q$13 (Seq a1)) (q$14 a0)) (=> (and (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$10 q$11 q$12) (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$12 q$13 q$14)) (q_produces_54ea0603cb7c1bc6ff016a0fccdb8649<a0> q$10 (seq.++ q$11 q$13) q$14)))))
+(define-fun p_invariant_54ea0603cb7c1bc611daa24df0369fc6_0 ((v0 A2_Tuple<Mut<Seq<a2>>>)) Bool (= (seq.len (mut_final<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v0))) (seq.len (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v0)))))
+(define-fun p_completed_54ea0603cb7c1bc66af36494d723416f_1 ((v0 A3_Mut<Tuple<Mut<Seq<a2>>>>)) Bool (and (= (mut_final<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 (mut_current<Tuple<Mut<Seq<a2>>>> v0))) (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 (mut_current<Tuple<Mut<Seq<a2>>>> v0)))) (= (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 (mut_current<Tuple<Mut<Seq<a2>>>> v0))) (as seq.empty (Seq a2)))))
+(define-fun p_produces_54ea0603cb7c1bc612b76ab6fc53dc1c_2 ((v0 A2_Tuple<Mut<Seq<a2>>>) (v1 (Seq A5_Mut<a2>)) (v2 A2_Tuple<Mut<Seq<a2>>>)) Bool (and (and (= (seq.len (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v0))) (+ (seq.len v1) (seq.len (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v2))))) (forall ((q$1 Int)) (or (not (and (<= 0 q$1) (< q$1 (seq.len v1)))) (= (seq.nth v1 q$1) (mut<a2> (seq.nth (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v0)) q$1) (seq.nth (mut_final<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v0)) q$1)))))) (forall ((q$2 Int)) (or (not (and (<= 0 q$2) (< q$2 (seq.len (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v2)))))) (and (= (seq.nth (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v2)) q$2) (seq.nth (mut_current<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v0)) (+ (seq.len v1) q$2))) (= (seq.nth (mut_final<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v2)) q$2) (seq.nth (mut_final<Seq<a2>> (tuple_proj<Mut<Seq<a2>>>.0 v0)) (+ (seq.len v1) q$2))))))))
+(define-fun p_invariant_54ea0603cb7c1bc611daa24df0369fc6_3 ((v0 A7_Tuple<Mut<Seq<a3>>>)) Bool (= (seq.len (mut_final<Seq<a3>> (tuple_proj<Mut<Seq<a3>>>.0 v0))) (seq.len (mut_current<Seq<a3>> (tuple_proj<Mut<Seq<a3>>>.0 v0)))))
+(define-fun p_in_bounds_54ea0603cb7c1bc656b905a1889316c3_4 ((v0 A6_Tuple) (v1 (Seq a3))) Bool true)
+(define-fun p_has_value_54ea0603cb7c1bc67c3a0ffff6731fb_5 ((v0 A6_Tuple) (v1 (Seq a3)) (v2 (Seq a3))) Bool (= v1 v2))
+(define-fun p_store_value_54ea0603cb7c1bc6e3a1c97e10473572_6 ((v0 A6_Tuple) (v1 (Seq a3)) (v2 (Seq a3)) (v3 (Seq a3))) Bool (= v3 v2))
+(declare-dep-exists-fun p0 () (A2_Tuple<Mut<Seq<a2>>> A2_Tuple<Mut<Seq<a2>>>) Bool)
+(declare-dep-exists-fun p1 () (A2_Tuple<Mut<Seq<a2>>> A2_Tuple<Mut<Seq<a2>>> (Seq A5_Mut<a2>) A2_Tuple<Mut<Seq<a2>>> (Seq A5_Mut<a2>) A2_Tuple<Mut<Seq<a2>>> A2_Tuple<Mut<Seq<a2>>> (Seq A5_Mut<a2>) A2_Tuple<Mut<Seq<a2>>> (Seq A5_Mut<a2>)) Bool)
+(declare-dep-exists-fun p2 () (A3_Mut<Tuple<Mut<Seq<a2>>>> A3_Mut<Tuple<Mut<Seq<a2>>>>) Bool)
+(declare-dep-exists-fun p3 () (A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>> A2_Tuple<Mut<Seq<a2>>> (Seq a2) (Seq a2) A3_Mut<Tuple<Mut<Seq<a2>>>> A0_Mut<Seq<a2>> A0_Mut<Seq<a2>> (Seq a2) (Seq a2) A0_Mut<Seq<a2>> A0_Mut<Seq<a2>> (Seq a2) (Seq a2)) Bool)
+(declare-dep-exists-fun p4 () (A4_Mut<Seq<a3>> A4_Mut<Seq<a3>>) Bool)
+(declare-dep-exists-fun p5 () (A4_Mut<Seq<a3>> (Seq a3) (Seq a3) A4_Mut<Seq<a3>> (Seq a3) (Seq a3) (Seq a3)) Bool)
+(assert (forall ((v0 A2_Tuple<Mut<Seq<a2>>>) (v1 A2_Tuple<Mut<Seq<a2>>>) (v2 A6_Tuple) (v3 A2_Tuple<Mut<Seq<a2>>>)) (=> (and (= v1 v0) (p0 v1 v0) (= v3 v1) (not (p_produces_54ea0603cb7c1bc612b76ab6fc53dc1c_2 v3 (as seq.empty (Seq A5_Mut<a2>)) v3))) false)))
+(assert (forall ((v0 A2_Tuple<Mut<Seq<a2>>>) (v1 A2_Tuple<Mut<Seq<a2>>>)) (=> (and  true) (p0 v1 v1))))
+(assert (forall ((v0 A2_Tuple<Mut<Seq<a2>>>) (v1 (Seq A5_Mut<a2>)) (v2 A2_Tuple<Mut<Seq<a2>>>) (v3 (Seq A5_Mut<a2>)) (v4 A2_Tuple<Mut<Seq<a2>>>) (v5 A2_Tuple<Mut<Seq<a2>>>) (v6 (Seq A5_Mut<a2>)) (v7 A2_Tuple<Mut<Seq<a2>>>) (v8 (Seq A5_Mut<a2>)) (v9 A2_Tuple<Mut<Seq<a2>>>) (v10 A6_Tuple) (v11 A2_Tuple<Mut<Seq<a2>>>) (v12 (Seq A5_Mut<a2>)) (v13 A2_Tuple<Mut<Seq<a2>>>) (v14 (Seq A5_Mut<a2>)) (v15 A2_Tuple<Mut<Seq<a2>>>)) (=> (and (= v5 v0) (= v6 v1) (= v7 v2) (= v8 v3) (= v9 v4) (p1 v9 v0 v1 v2 v3 v4 v5 v6 v7 v8) (= v11 v5) (= v12 v6) (= v13 v7) (= v14 v8) (= v15 v9) (not (p_produces_54ea0603cb7c1bc612b76ab6fc53dc1c_2 v11 (seq.++ v12 v14) v15))) false)))
+(assert (forall ((v0 A2_Tuple<Mut<Seq<a2>>>) (v1 (Seq A5_Mut<a2>)) (v2 A2_Tuple<Mut<Seq<a2>>>) (v3 (Seq A5_Mut<a2>)) (v4 A2_Tuple<Mut<Seq<a2>>>) (v5 A2_Tuple<Mut<Seq<a2>>>)) (=> (and  (and (p_produces_54ea0603cb7c1bc612b76ab6fc53dc1c_2 v0 v1 v2) (p_produces_54ea0603cb7c1bc612b76ab6fc53dc1c_2 v2 v3 v5))) (p1 v5 v0 v1 v2 v3 v5 v0 v1 v2 v3))))
+(assert (forall ((v0 A2_Tuple<Mut<Seq<a2>>>) (v1 (Seq a2)) (v2 (Seq a2)) (v3 A3_Mut<Tuple<Mut<Seq<a2>>>>) (v4 A0_Mut<Seq<a2>>) (v5 A0_Mut<Seq<a2>>) (v6 (Seq a2)) (v7 (Seq a2)) (v8 A0_Mut<Seq<a2>>) (v9 A0_Mut<Seq<a2>>) (v10 (Seq a2)) (v11 (Seq a2)) (v12 A1_Mut<Mut<Seq<a2>>>) (v13 A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>)) (=> (and (= (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v7 v6) v5) (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v2 v1) v4)) (= (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v11 v10) v9) (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v7 v6) v8)) (p2 v3 (mut<Tuple<Mut<Seq<a2>>>> (tuple<Mut<Seq<a2>>> (mut<Seq<a2>> v2 v1)) v0)) (= (mut_final<Tuple<Mut<Seq<a2>>>> (mut<Tuple<Mut<Seq<a2>>>> (tuple<Mut<Seq<a2>>> v4) v0)) (mut_current<Tuple<Mut<Seq<a2>>>> (mut<Tuple<Mut<Seq<a2>>>> (tuple<Mut<Seq<a2>>> v4) v0))) (= v12 (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v11 v10) v9)) (or (and (and (and (and (> (seq.len (mut_current<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12))) 0) (> (seq.len (mut_final<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12))) 0)) (= v13 (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Mut<a2>> (mut<a2> (seq.nth (mut_current<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12)) 0) (seq.nth (mut_final<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12)) 0))))) (= (mut_current<Seq<a2>> (mut_final<Mut<Seq<a2>>> v12)) (seq.extract (mut_current<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12)) 1 (- (seq.len (mut_current<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12))) 1)))) (= (mut_final<Seq<a2>> (mut_final<Mut<Seq<a2>>> v12)) (seq.extract (mut_final<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12)) 1 (- (seq.len (mut_final<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12))) 1)))) (and (and (and (and (= v13 d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Mut<a2>>) (= (mut_current<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12)) (as seq.empty (Seq a2)))) (= (mut_final<Seq<a2>> (mut_current<Mut<Seq<a2>>> v12)) (as seq.empty (Seq a2)))) (= (mut_current<Seq<a2>> (mut_final<Mut<Seq<a2>>> v12)) (as seq.empty (Seq a2)))) (= (mut_final<Seq<a2>> (mut_final<Mut<Seq<a2>>> v12)) (as seq.empty (Seq a2)))))) (p3 v13 v0 v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11))))
+(assert (forall ((v0 A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>) (v1 A3_Mut<Tuple<Mut<Seq<a2>>>>) (v2 A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>) (v3 A2_Tuple<Mut<Seq<a2>>>) (v4 (Seq a2)) (v5 (Seq a2)) (v6 A3_Mut<Tuple<Mut<Seq<a2>>>>) (v7 A0_Mut<Seq<a2>>) (v8 A0_Mut<Seq<a2>>) (v9 (Seq a2)) (v10 (Seq a2)) (v11 A0_Mut<Seq<a2>>) (v12 A0_Mut<Seq<a2>>) (v13 (Seq a2)) (v14 (Seq a2)) (v15 A3_Mut<Tuple<Mut<Seq<a2>>>>) (v16 A8_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Mut<a2>>)) (=> (and (p3 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12 v13 v14) (= (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v10 v9) v8) (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v5 v4) v7)) (= (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v14 v13) v12) (mut<Mut<Seq<a2>>> (mut<Seq<a2>> v10 v9) v11)) (p2 v6 (mut<Tuple<Mut<Seq<a2>>>> (tuple<Mut<Seq<a2>>> (mut<Seq<a2>> v5 v4)) v3)) (= (mut_final<Tuple<Mut<Seq<a2>>>> (mut<Tuple<Mut<Seq<a2>>>> (tuple<Mut<Seq<a2>>> v7) v3)) (mut_current<Tuple<Mut<Seq<a2>>>> (mut<Tuple<Mut<Seq<a2>>>> (tuple<Mut<Seq<a2>>> v7) v3))) (= (mut_final<Mut<Seq<a2>>> (mut<Mut<Seq<a2>>> v11 v8)) (mut_current<Mut<Seq<a2>>> (mut<Mut<Seq<a2>>> v11 v8))) (= v0 v2) (= v1 v6) (= v15 v1) (= v16 v0) (not (and (and (p_invariant_54ea0603cb7c1bc611daa24df0369fc6_0 (mut_final<Tuple<Mut<Seq<a2>>>> v15)) (=> (= v16 d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Mut<a2>>) (p_completed_54ea0603cb7c1bc66af36494d723416f_1 v15))) (forall ((q$0 A5_Mut<a2>)) (=> (= v16 (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Mut<a2>> q$0)) (p_produces_54ea0603cb7c1bc612b76ab6fc53dc1c_2 (mut_current<Tuple<Mut<Seq<a2>>>> v15) (seq.unit q$0) (mut_final<Tuple<Mut<Seq<a2>>>> v15))))))) false)))
+(assert (forall ((v0 A3_Mut<Tuple<Mut<Seq<a2>>>>) (v1 A3_Mut<Tuple<Mut<Seq<a2>>>>)) (=> (and  (p_invariant_54ea0603cb7c1bc611daa24df0369fc6_0 (mut_current<Tuple<Mut<Seq<a2>>>> v1))) (p2 v1 v1))))
+(assert (forall ((v0 (Seq a3)) (v1 (Seq a3)) (v2 A4_Mut<Seq<a3>>) (v3 A6_Tuple) (v4 (Seq a3)) (v5 (Seq a3)) (v6 (Seq a3)) (v7 A4_Mut<Seq<a3>>)) (=> (and (= (mut<Seq<a3>> v6 v5) (mut<Seq<a3>> v1 v4)) (p4 v2 (mut<Seq<a3>> v1 v0)) (= v7 (mut<Seq<a3>> v6 v5)) (not (p_in_bounds_54ea0603cb7c1bc656b905a1889316c3_4 tuple (mut_current<Seq<a3>> v7)))) false)))
+(assert (forall ((v0 (Seq a3)) (v1 (Seq a3)) (v2 A4_Mut<Seq<a3>>) (v3 A6_Tuple) (v4 (Seq a3)) (v5 (Seq a3)) (v6 (Seq a3)) (v7 A4_Mut<Seq<a3>>) (v8 A4_Mut<Seq<a3>>)) (=> (and (= (mut<Seq<a3>> v6 v5) (mut<Seq<a3>> v1 v4)) (p4 v2 (mut<Seq<a3>> v1 v0)) (= v7 (mut<Seq<a3>> v6 v5)) (and (and (p_has_value_54ea0603cb7c1bc67c3a0ffff6731fb_5 tuple (mut_current<Seq<a3>> v7) (mut_current<Seq<a3>> v8)) (p_store_value_54ea0603cb7c1bc6e3a1c97e10473572_6 tuple (mut_current<Seq<a3>> v7) (mut_final<Seq<a3>> v8) (mut_final<Seq<a3>> v7))) (= (seq.len (mut_final<Seq<a3>> v7)) (seq.len (mut_current<Seq<a3>> v7))))) (p5 v8 v0 v1 v2 v4 v5 v6))))
+(assert (forall ((v0 A7_Tuple<Mut<Seq<a3>>>) (v1 (Seq a3)) (v2 (Seq a3)) (v3 A4_Mut<Seq<a3>>) (v4 (Seq a3)) (v5 (Seq a3)) (v6 (Seq a3)) (v7 (Seq a3)) (v8 (Seq a3)) (v9 A4_Mut<Seq<a3>>) (v10 A6_Tuple) (v11 (Seq a3)) (v12 (Seq a3)) (v13 (Seq a3)) (v14 (Seq a3)) (v15 (Seq a3)) (v16 A4_Mut<Seq<a3>>) (v17 A7_Tuple<Mut<Seq<a3>>>)) (=> (and (= v0 (tuple<Mut<Seq<a3>>> (mut<Seq<a3>> v6 v5))) (= (mut<Seq<a3>> v6 v5) (mut<Seq<a3>> v2 v4)) (= (mut<Seq<a3>> v13 v12) (mut<Seq<a3>> v8 v11)) (p5 (mut<Seq<a3>> v15 v14) v7 v8 v9 v11 v12 v13) (p4 v9 (mut<Seq<a3>> v8 v7)) (= (mut_final<Seq<a3>> (mut<Seq<a3>> v11 v7)) (mut_current<Seq<a3>> (mut<Seq<a3>> v11 v7))) (= (mut<Seq<a3>> v2 v1) (mut<Seq<a3>> v15 v14)) (= v3 v9) (= (mut_final<Seq<a3>> (mut<Seq<a3>> v4 v1)) (mut_current<Seq<a3>> (mut<Seq<a3>> v4 v1))) (= v16 v3) (= v17 v0) (not (and (and (and (p_invariant_54ea0603cb7c1bc611daa24df0369fc6_3 v17) (= (mut_current<Seq<a3>> (tuple_proj<Mut<Seq<a3>>>.0 v17)) (mut_current<Seq<a3>> v16))) (= (mut_final<Seq<a3>> (tuple_proj<Mut<Seq<a3>>>.0 v17)) (mut_final<Seq<a3>> v16))) (= (seq.len (mut_final<Seq<a3>> v16)) (seq.len (mut_current<Seq<a3>> v16)))))) false)))
+(assert (forall ((v0 A4_Mut<Seq<a3>>) (v1 A4_Mut<Seq<a3>>)) (=> (and  true) (p4 v1 v1))))

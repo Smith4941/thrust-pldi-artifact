@@ -1,0 +1,1745 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use num_bigint::BigInt;
+use rustc_index::IndexVec;
+use rustc_middle::mir::{Local, Mutability};
+use rustc_middle::ty as mir_ty;
+use rustc_span::def_id::DefId;
+
+use super::basic_block::BasicBlockType;
+use crate::analyze::{DefIdCache, EnumDefs, TypeParam, TypeParamMap};
+use crate::chc;
+use crate::refine;
+use crate::rty;
+
+/// The model of a contiguous sequence of `elem_ty`: the native sequence that `thrust_models`
+/// gives to `Vec<T>`, `[T]` and `[T; N]` alike.
+///
+/// A concrete element type never needs this: `<Vec<i64> as Model>::Ty` normalizes to
+/// `model::Seq<model::Int>`, which `model_adt` maps to the same type. A generic element type
+/// does not get that far: where it is not bounded by `Model` the projection does not normalize,
+/// and where it is, the nested alias it leaves behind makes `resolve_model_ty` discard the
+/// normalization. The element's model is then the element type as `build` sees it, a type
+/// parameter, and the sequence over it is spelled out here.
+fn seq_model_type<V>(elem_ty: rty::Type<V>) -> rty::Type<V> {
+    rty::Type::Seq(Box::new(rty::RefinedType::unrefined(elem_ty)))
+}
+
+/// The model of an iterator over a contiguous sequence: the `(base, cursor)` pair, where the
+/// cursor is the position of the element the next `next` will return and the base is the whole
+/// sequence the iterator was made from.
+///
+/// Spelling the pair out here is what lets the element type be a type parameter, the same way
+/// `seq_model_type` does for the sequence types themselves. Unlike those, though, the struct
+/// traversal is not merely unhelpful for these three but impossible: every one of them reaches
+/// a `*const T` through `NonNull`, which has no model at any element type at all.
+fn seq_iter_model_type<V>(base_ty: rty::Type<V>) -> rty::Type<V> {
+    rty::TupleType::new(vec![
+        rty::PointerType::own(base_ty).into(),
+        rty::PointerType::own(rty::Type::int()).into(),
+    ])
+    .into()
+}
+
+/// The model of `slice::IterMut`: the two halves of the `&mut [T]` it was made from, as
+/// separate sequences, and the cursor.
+///
+/// The two halves are named rather than carried as one `Mut`, because a `Mut` here would not
+/// be a borrow of the iterator's own. The drop rule resolves every `Mut` it finds while
+/// walking a dying local's model, which is right for a borrow that ends there and wrong for a
+/// second name of a pair the caller still holds: the iterator freezes its base, so the pair's
+/// current half stops following the writes, and resolving it would equate what the caller
+/// passed in with what the writes produced. `iter_mut` relates the two sequences to the
+/// reference itself, and states the length preservation that the drop rule used to supply.
+fn mut_seq_iter_model_type<V: Clone>(seq_ty: rty::Type<V>) -> rty::Type<V> {
+    rty::TupleType::new(vec![
+        rty::PointerType::own(seq_ty.clone()).into(),
+        rty::PointerType::own(seq_ty).into(),
+        rty::PointerType::own(rty::Type::int()).into(),
+    ])
+    .into()
+}
+
+/// The element type of one of the three sequence iterators.
+///
+/// It is the first type argument, but not the first argument: `slice::Iter` and
+/// `slice::IterMut` take a lifetime ahead of it and `vec::IntoIter` an allocator behind it.
+fn iterated_elem_ty<'tcx>(
+    ty: mir_ty::Ty<'tcx>,
+    args: &'tcx mir_ty::List<mir_ty::GenericArg<'tcx>>,
+) -> mir_ty::Ty<'tcx> {
+    args.types()
+        .next()
+        .unwrap_or_else(|| panic!("sequence iterator without an element type: {ty:?}"))
+}
+
+pub trait TemplateRegistry {
+    fn register_template<V: chc::Var>(&mut self, tmpl: rty::Template<V>) -> rty::RefinedType<V>;
+}
+
+impl<T> TemplateRegistry for &mut T
+where
+    T: TemplateRegistry + ?Sized,
+{
+    fn register_template<V: chc::Var>(&mut self, tmpl: rty::Template<V>) -> rty::RefinedType<V> {
+        T::register_template(self, tmpl)
+    }
+}
+
+/// [`TemplateScope`] with no variables in scope.
+#[derive(Clone, Default)]
+pub struct EmptyTemplateScope;
+
+impl TemplateScope for EmptyTemplateScope {
+    type Var = rty::Closed;
+    fn build_template(&self) -> rty::TemplateBuilder<Self::Var> {
+        rty::TemplateBuilder::default()
+    }
+}
+
+pub trait TemplateScope {
+    type Var: chc::Var;
+    fn build_template(&self) -> rty::TemplateBuilder<Self::Var>;
+}
+
+impl<T> TemplateScope for &T
+where
+    T: TemplateScope,
+{
+    type Var = T::Var;
+    fn build_template(&self) -> rty::TemplateBuilder<Self::Var> {
+        T::build_template(self)
+    }
+}
+
+impl<T> TemplateScope for rty::TemplateBuilder<T>
+where
+    T: chc::Var,
+{
+    type Var = T;
+    fn build_template(&self) -> rty::TemplateBuilder<T> {
+        self.clone()
+    }
+}
+
+/// Translates [`mir_ty::Ty`] to [`rty::RefinedType`].
+///
+/// This struct implements a translation from Rust MIR types to Thrust types.
+/// Thrust types may contain refinement predicates which do not exist in MIR types, and
+/// [`TypeBuilder::build`] leaves them unrefined. An unsigned integer becomes [`rty::Type::UInt`]
+/// with its width, whose values are in range by the type itself. This also provides
+/// [`TypeBuilder::for_template`] to build refinement types by filling unknown predicates with
+/// templates with predicate variables.
+#[derive(Clone)]
+pub struct TypeBuilder<'tcx> {
+    tcx: mir_ty::TyCtxt<'tcx>,
+    def_ids: DefIdCache<'tcx>,
+    owner_fn_id: DefId,
+    typing_env: mir_ty::TypingEnv<'tcx>,
+    /// Maps index in [`mir_ty::ParamTy`] to [`rty::TypeParamIdx`].
+    /// These indices may differ because we skip lifetime parameters and they always need to be
+    /// mapped when we translate a [`mir_ty::ParamTy`] to [`rty::ParamType`].
+    /// See [`rty::TypeParamIdx`] for more details.
+    param_idx_mapping: HashMap<u32, rty::TypeParamIdx>,
+    type_params: Rc<RefCell<TypeParamMap<'tcx>>>,
+    closure_type_params: Rc<RefCell<HashMap<TypeParam, rty::FunctionType>>>,
+    system: Rc<RefCell<chc::System>>,
+    enum_defs: Rc<RefCell<EnumDefs>>,
+    /// The structs whose fields are being built, outermost first.
+    structs_in_progress: Rc<RefCell<Vec<mir_ty::Ty<'tcx>>>>,
+}
+
+// TODO: Fold `TypeBuilder::closure_trait_ret` into `closure_trait_call` so that one function
+// resolves a closure-typed parameter's whole call signature instead of two halves reporting the
+// parameters and the return type separately.
+/// What a `Fn`/`FnMut`/`FnOnce` bound says about calling a closure-typed parameter: the parameters
+/// of the call, and which of the three traits the bound is. The return type comes separately, from
+/// [`TypeBuilder::closure_trait_ret`].
+struct ClosureTraitCall {
+    params: IndexVec<rty::FunctionParamIdx, rty::RefinedType<rty::FunctionParamIdx>>,
+    kind: mir_ty::ClosureKind,
+}
+
+/// `s` with every character a symbol name cannot hold replaced by `_`.
+fn symbol_chars(s: &str) -> String {
+    s.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '.', "_")
+}
+
+/// The sort a closure precondition takes its upvars in.
+///
+/// An `FnMut` closure receives its upvars behind a `&mut`, whose prophecy is still unconstrained
+/// where the precondition has to be discharged; the precondition therefore names their current
+/// value rather than the `Mut` pair. `Fn` and `FnOnce` carry no prophecy to drop.
+fn pre_upvars_sort(upvars: chc::Sort, closure_kind: mir_ty::ClosureKind) -> chc::Sort {
+    match closure_kind {
+        mir_ty::ClosureKind::FnMut => upvars.deref(),
+        mir_ty::ClosureKind::Fn | mir_ty::ClosureKind::FnOnce => upvars,
+    }
+}
+
+/// The upvars term matching [`pre_upvars_sort`].
+fn pre_upvars_term<V>(upvars: chc::Term<V>, closure_kind: mir_ty::ClosureKind) -> chc::Term<V> {
+    match closure_kind {
+        mir_ty::ClosureKind::FnMut => upvars.mut_current(),
+        mir_ty::ClosureKind::Fn | mir_ty::ClosureKind::FnOnce => upvars,
+    }
+}
+
+/// The parts of [`TypeBuilder::build_ty_in`] where an unrefined type ([`TypeBuilder::build`]) and
+/// a template ([`TemplateTypeBuilder::build`]) differ: the two that allocate predicate variables
+/// in a template.
+trait TyMode<'tcx> {
+    type Var: chc::Var;
+    /// The type of a function pointer with the signature `sig`.
+    fn fn_ptr(&mut self, b: &TypeBuilder<'tcx>, sig: mir_ty::FnSig<'tcx>) -> rty::Type<Self::Var>;
+    /// The type of a type argument `ty` of an enum.
+    fn enum_arg(
+        &mut self,
+        b: &TypeBuilder<'tcx>,
+        ty: mir_ty::Ty<'tcx>,
+    ) -> rty::RefinedType<Self::Var>;
+}
+
+struct Unrefined;
+
+impl<'tcx> TyMode<'tcx> for Unrefined {
+    type Var = rty::Closed;
+
+    fn fn_ptr(
+        &mut self,
+        b: &TypeBuilder<'tcx>,
+        sig: mir_ty::FnSig<'tcx>,
+    ) -> rty::Type<rty::Closed> {
+        let mut params: IndexVec<rty::FunctionParamIdx, _> = sig
+            .inputs()
+            .iter()
+            .map(|ty| b.build(*ty).vacuous())
+            .collect();
+        // A function without parameters has a unit one in its type, as the template builder
+        // gives it, so that a function of either kind is a value of this pointer type.
+        if params.is_empty() {
+            params.push(rty::RefinedType::unrefined(rty::Type::unit()));
+        }
+        let ret = b.build(sig.output());
+        rty::FunctionType::new(params, ret.vacuous()).into()
+    }
+
+    fn enum_arg(
+        &mut self,
+        b: &TypeBuilder<'tcx>,
+        ty: mir_ty::Ty<'tcx>,
+    ) -> rty::RefinedType<rty::Closed> {
+        b.build(ty)
+    }
+}
+
+impl<'tcx> TypeBuilder<'tcx> {
+    pub fn new(
+        tcx: mir_ty::TyCtxt<'tcx>,
+        def_ids: DefIdCache<'tcx>,
+        owner_fn_id: DefId,
+        type_params: Rc<RefCell<TypeParamMap<'tcx>>>,
+        closure_type_params: Rc<RefCell<HashMap<TypeParam, rty::FunctionType>>>,
+        system: Rc<RefCell<chc::System>>,
+        enum_defs: Rc<RefCell<EnumDefs>>,
+    ) -> Self {
+        let generics = tcx.generics_of(owner_fn_id);
+        let mut param_idx_mapping: HashMap<u32, rty::TypeParamIdx> = Default::default();
+        for i in 0..generics.count() {
+            let generic_param = generics.param_at(i, tcx);
+            match generic_param.kind {
+                mir_ty::GenericParamDefKind::Lifetime => {}
+                mir_ty::GenericParamDefKind::Type { .. } => {
+                    param_idx_mapping.insert(i as u32, param_idx_mapping.len().into());
+                }
+                mir_ty::GenericParamDefKind::Const { .. } => {}
+            }
+        }
+
+        tracing::debug!("TypeBuilder is created for {owner_fn_id:?} with param_idx_mapping {param_idx_mapping:#?}.");
+        let typing_env = mir_ty::TypingEnv::post_analysis(tcx, owner_fn_id);
+        Self {
+            tcx,
+            def_ids,
+            owner_fn_id,
+            typing_env,
+            param_idx_mapping,
+            type_params,
+            closure_type_params,
+            system,
+            enum_defs,
+            structs_in_progress: Default::default(),
+        }
+    }
+
+    pub fn owner_fn_id(&self) -> DefId {
+        self.owner_fn_id
+    }
+
+    /// Registers the definition of the enum `def_id` in the crate's enum definitions, unless it is
+    /// registered or being built, so that the facts of its payloads can be read wherever a type
+    /// this builder makes is used (`rty::RefinedType::formula_with`).
+    fn register_enum_def(&self, def_id: DefId) {
+        if !self.enum_defs.borrow_mut().start_building(def_id) {
+            return;
+        }
+        let def = self.build_enum_def(def_id);
+        self.enum_defs.borrow_mut().insert(def_id, def);
+    }
+
+    /// The definition of the enum `def_id`: its variants with their discriminants and the types
+    /// of their fields over the enum's own type parameters.
+    pub fn build_enum_def(&self, def_id: DefId) -> rty::EnumDatatypeDef {
+        let adt = self.tcx.adt_def(def_id);
+        let builder = TypeBuilder::new(
+            self.tcx,
+            self.def_ids.clone(),
+            def_id,
+            self.type_params.clone(),
+            self.closure_type_params.clone(),
+            self.system.clone(),
+            self.enum_defs.clone(),
+        );
+
+        let name = refine::datatype_symbol(self.tcx, def_id);
+        let variants: IndexVec<_, _> = adt
+            .variants()
+            .iter()
+            .zip(adt.discriminants(self.tcx))
+            .map(|(variant, (_, discr))| {
+                let discr = discr_value(self.tcx, discr);
+                let field_tys = variant
+                    .fields
+                    .iter()
+                    .map(|field| builder.build(self.tcx.type_of(field.did).instantiate_identity()))
+                    .collect();
+                rty::EnumVariantDef {
+                    name: refine::variant_symbol(&name, variant.name),
+                    discr,
+                    field_tys,
+                }
+            })
+            .collect();
+
+        let generics = self.tcx.generics_of(def_id);
+        let ty_params = (0..generics.count())
+            .filter(|idx| {
+                matches!(
+                    generics.param_at(*idx, self.tcx).kind,
+                    mir_ty::GenericParamDefKind::Type { .. }
+                )
+            })
+            .count();
+        tracing::debug!(?def_id, ?name, ?ty_params, "ty_params count");
+
+        rty::EnumDatatypeDef {
+            name,
+            ty_params,
+            variants,
+        }
+    }
+
+    /// Returns the def_id of the declaration site of the given type parameter.
+    ///
+    /// For impl methods, an inherited parameter (e.g. the impl's `I`) reports
+    /// the def_id of the parameter declared on the impl block, so all uses
+    /// of that parameter across the impl's methods share a single cache key.
+    pub fn param_def_id(&self, ty: &mir_ty::ParamTy) -> DefId {
+        let generics = self.tcx.generics_of(self.owner_fn_id);
+        generics.param_at(ty.index as usize, self.tcx).def_id
+    }
+
+    /// Returns the local index of a type parameter within the declaring item,
+    /// skipping lifetime and const parameters. This is the position used for
+    /// monomorphization of generic arguments.
+    pub fn param_local_idx(&self, ty: &mir_ty::ParamTy) -> u32 {
+        let idx = self
+            .param_idx_mapping
+            .get(&ty.index)
+            .expect("unknown type param idx");
+        u32::from(*idx)
+    }
+
+    fn translate_param_type(&self, ty: &mir_ty::ParamTy) -> rty::Type<rty::Closed> {
+        // FIXME:
+        // `__ThrustSelf` is currently treated as a distinct `ParamTy` from `Self`,
+        // which can lead to cache/key mismatches (e.g. in `TypeParamMap`).
+        //
+        // We currently normalize it here as a workaround, but this should be done
+        // earlier during type translation/analysis so that all internal
+        // representations consistently use the canonical `Self` parameter.
+        if ty.name.as_str() == "__ThrustSelf" {
+            let parent_def_id = self.tcx.parent(self.owner_fn_id);
+            let self_ty_def = self
+                .tcx
+                .generics_of(parent_def_id)
+                .own_params
+                .iter()
+                .find(|ty| ty.name.as_str() == "Self")
+                .expect("Type parameter `Self` is not found.");
+
+            let self_ty = mir_ty::ParamTy::new(self_ty_def.index, self_ty_def.name);
+            tracing::debug!("replace {ty:?} with {self_ty:?}.");
+            return self.translate_param_type(&self_ty);
+        }
+        let param_local_idx = self.param_local_idx(ty);
+
+        let param_def_id = self.param_def_id(ty);
+        tracing::debug!("translating ParamTy {ty:?} (decl={param_def_id:?})...");
+
+        let mut type_params = self.type_params.borrow_mut();
+        let forall_sort_idx = type_params
+            .entry(TypeParam::GenericType {
+                param_def_id,
+                local_idx: param_local_idx,
+            })
+            .or_insert_with(|| {
+                let desc = format!("ParamTy {:?} (decl={:?})", ty, param_def_id);
+                let debug_info = chc::DebugInfo::default().with_context("type_param", desc.clone());
+                let idx = self.system.borrow_mut().new_forall_sort(debug_info);
+                tracing::debug!("issue the new ForallSortIdx {} for {desc}.", idx);
+                idx
+            });
+        rty::ParamType::new(rty::TypeParamIdx::from(param_local_idx), *forall_sort_idx).into()
+    }
+
+    fn translate_alias_type(&self, ty: &mir_ty::AliasTy<'tcx>) -> rty::Type<rty::Closed> {
+        let projection = mir_ty::Ty::new_projection(self.tcx, ty.def_id, ty.args);
+        if let Ok(normalized) = self
+            .tcx
+            .try_normalize_erasing_regions(self.typing_env, projection)
+        {
+            if normalized != projection {
+                tracing::debug!(
+                    "alias projection {:#?} normalized to {:#?}",
+                    projection,
+                    normalized
+                );
+                return self.build_ty(normalized);
+            }
+        }
+
+        // `<T as Model>::Ty` that rustc cannot normalize because `T` contains a
+        // projection that is stuck (an associated type of an instantiation that
+        // satisfies no impl, such as `<Map<Range, Closure<..>> as Iterator>::Item`
+        // where the closure model does not implement `Fn`). The model of `T` is
+        // what `build` computes structurally, so take it rather than standing a
+        // forall sort for the whole of `T`'s model: a `Seq<..>` binder would
+        // otherwise lose its sequence sort.
+        if Some(ty.def_id) == self.def_ids.model_ty() {
+            let modeled = ty.args.type_at(0);
+            tracing::debug!(
+                "alias projection {:#?} is the model of {:#?}; built structurally",
+                projection,
+                modeled
+            );
+            return self.build_ty(modeled);
+        }
+
+        let args: Vec<rty::Type<rty::Closed>> = ty.args.types().map(|t| self.build_ty(t)).collect();
+        // The arguments' sorts do not tell two projections apart (`<(T, A) as Tr>::Out` and
+        // `<(T, B) as Tr>::Out` for two structs of one sort); their Rust types do.
+        let args_symbol = self.generic_args_symbol(ty.args);
+        let mut type_params = self.type_params.borrow_mut();
+        tracing::debug!(?type_params);
+        let index = type_params
+            .entry(TypeParam::AssocType(ty.def_id, args.clone(), args_symbol))
+            .or_insert_with(|| {
+                let desc = format!(
+                    "AliasTy {:?} with (def_id = {:?}, args = {:?})",
+                    ty, ty.def_id, args
+                );
+                let debug_info = chc::DebugInfo::default().with_context("type_param", desc.clone());
+                let idx = self.system.borrow_mut().new_forall_sort(debug_info);
+                tracing::debug!("issue the new ForallSortIdx {} for {desc}.", idx);
+                idx
+            });
+
+        rty::AliasType::new(*index, args).into()
+    }
+
+    /// The contract of the closure-typed parameter `param_ty` of the function being analyzed,
+    /// registering it on first use from the bound `local_def_id` states at `generic_args`.
+    ///
+    /// A contract already registered for `param_ty` is kept: it was built from the bound of the
+    /// function declaring `param_ty`, while `local_def_id` may be a callee analyzed at that
+    /// function's arguments, whose bound can be of another closure kind.
+    pub(crate) fn closure_param_contract(
+        &self,
+        param_ty: mir_ty::ParamTy,
+        local_def_id: rustc_hir::def_id::LocalDefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> Option<rty::FunctionType> {
+        let type_param = TypeParam::GenericType {
+            param_def_id: self.param_def_id(&param_ty),
+            local_idx: self.param_local_idx(&param_ty),
+        };
+        if let Some(contract) = self.closure_type_params.borrow().get(&type_param) {
+            return Some(contract.clone());
+        }
+        let contract = self.build_closure_type_for_param(param_ty, local_def_id, generic_args)?;
+        self.register_closure_type_param(type_param, contract.clone());
+        Some(contract)
+    }
+
+    pub(crate) fn register_closure_type_param(
+        &self,
+        type_param: TypeParam,
+        fun_type: rty::FunctionType,
+    ) {
+        tracing::info!(?type_param, ?fun_type, "register_closure_type_param");
+        self.closure_type_params
+            .borrow_mut()
+            .insert(type_param, fun_type);
+    }
+
+    /// Replaces {closure} types with thrust_models::Closure<{closure}>.
+    ///
+    /// Ideally, we want to have `impl<F> Model for F where F: Fn` instead of this and let
+    /// normalization do the work. However, it doesn't work:
+    /// 1. it simply conflicts with other blanket impls
+    /// 2. attempts to fake the impl via override_queries have failed so far
+    fn replace_closure_model(&self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        let Some(closure_model_id) = self.def_ids.closure_model() else {
+            return ty;
+        };
+
+        struct ReplaceClosureModel<'tcx> {
+            tcx: mir_ty::TyCtxt<'tcx>,
+            closure_model_id: DefId,
+        }
+
+        use mir_ty::TypeFoldable;
+        impl<'tcx> mir_ty::TypeFolder<mir_ty::TyCtxt<'tcx>> for ReplaceClosureModel<'tcx> {
+            fn cx(&self) -> mir_ty::TyCtxt<'tcx> {
+                self.tcx
+            }
+
+            fn fold_ty(&mut self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+                use mir_ty::TypeSuperFoldable;
+                if let mir_ty::TyKind::Closure(_, args) = ty.kind() {
+                    let args = self
+                        .tcx
+                        .mk_args(&[args.as_closure().tupled_upvars_ty().into()]);
+                    let adt_def = self.tcx.adt_def(self.closure_model_id);
+                    return mir_ty::Ty::new_adt(self.tcx, adt_def, args);
+                }
+                // A function item is a closure without captures: its model is the unit.
+                if let mir_ty::TyKind::FnDef(..) = ty.kind() {
+                    let args = self.tcx.mk_args(&[self.tcx.types.unit.into()]);
+                    let adt_def = self.tcx.adt_def(self.closure_model_id);
+                    return mir_ty::Ty::new_adt(self.tcx, adt_def, args);
+                }
+                ty.super_fold_with(self)
+            }
+        }
+
+        ty.fold_with(&mut ReplaceClosureModel {
+            tcx: self.tcx,
+            closure_model_id,
+        })
+    }
+
+    /// The typing environment extended with `P: Model` for every type parameter `P` of `ty`.
+    ///
+    /// The model of a parameter is built as the parameter itself, bound or not, so an impl such
+    /// as `impl<I, T: Model> Model for Wrap<I, T>` applies to `Wrap<I, T>` in a function that
+    /// leaves `T` unbounded, and the type gets the same lowering as it has where `T` is bound.
+    fn params_are_models(
+        &self,
+        model_ty_def_id: DefId,
+        ty: mir_ty::Ty<'tcx>,
+    ) -> mir_ty::TypingEnv<'tcx> {
+        use rustc_middle::ty::Upcast as _;
+        let model_trait = self.tcx.parent(model_ty_def_id);
+        let assumed = ty.walk().filter_map(|arg| match arg.kind() {
+            mir_ty::GenericArgKind::Type(t) if matches!(t.kind(), mir_ty::TyKind::Param(_)) => {
+                let trait_ref = mir_ty::TraitRef::new(self.tcx, model_trait, [t]);
+                Some(trait_ref.upcast(self.tcx))
+            }
+            _ => None,
+        });
+        let clauses = self.tcx.mk_clauses_from_iter(
+            self.typing_env
+                .param_env
+                .caller_bounds()
+                .iter()
+                .chain(assumed),
+        );
+        mir_ty::TypingEnv {
+            param_env: mir_ty::ParamEnv::new(clauses),
+            ..self.typing_env
+        }
+    }
+
+    pub fn resolve_model_ty(&self, orig_ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        let replaced = self.replace_closure_model(orig_ty);
+
+        let Some(model_ty_def_id) = self.def_ids.model_ty() else {
+            return replaced;
+        };
+        // Normalize with the closure types intact first: an impl bound such as
+        // `F: Fn(..)` holds of the closure itself and not of its `Closure<..>`
+        // model, so a projection through such an impl (`<Map<Range, {closure}>
+        // as Iterator>::Item`) resolves only on the original type. The closure
+        // models are put in place on the result.
+        for (params_are_models, ty) in [(false, orig_ty), (false, replaced), (true, orig_ty)] {
+            let typing_env = if params_are_models {
+                self.params_are_models(model_ty_def_id, ty)
+            } else {
+                self.typing_env
+            };
+            let args = self.tcx.mk_args(&[ty.into()]);
+            tracing::debug!("generic args are {:#?}.", args);
+            let projection_ty = mir_ty::Ty::new_projection(self.tcx, model_ty_def_id, args);
+            let Ok(normalized_ty) = self
+                .tcx
+                .try_normalize_erasing_regions(typing_env, projection_ty)
+            else {
+                continue;
+            };
+            tracing::debug!(
+                "the type {:#?} is normalized as the type {:#?}.",
+                orig_ty,
+                normalized_ty
+            );
+            // A partly normalized result is still progress: `build` expands the
+            // `Model::Ty` projections left inside it. Only a result that still
+            // projects `ty` itself has to be rejected, or `build` would come back here.
+            let stuck_on_ty = normalized_ty.walk().any(|arg| {
+                if let mir_ty::GenericArgKind::Type(t) = arg.kind() {
+                    matches!(
+                        t.kind(),
+                        mir_ty::TyKind::Alias(_, alias_ty)
+                            if alias_ty.def_id == model_ty_def_id && alias_ty.args.type_at(0) == ty
+                    )
+                } else {
+                    false
+                }
+            });
+            if !stuck_on_ty {
+                return self.replace_closure_model(normalized_ty);
+            }
+        }
+        // The type itself may still normalize where its model does not, and only with the
+        // closure types intact: left as the projection `<Filter<I, {closure}> as Iterator>::Item`,
+        // it would get a forall sort of its own apart from the sort of the type it stands for.
+        let normalized = self
+            .tcx
+            .try_normalize_erasing_regions(self.typing_env, orig_ty)
+            .unwrap_or(orig_ty);
+        let replaced = self.replace_closure_model(normalized);
+        tracing::debug!(
+            "the type {:#?} is replaced as the {:#?}.",
+            orig_ty,
+            replaced
+        );
+        replaced
+    }
+
+    /// The field of the struct `ty` that *is* the whole value in the logic, so that reading it
+    /// -- or building the struct out of it -- is the identity rather than a projection.
+    ///
+    /// A struct whose `Model::Ty` is the model of one of its fields does not survive as a
+    /// struct here: [`build`](Self::build) resolves it to that model and the struct's own
+    /// fields are never traversed. A field access then has nothing to project out of, and the
+    /// field index would otherwise be read as an index into the model -- the first field of
+    /// `IndexVec { raw: Vec<T>, _marker: PhantomData<I> }` and the first component of the
+    /// `(elements, length)` pair its model is are both `0`, so `.raw` would silently come back
+    /// as the element array instead of the whole sequence.
+    ///
+    /// The struct is user code that cannot be marked -- unlike `Closure<T>` and `Ghost<T>`,
+    /// which are lowered through their content by an attribute -- so this is checked: exactly
+    /// one field is not of singleton sort, and it has the sort of the struct's model. That keeps
+    /// the answer in step with the lowering actually chosen: where the model cannot be resolved
+    /// and the struct is traversed after all, the fields really are projections and this says
+    /// so. The other fields are inert, so the identity does not drop anything the model carries.
+    pub fn transparent_field(&self, ty: mir_ty::Ty<'tcx>) -> Option<usize> {
+        let mir_ty::TyKind::Adt(def, args) = ty.kind() else {
+            return None;
+        };
+        if !def.is_struct() {
+            return None;
+        }
+        let model_sort = self.build(ty).to_sort();
+        let mut live = def.all_fields().enumerate().filter_map(|(idx, field)| {
+            let sort = self.build(field.ty(self.tcx, args)).to_sort();
+            (!sort.is_singleton()).then_some((idx, sort))
+        });
+        match (live.next(), live.next()) {
+            (Some((idx, sort)), None) if sort == model_sort => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// Builds the type of `thrust_models::model::BitVec<WIDTH, SIGNED>` from its generic `args`.
+    /// The width of the model type `UIntN<BITS>` or `IntN<BITS>`.
+    fn uint_n_width(&self, args: mir_ty::GenericArgsRef<'tcx>) -> u32 {
+        let width = args
+            .const_at(0)
+            .try_to_target_usize(self.tcx)
+            .expect("the width of UIntN or IntN must be a known constant");
+        width.try_into().unwrap()
+    }
+
+    fn build_bit_vec(&self, args: mir_ty::GenericArgsRef<'tcx>) -> rty::BitVecType {
+        let width = args
+            .const_at(0)
+            .try_to_target_usize(self.tcx)
+            .expect("BitVec width must be a known constant");
+        let signed = args
+            .const_at(1)
+            .try_to_value()
+            .and_then(|value| value.try_to_bool())
+            .expect("BitVec signedness must be a known constant");
+        rty::BitVecType {
+            width: width.try_into().unwrap(),
+            signed,
+        }
+    }
+
+    fn model_adt<M: TyMode<'tcx>>(
+        &self,
+        m: &mut M,
+        adt: &mir_ty::AdtDef<'tcx>,
+        args: &'tcx mir_ty::List<mir_ty::GenericArg<'tcx>>,
+    ) -> Option<rty::Type<M::Var>> {
+        if Some(adt.did()) == self.def_ids.int_model() {
+            return Some(rty::Type::int());
+        }
+        if Some(adt.did()) == self.def_ids.dyn_model() {
+            return Some(rty::Type::opaque());
+        }
+        if Some(adt.did()) == self.def_ids.uint_model() {
+            return Some(rty::Type::uint());
+        }
+        if Some(adt.did()) == self.def_ids.uint_n_model() {
+            return Some(rty::Type::uint_of_width(self.uint_n_width(args)));
+        }
+        if Some(adt.did()) == self.def_ids.int_n_model() {
+            return Some(rty::Type::int_of_width(self.uint_n_width(args)));
+        }
+
+        if Some(adt.did()) == self.def_ids.bit_vec_model() {
+            return Some(rty::Type::BitVec(self.build_bit_vec(args)));
+        }
+
+        if Some(adt.did()) == self.def_ids.mut_model() {
+            let elem_ty = self.build_in(m, args.type_at(0));
+            return Some(rty::PointerType::mut_to_refined(elem_ty).into());
+        }
+
+        if Some(adt.did()) == self.def_ids.box_model() {
+            let elem_ty = self.build_ty_in(m, args.type_at(0));
+            return Some(rty::PointerType::own(elem_ty).into());
+        }
+
+        if Some(adt.did()) == self.def_ids.seq_model() {
+            let elem_ty = self.build_ty_in(m, args.type_at(0));
+            return Some(rty::Type::Seq(Box::new(rty::RefinedType::unrefined(
+                elem_ty,
+            ))));
+        }
+
+        if Some(adt.did()) == self.def_ids.array_model() {
+            let idx_ty = self.build_ty_in(m, args.type_at(0));
+            let elem_ty = self.build_ty_in(m, args.type_at(1));
+            return Some(rty::ArrayType::new(idx_ty, elem_ty).into());
+        }
+
+        if Some(adt.did()) == self.def_ids.closure_model() {
+            let tupled_upvars_ty = args.type_at(0);
+            return Some(self.build_ty_in(m, tupled_upvars_ty));
+        }
+
+        // TODO: keep this in step with `impl<T: Model> Model for Ghost<T>` in std.rs, which
+        // resolves a `Ghost<T>` to its content as well, and with `spec_value_view` in
+        // `analyze::annot_fn`, which compares a `pre!`/`post!` argument's type the same way (it
+        // also follows the `Box` and `Closure<F>` cases above).
+        //
+        // Which of the two applies is not evident from the source: a concrete `Ghost<i64>`
+        // normalizes and never reaches here, while a generic one does, because
+        // `resolve_model_ty` either fails to normalize it or discards the partly normalized
+        // result. See that impl for why it cannot be a fixed point like the models above.
+        if Some(adt.did()) == self.def_ids.ghost_model() {
+            let content_ty = args.type_at(0);
+            return Some(self.build_ty_in(m, content_ty));
+        }
+
+        None
+    }
+
+    /// The type of a tuple element or struct field, boxed (elaboration: all fields are boxed).
+    fn field_type<M: TyMode<'tcx>>(
+        &self,
+        m: &mut M,
+        ty: mir_ty::Ty<'tcx>,
+    ) -> rty::PointerType<M::Var> {
+        rty::PointerType::own_refined(self.build_in(m, ty))
+    }
+
+    pub fn build(&self, ty: mir_ty::Ty<'tcx>) -> rty::RefinedType<rty::Closed> {
+        rty::RefinedType::unrefined(self.build_ty(ty))
+    }
+
+    /// The `<A1-A2-...>` suffix of a symbol that stands for an item at the generic arguments
+    /// `args`, empty when there are none. The arguments are named as Rust types rather than by
+    /// their sorts, which many types share (every integer width, `&T` and `Box<T>`, structs with
+    /// the same fields), so that the item at two types is two symbols. A type parameter is named
+    /// by its sort, which is its own, and a projection that does not normalize by its associated
+    /// item and arguments.
+    pub fn generic_args_symbol(&self, args: mir_ty::GenericArgsRef<'tcx>) -> String {
+        let names: Vec<String> = args
+            .iter()
+            .filter_map(|arg| match arg.kind() {
+                mir_ty::GenericArgKind::Type(ty) => Some(self.type_symbol(ty)),
+                mir_ty::GenericArgKind::Const(ct) => Some(self.const_symbol(ct)),
+                mir_ty::GenericArgKind::Lifetime(_) => None,
+            })
+            .collect();
+        if names.is_empty() {
+            return String::new();
+        }
+        format!("<{}>", names.join("-"))
+    }
+
+    fn type_symbol(&self, ty: mir_ty::Ty<'tcx>) -> String {
+        use mir_ty::TyKind;
+
+        let tcx = self.tcx;
+        match ty.kind() {
+            TyKind::Param(_) => chc::format_context::format_sort_symbol(&self.build(ty).to_sort()),
+            TyKind::Alias(_, alias) => {
+                let normalized = tcx
+                    .try_normalize_erasing_regions(self.typing_env, ty)
+                    .unwrap_or(ty);
+                if normalized != ty {
+                    return self.type_symbol(normalized);
+                }
+                format!(
+                    "{}{}",
+                    refine::stable_def_id_symbol(tcx, alias.def_id, "assoc"),
+                    self.generic_args_symbol(alias.args)
+                )
+            }
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_) => {
+                ty.to_string()
+            }
+            TyKind::Str => "str".to_owned(),
+            TyKind::Never => "Never".to_owned(),
+            TyKind::Ref(_, elem, mutbl) => {
+                let name = match mutbl {
+                    Mutability::Not => "Ref",
+                    Mutability::Mut => "RefMut",
+                };
+                format!("{name}<{}>", self.type_symbol(*elem))
+            }
+            TyKind::RawPtr(elem, mutbl) => {
+                let name = match mutbl {
+                    Mutability::Not => "Ptr",
+                    Mutability::Mut => "PtrMut",
+                };
+                format!("{name}<{}>", self.type_symbol(*elem))
+            }
+            TyKind::Tuple(tys) => {
+                let args = tcx.mk_args_from_iter(tys.iter().map(mir_ty::GenericArg::from));
+                format!("Tuple{}", self.generic_args_symbol(args))
+            }
+            TyKind::Slice(elem) => format!("Slice<{}>", self.type_symbol(*elem)),
+            TyKind::Array(elem, len) => {
+                format!(
+                    "Array<{}-{}>",
+                    self.type_symbol(*elem),
+                    self.const_symbol(*len)
+                )
+            }
+            TyKind::Adt(adt, args) => format!(
+                "{}{}",
+                refine::datatype_symbol(tcx, adt.did()),
+                self.generic_args_symbol(args)
+            ),
+            TyKind::FnDef(def_id, args) => format!(
+                "{}{}",
+                refine::stable_def_id_symbol(tcx, *def_id, "fn"),
+                self.generic_args_symbol(args)
+            ),
+            TyKind::Closure(def_id, args) => format!(
+                "{}{}",
+                refine::stable_def_id_symbol(tcx, *def_id, "closure"),
+                self.generic_args_symbol(tcx.mk_args(args.as_closure().parent_args()))
+            ),
+            _ => {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut hasher = std::hash::DefaultHasher::new();
+                format!("{ty:?}").hash(&mut hasher);
+                format!("Ty{:016x}", hasher.finish())
+            }
+        }
+    }
+
+    /// A const argument: a const parameter by the def path hash of its declaration, so that the
+    /// parameters of two items are two names, and any other const by its text, readable, with a
+    /// hash of the full text, which tells apart texts that differ only in characters a symbol
+    /// cannot hold (`'+'` and `'-'`).
+    fn const_symbol(&self, ct: mir_ty::Const<'tcx>) -> String {
+        let mir_ty::ConstKind::Param(param) = ct.kind() else {
+            use std::hash::{Hash as _, Hasher as _};
+            let text = ct.to_string();
+            let mut hasher = std::hash::DefaultHasher::new();
+            text.hash(&mut hasher);
+            return format!("{}_{:016x}", symbol_chars(&text), hasher.finish());
+        };
+        let generics = self.tcx.generics_of(self.owner_fn_id);
+        let def_id = generics.param_at(param.index as usize, self.tcx).def_id;
+        refine::stable_def_id_symbol(self.tcx, def_id, "const")
+    }
+
+    fn build_ty(&self, ty: mir_ty::Ty<'tcx>) -> rty::Type<rty::Closed> {
+        self.build_ty_in(&mut Unrefined, ty)
+    }
+
+    fn build_in<M: TyMode<'tcx>>(
+        &self,
+        m: &mut M,
+        ty: mir_ty::Ty<'tcx>,
+    ) -> rty::RefinedType<M::Var> {
+        rty::RefinedType::unrefined(self.build_ty_in(m, ty))
+    }
+
+    /// Builds `ty`, taking from `m` the parts where an unrefined type and a template differ.
+    fn build_ty_in<M: TyMode<'tcx>>(&self, m: &mut M, ty: mir_ty::Ty<'tcx>) -> rty::Type<M::Var> {
+        // An integer keeps its width, which its model `Int` or `UInt` does not have. A `char` is
+        // the `u32` of its code point.
+        if ty.is_integral() || ty.is_char() {
+            let width = ty.primitive_size(self.tcx).bits() as u32;
+            return if ty.is_signed() {
+                rty::Type::int_of_width(width)
+            } else {
+                rty::Type::uint_of_width(width)
+            };
+        }
+        // A trait object is opaque whatever `Model` impl it has: its value is never read.
+        if ty.is_trait() {
+            return rty::Type::opaque();
+        }
+        let ty = self.resolve_model_ty(ty);
+        match ty.kind() {
+            mir_ty::TyKind::Bool => rty::Type::bool(),
+            mir_ty::TyKind::Str => rty::Type::string(),
+            mir_ty::TyKind::RawPtr(..) | mir_ty::TyKind::Dynamic(..) => rty::Type::opaque(),
+            mir_ty::TyKind::Ref(_, elem_ty, mir_ty::Mutability::Not) => {
+                let elem_ty = self.build_in(m, *elem_ty);
+                rty::PointerType::immut_to_refined(elem_ty).into()
+            }
+            mir_ty::TyKind::Ref(_, elem_ty, mir_ty::Mutability::Mut) => {
+                let elem_ty = self.build_in(m, *elem_ty);
+                rty::PointerType::mut_to_refined(elem_ty).into()
+            }
+            mir_ty::TyKind::Tuple(ts) => {
+                // elaboration: all fields are boxed
+                let elems = ts.iter().map(|ty| self.field_type(m, ty).into()).collect();
+                rty::TupleType::new(elems).into()
+            }
+            mir_ty::TyKind::Never => rty::Type::never(),
+            mir_ty::TyKind::Param(ty) => self.translate_param_type(ty).vacuous(),
+            mir_ty::TyKind::FnPtr(sig_tys, hdr) => {
+                // TODO: justification for skip_binder
+                let sig = sig_tys.with(*hdr).skip_binder();
+                m.fn_ptr(self, sig)
+            }
+            mir_ty::TyKind::Slice(elem_ty) | mir_ty::TyKind::Array(elem_ty, _) => {
+                let elem_ty = self.build_ty_in(m, *elem_ty);
+                seq_model_type(elem_ty)
+            }
+            mir_ty::TyKind::Adt(def, params) => {
+                if let Some(model_ty) = self.model_adt(m, def, params) {
+                    return model_ty;
+                }
+                // Treat Box and Vec as opaque types to avoid traversing internal structure
+                if Some(def.did()) == self.def_ids.box_() {
+                    let elem_ty = self.build_ty_in(m, params.type_at(0));
+                    return rty::PointerType::own(elem_ty).into();
+                }
+                if Some(def.did()) == self.def_ids.vec() {
+                    let elem_ty = self.build_ty_in(m, params.type_at(0));
+                    return seq_model_type(elem_ty);
+                }
+                if Some(def.did()) == self.def_ids.slice_iter()
+                    || Some(def.did()) == self.def_ids.vec_into_iter()
+                {
+                    let elem_ty = self.build_ty_in(m, iterated_elem_ty(ty, params));
+                    return seq_iter_model_type(seq_model_type(elem_ty));
+                }
+                if Some(def.did()) == self.def_ids.slice_iter_mut() {
+                    let elem_ty = self.build_ty_in(m, iterated_elem_ty(ty, params));
+                    return mut_seq_iter_model_type(seq_model_type(elem_ty));
+                }
+                if def.is_enum() {
+                    let sym = refine::datatype_symbol(self.tcx, def.did());
+                    if rty::int_range_mode() != rty::IntRange::Off {
+                        self.register_enum_def(def.did());
+                    }
+                    let args: IndexVec<_, _> =
+                        params.types().map(|ty| m.enum_arg(self, ty)).collect();
+                    rty::EnumType::new(sym, args).into()
+                } else if def.is_struct() {
+                    // A struct is the tuple of its fields, which has no finite form when the
+                    // struct reaches itself through them. An enum is a datatype and may.
+                    if self.structs_in_progress.borrow().contains(&ty) {
+                        self.tcx.dcx().span_fatal(
+                            self.tcx.def_span(def.did()),
+                            format!(
+                                "thrust: the struct `{ty}` contains itself through its fields, \
+                                 which is not supported"
+                            ),
+                        );
+                    }
+                    self.structs_in_progress.borrow_mut().push(ty);
+                    let elem_tys = def
+                        .all_fields()
+                        .map(|field| {
+                            let ty = field.ty(self.tcx, params);
+                            // elaboration: all fields are boxed
+                            self.field_type(m, ty).into()
+                        })
+                        .collect();
+                    self.structs_in_progress.borrow_mut().pop();
+                    rty::TupleType::new(elem_tys).into()
+                } else {
+                    unimplemented!("unsupported ADT: {:?}", ty);
+                }
+            }
+            mir_ty::TyKind::Alias(mir_ty::AliasTyKind::Projection, ty) => {
+                if let Some(model_ty_def_id) = self.def_ids.model_ty() {
+                    let arg_ty = ty.args.type_at(0);
+
+                    if ty.def_id == model_ty_def_id
+                        && (matches!(
+                            arg_ty.kind(),
+                            mir_ty::TyKind::Param(_) | mir_ty::TyKind::Alias(..)
+                        ))
+                    {
+                        tracing::debug!(
+                            "expanding projection to thrust_models::Model::Ty for {arg_ty:?}."
+                        );
+                        return self.build_ty_in(m, arg_ty);
+                    }
+                }
+
+                self.translate_alias_type(ty).vacuous()
+            }
+            kind => unimplemented!("unsupported type: {:?}", kind),
+        }
+    }
+
+    pub fn build_basic_block<I>(
+        &mut self,
+        body: &rustc_middle::mir::Body<'tcx>,
+        live_locals: I,
+        ret_ty: mir_ty::Ty<'tcx>,
+    ) -> BasicBlockType
+    where
+        I: IntoIterator<Item = (Local, mir_ty::TypeAndMut<'tcx>)>,
+    {
+        struct FakeRegistry;
+        impl TemplateRegistry for FakeRegistry {
+            fn register_template<V: chc::Var>(
+                &mut self,
+                _tmpl: rty::Template<V>,
+            ) -> rty::RefinedType<V> {
+                panic!("unexpected template registration")
+            }
+        }
+        self.for_template(&mut FakeRegistry)
+            .build_basic_block_with_precondition(
+                body,
+                live_locals.into_iter().collect(),
+                ret_ty,
+                Some(rty::Refinement::top()),
+            )
+    }
+
+    pub fn for_template<'a, R>(
+        &self,
+        registry: &'a mut R,
+    ) -> TemplateTypeBuilder<'tcx, 'a, R, EmptyTemplateScope> {
+        TemplateTypeBuilder {
+            inner: self.clone(),
+            registry,
+            scope: Default::default(),
+        }
+    }
+
+    pub fn for_function_template<'a, R>(
+        &self,
+        registry: &'a mut R,
+        sig: mir_ty::FnSig<'tcx>,
+    ) -> FunctionTemplateTypeBuilder<'tcx, 'a, R> {
+        let abi = match sig.abi {
+            rustc_abi::ExternAbi::Rust => rty::FunctionAbi::Rust,
+            rustc_abi::ExternAbi::RustCall => rty::FunctionAbi::RustCall,
+            _ => unimplemented!("unsupported function ABI: {:?}", sig.abi),
+        };
+        FunctionTemplateTypeBuilder {
+            inner: self.clone(),
+            registry,
+            param_tys: sig
+                .inputs()
+                .iter()
+                .map(|ty| mir_ty::TypeAndMut {
+                    ty: *ty,
+                    mutbl: Mutability::Not,
+                })
+                .collect(),
+            ret_ty: sig.output(),
+            param_rtys: Default::default(),
+            param_refinement: None,
+            ret_rty: None,
+            abi,
+        }
+    }
+
+    /// Extracts the [`ClosureTraitCall`] of a `Fn` / `FnMut` / `FnOnce` trait predicate
+    /// whose `Self` type matches `param_ty`. Returns `None` otherwise.
+    ///
+    /// The first parameter is the closure value (wrapped in a `&` / `&mut` pointer
+    /// for `Fn` / `FnMut`, or owned for `FnOnce`), followed by the logical arguments
+    /// as a single tuple matching the call-site shape produced by
+    /// `<F as Fn<(A,)>>::call(...)`.
+    #[tracing::instrument(skip(self))]
+    fn closure_trait_call(
+        &self,
+        param_ty: mir_ty::ParamTy,
+        pred: mir_ty::TraitPredicate<'tcx>,
+    ) -> Option<ClosureTraitCall> {
+        let trait_ref = pred.trait_ref;
+        if trait_ref.self_ty() != param_ty.to_ty(self.tcx) {
+            return None;
+        }
+        // Reject non-`Fn`/`FnMut`/`FnOnce` predicates (e.g. `Sized`) before building any type,
+        // so that a `ParamTy` the current TypeBuilder cannot translate is never built here.
+        use mir_ty::ClosureKind::*;
+        let closure_kind = self.tcx.fn_trait_kind_from_def_id(trait_ref.def_id)?;
+        tracing::debug!(?trait_ref.args);
+
+        let receiver_type = self.build_ty(trait_ref.args.type_at(0));
+        let receiver_type = match closure_kind {
+            Fn => rty::PointerType::immut_to(receiver_type).into(),
+            FnMut => rty::PointerType::mut_to(receiver_type).into(),
+            FnOnce => receiver_type,
+        };
+
+        let mir_ty::Tuple(other_params) = trait_ref.args.type_at(1).kind() else {
+            panic!("Closure should have at least one argument.")
+        };
+
+        let other_params = other_params.iter().map(|ty| self.build(ty).vacuous());
+        let params = std::iter::once(rty::RefinedType::unrefined(receiver_type.vacuous()))
+            .chain(other_params)
+            .collect();
+
+        tracing::debug!("found the signature for closure trait: {params:#?}");
+        Some(ClosureTraitCall {
+            params,
+            kind: closure_kind,
+        })
+    }
+
+    /// Extracts the return type refinement for `<F as FnOnce>::Output` projection
+    /// where `F = param_ty`. Returns `None` otherwise.
+    #[tracing::instrument(skip(self))]
+    fn closure_trait_ret(
+        &self,
+        param_ty: mir_ty::ParamTy,
+        pred: mir_ty::ProjectionPredicate<'tcx>,
+    ) -> Option<rty::RefinedType<rty::FunctionParamIdx>> {
+        let projection = pred.projection_term;
+        if projection.def_id != self.tcx.lang_items().fn_once_output()?
+            || projection.args.type_at(0) != param_ty.to_ty(self.tcx)
+        {
+            return None;
+        }
+
+        let ret_ty = self.build(pred.term.expect_type()).vacuous();
+        tracing::debug!(?ret_ty);
+        Some(ret_ty)
+    }
+
+    /// Builds the [`rty::FunctionType`] for a type parameter `param_ty` declared
+    /// on the function identified by `local_def_id`, when `param_ty` is bounded
+    /// by `Fn` / `FnMut` / `FnOnce`.
+    ///
+    /// `generic_args` are the generic arguments of the enclosing function
+    /// (the function whose body is being type-checked). When the enclosing
+    /// function is itself generic, `predicates_of(local_def_id)` is the raw
+    /// predicate list which is then instantiated with `generic_args`. When
+    /// `generic_args` is empty, predicates are used un-instantiated.
+    ///
+    /// Returns `None` if `param_ty` has no `Fn` / `FnMut` / `FnOnce` trait bound.
+    /// As a side effect, the closure pre/post forall predicates are registered
+    /// with the [`chc::System`].
+    /// Resolves `param_ty`, declared by some other item, at the generic arguments
+    /// this analysis runs with.
+    ///
+    /// Returns the type parameter those arguments map it to -- which is the one the
+    /// current [`Self::param_local_idx`] can read -- or `None` when it maps to a
+    /// concrete type, which carries its own contract and needs no parameter-keyed one.
+    pub fn resolve_param_ty(
+        &self,
+        param_ty: mir_ty::ParamTy,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> Option<mir_ty::ParamTy> {
+        if generic_args.is_empty() {
+            return Some(param_ty);
+        }
+        // Bind the *type*, not the `ParamTy`: instantiating a `ParamTy` can only ever
+        // return a `ParamTy`, so it cannot substitute a concrete argument.
+        let ty =
+            mir_ty::EarlyBinder::bind(param_ty.to_ty(self.tcx)).instantiate(self.tcx, generic_args);
+        match ty.kind() {
+            mir_ty::TyKind::Param(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The `Fn`, `FnMut` or `FnOnce` bound of the closure type parameter `param_ty` among the
+    /// predicates of `local_def_id` at `generic_args`, and the `FnOnce::Output` projection it
+    /// states.
+    pub fn closure_param_bound(
+        &self,
+        param_ty: mir_ty::ParamTy,
+        local_def_id: rustc_hir::def_id::LocalDefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> Option<(
+        mir_ty::PolyTraitPredicate<'tcx>,
+        mir_ty::PolyProjectionPredicate<'tcx>,
+    )> {
+        // `predicates_of(..).predicates` holds only the predicates written on the
+        // function itself; a bound such as `F: FnMut(..)` on the enclosing impl or
+        // trait lives in the parent's predicates. `instantiate` and
+        // `instantiate_identity` walk the parent chain, so go through them.
+        let generic_predicates = self.tcx.predicates_of(local_def_id.to_def_id());
+        let predicates = if !generic_args.is_empty() {
+            generic_predicates.instantiate(self.tcx, generic_args)
+        } else {
+            generic_predicates.instantiate_identity(self.tcx)
+        };
+        let param = param_ty.to_ty(self.tcx);
+        let call = predicates
+            .predicates
+            .iter()
+            .filter_map(|clause| clause.as_trait_clause())
+            .find(|pred| {
+                let trait_ref = pred.skip_binder().trait_ref;
+                trait_ref.self_ty() == param
+                    && self
+                        .tcx
+                        .fn_trait_kind_from_def_id(trait_ref.def_id)
+                        .is_some()
+            })?;
+        let output = predicates
+            .predicates
+            .iter()
+            .filter_map(|clause| clause.as_projection_clause())
+            .find(|pred| {
+                let projection = pred.skip_binder().projection_term;
+                Some(projection.def_id) == self.tcx.lang_items().fn_once_output()
+                    && projection.args.type_at(0) == param
+            })?;
+        Some((call, output))
+    }
+
+    /// Builds the contract of a closure-typed parameter from its `Fn` bound.
+    ///
+    /// `param_ty` must already be resolved for the current analysis
+    /// ([`Self::resolve_param_ty`]); `generic_args` instantiates `local_def_id`'s
+    /// predicates so the bound is found at those same arguments.
+    pub fn build_closure_type_for_param(
+        &self,
+        param_ty: mir_ty::ParamTy,
+        local_def_id: rustc_hir::def_id::LocalDefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> Option<rty::FunctionType> {
+        let (call, output) = self.closure_param_bound(param_ty, local_def_id, generic_args)?;
+        let ClosureTraitCall {
+            mut params,
+            kind: closure_kind,
+        } = self.closure_trait_call(param_ty, call.skip_binder())?;
+        let mut ret = self.closure_trait_ret(param_ty, output.skip_binder())?;
+
+        let free = |idx| chc::Term::var(rty::RefinedTypeVar::Free(idx));
+        let value = chc::Term::var(rty::RefinedTypeVar::Value);
+
+        let args: Vec<_> = params
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| free(rty::FunctionParamIdx::from_usize(idx)))
+            .collect();
+
+        let type_args =
+            self.generic_args_symbol(self.tcx.mk_args(&[param_ty.to_ty(self.tcx).into()]));
+        let type_params = vec![self.build(param_ty.to_ty(self.tcx)).to_sort()];
+        let mut params_sort: Vec<chc::Sort> = params.iter().map(|rty| rty.ty.to_sort()).collect();
+        let ret_sort = ret.ty.to_sort();
+
+        let mut pre_params_sort = params_sort.clone();
+        pre_params_sort[0] = pre_upvars_sort(pre_params_sort[0].clone(), closure_kind);
+
+        // The contract stands for the closure `param_ty` is instantiated with, so it
+        // is one symbol per type parameter: named after the parameter's own def id,
+        // which every method of an impl that declares `F` shares. Naming it after the
+        // method would give each method its own copy, and nothing would relate them.
+        let contract_owner = self.param_def_id(&param_ty);
+        let pre_pred = refine::closure_pre_forall_pred(
+            self.tcx,
+            contract_owner,
+            type_args.clone(),
+            type_params.clone(),
+            pre_params_sort,
+        );
+        self.system
+            .borrow_mut()
+            .register_forall_pred(pre_pred.clone());
+        params_sort.push(ret_sort);
+        let post_pred = refine::closure_post_forall_pred(
+            self.tcx,
+            contract_owner,
+            type_args,
+            type_params,
+            params_sort,
+        );
+        self.system
+            .borrow_mut()
+            .register_forall_pred(post_pred.clone());
+
+        params
+            .iter_mut()
+            .last()
+            .expect("Closure should have at least one argument.")
+            .extend_refinement({
+                // This refinement rides on the closure's last parameter, so `value` names that
+                // parameter here and `free(idx)` the earlier ones: a closure taking no logical
+                // argument has its upvars in the `value` slot.
+                let (args_front, _args_last) = args.split_at(args.len() - 1);
+                let mut pre_args: Vec<_> =
+                    [args_front, std::slice::from_ref(&value.clone())].concat();
+                pre_args[0] = pre_upvars_term(pre_args[0].clone(), closure_kind);
+                chc::Atom::new(pre_pred.into(), pre_args).into()
+            });
+
+        ret.extend_refinement(
+            chc::Atom::new(post_pred.into(), [args, vec![value.clone()]].concat()).into(),
+        );
+        let ret = Box::new(ret);
+
+        Some(rty::FunctionType {
+            params,
+            ret,
+            abi: rty::FunctionAbi::RustCall,
+        })
+    }
+
+    /// The type of a function whose precondition is `false`: its last parameter, or a unit
+    /// parameter when it has none, is refined by `false`, and its result is unconstrained.
+    pub fn build_unreachable_function_type(
+        &self,
+        def_id: DefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> rty::FunctionType {
+        let sig = self
+            .tcx
+            .fn_sig(def_id)
+            .instantiate(self.tcx, generic_args)
+            .skip_binder();
+        let mut params: IndexVec<rty::FunctionParamIdx, rty::RefinedType<rty::FunctionParamIdx>> =
+            sig.inputs()
+                .iter()
+                .map(|ty| self.build(*ty).vacuous())
+                .collect();
+        if params.is_empty() {
+            params.push(rty::RefinedType::unrefined(rty::Type::unit()));
+        }
+        params
+            .raw
+            .last_mut()
+            .unwrap()
+            .refinement
+            .push_conj(rty::Refinement::bottom());
+        let ret = self.build(sig.output()).vacuous();
+        rty::FunctionType::new(params, ret)
+    }
+
+    /// The contract of the trait method `def_id`, which has no specification, called at
+    /// `generic_args` that still name type parameters: it can be called with any arguments, and
+    /// its result is related to them by a forall predicate, which `post!` names.
+    pub fn build_unspecified_method_type(
+        &self,
+        def_id: DefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> rty::FunctionType {
+        let sig = self
+            .tcx
+            .fn_sig(def_id)
+            .instantiate(self.tcx, generic_args)
+            .skip_binder();
+        let mut params: IndexVec<rty::FunctionParamIdx, rty::RefinedType<rty::FunctionParamIdx>> =
+            sig.inputs()
+                .iter()
+                .map(|ty| self.build(*ty).vacuous())
+                .collect();
+        let mut ret = self.build(sig.output()).vacuous();
+
+        let type_args = self.generic_args_symbol(generic_args);
+        let type_params = generic_args
+            .types()
+            .map(|ty| self.build(ty).to_sort())
+            .collect();
+        let sorts = params
+            .iter()
+            .chain(std::iter::once(&ret))
+            .map(|rty| rty.ty.to_sort())
+            .collect();
+        let post_pred =
+            refine::method_post_forall_pred(self.tcx, def_id, type_args, type_params, sorts);
+        self.system
+            .borrow_mut()
+            .register_forall_pred(post_pred.clone());
+
+        let args = params
+            .indices()
+            .map(|idx| chc::Term::var(rty::RefinedTypeVar::Free(idx)))
+            .chain(std::iter::once(chc::Term::var(rty::RefinedTypeVar::Value)))
+            .collect();
+        ret.extend_refinement(chc::Atom::new(post_pred.into(), args).into());
+        // A function type has at least one parameter, as `FunctionTemplateTypeBuilder` builds it.
+        if params.is_empty() {
+            params.push(self.build(self.tcx.types.unit).vacuous());
+        }
+        rty::FunctionType::new(params, ret)
+    }
+}
+
+/// Templates registered in `registry`, whose predicates depend on the variables of `scope`.
+struct Templated<'r, 's, R, S> {
+    registry: &'r mut R,
+    scope: &'s S,
+}
+
+impl<'tcx, R, S> TyMode<'tcx> for Templated<'_, '_, R, S>
+where
+    R: TemplateRegistry,
+    S: TemplateScope,
+{
+    type Var = S::Var;
+
+    fn fn_ptr(&mut self, b: &TypeBuilder<'tcx>, sig: mir_ty::FnSig<'tcx>) -> rty::Type<S::Var> {
+        let ty = b.for_function_template(self.registry, sig).build();
+        rty::Type::function(ty)
+    }
+
+    fn enum_arg(
+        &mut self,
+        b: &TypeBuilder<'tcx>,
+        ty: mir_ty::Ty<'tcx>,
+    ) -> rty::RefinedType<S::Var> {
+        self.refined(b, ty)
+    }
+}
+
+impl<'tcx, R, S> Templated<'_, '_, R, S>
+where
+    R: TemplateRegistry,
+    S: TemplateScope,
+{
+    /// A refinement type of `ty` whose refinement is an unknown predicate.
+    fn refined(&mut self, b: &TypeBuilder<'tcx>, ty: mir_ty::Ty<'tcx>) -> rty::RefinedType<S::Var> {
+        // TODO: consider building ty with scope
+        let mut unscoped = Templated {
+            registry: &mut *self.registry,
+            scope: &EmptyTemplateScope,
+        };
+        let ty = b.build_ty_in(&mut unscoped, ty).vacuous();
+        let tmpl = self.scope.build_template().build(ty);
+        self.registry.register_template(tmpl)
+    }
+}
+
+/// Translates [`mir_ty::Ty`] to [`rty::RefinedType`] using templates for unknown refinements.
+///
+/// [`rty::Template`] is a refinement type in the form of `{ T | P(x1, ..., xn) }` where `P` is a
+/// predicate variable. When constructing a template, we need to know which variables can affect the
+/// predicate of the template (dependencies, `x1, ..., xn`), and they are provided by the
+/// [`TemplateScope`]. No variables are in scope by default and you can provide a scope using
+/// [`TemplateTypeBuilder::with_scope`].
+pub struct TemplateTypeBuilder<'tcx, 'a, R, S> {
+    inner: TypeBuilder<'tcx>,
+    // XXX: this can't be simply `R` because monomorphization instantiates types recursively
+    registry: &'a mut R,
+    scope: S,
+}
+
+impl<'tcx, 'a, R, S> TemplateTypeBuilder<'tcx, 'a, R, S> {
+    pub fn with_scope<T>(self, scope: T) -> TemplateTypeBuilder<'tcx, 'a, R, T> {
+        TemplateTypeBuilder {
+            inner: self.inner,
+            registry: self.registry,
+            scope,
+        }
+    }
+}
+
+impl<'tcx, 'a, R, S> TemplateTypeBuilder<'tcx, 'a, R, S>
+where
+    R: TemplateRegistry,
+    S: TemplateScope,
+{
+    pub fn build(&mut self, ty: mir_ty::Ty<'tcx>) -> rty::RefinedType<S::Var> {
+        rty::RefinedType::unrefined(self.build_ty(ty))
+    }
+
+    fn build_ty(&mut self, ty: mir_ty::Ty<'tcx>) -> rty::Type<S::Var> {
+        let mut mode = Templated {
+            registry: &mut *self.registry,
+            scope: &self.scope,
+        };
+        self.inner.build_ty_in(&mut mode, ty)
+    }
+
+    /// Builds a refinement type whose refinement is an unknown predicate.
+    pub fn build_refined(&mut self, ty: mir_ty::Ty<'tcx>) -> rty::RefinedType<S::Var> {
+        let mut mode = Templated {
+            registry: &mut *self.registry,
+            scope: &self.scope,
+        };
+        mode.refined(&self.inner, ty)
+    }
+
+    fn build_basic_block_with_precondition(
+        &mut self,
+        body: &rustc_middle::mir::Body<'tcx>,
+        mut live_locals: Vec<(Local, mir_ty::TypeAndMut<'tcx>)>,
+        ret_ty: mir_ty::Ty<'tcx>,
+        precondition: Option<rty::Refinement<rty::FunctionParamIdx>>,
+    ) -> BasicBlockType {
+        // this is necessary for local_def::Analyzer::elaborate_unused_args
+        live_locals.sort_by_key(|(local, _)| *local);
+
+        let mut locals = IndexVec::<rty::FunctionParamIdx, _>::new();
+        let mut tys = Vec::new();
+        for (local, ty) in live_locals {
+            locals.push((local, ty.mutbl));
+            tys.push(ty);
+        }
+
+        for arg in body.args_iter() {
+            let decl = &body.local_decls[arg];
+            tys.push(mir_ty::TypeAndMut {
+                ty: decl.ty,
+                mutbl: decl.mutability,
+            });
+        }
+
+        let ty = FunctionTemplateTypeBuilder {
+            inner: self.inner.clone(),
+            registry: self.registry,
+            param_tys: tys,
+            ret_ty,
+            param_rtys: Default::default(),
+            param_refinement: precondition,
+            // not generating pvar of BB post
+            ret_rty: Some(self.inner.build(ret_ty).vacuous()),
+            abi: Default::default(),
+        }
+        .build();
+        BasicBlockType {
+            captured_param_count: 0,
+            ty,
+            locals,
+            outer_fn_param_count: body.arg_count,
+            precondition_names: Default::default(),
+        }
+    }
+
+    pub fn build_basic_block<I>(
+        &mut self,
+        body: &rustc_middle::mir::Body<'tcx>,
+        live_locals: I,
+        ret_ty: mir_ty::Ty<'tcx>,
+    ) -> BasicBlockType
+    where
+        I: IntoIterator<Item = (Local, mir_ty::TypeAndMut<'tcx>)>,
+    {
+        self.build_basic_block_with_precondition(
+            body,
+            live_locals.into_iter().collect(),
+            ret_ty,
+            None,
+        )
+    }
+}
+
+/// A builder for function template types.
+pub struct FunctionTemplateTypeBuilder<'tcx, 'a, R> {
+    inner: TypeBuilder<'tcx>,
+    registry: &'a mut R,
+    param_tys: Vec<mir_ty::TypeAndMut<'tcx>>,
+    ret_ty: mir_ty::Ty<'tcx>,
+    param_refinement: Option<rty::Refinement<rty::FunctionParamIdx>>,
+    param_rtys: HashMap<rty::FunctionParamIdx, rty::RefinedType<rty::FunctionParamIdx>>,
+    ret_rty: Option<rty::RefinedType<rty::FunctionParamIdx>>,
+    abi: rty::FunctionAbi,
+}
+
+impl<'tcx, 'a, R> FunctionTemplateTypeBuilder<'tcx, 'a, R> {
+    pub fn param_refinement(
+        &mut self,
+        refinement: rty::Refinement<rty::FunctionParamIdx>,
+    ) -> &mut Self {
+        let rty::Refinement { existentials, body } = refinement;
+        let refinement = rty::Refinement {
+            existentials,
+            body: body.map_var(|v| match v {
+                rty::RefinedTypeVar::Free(idx) if idx.index() == self.param_tys.len() - 1 => {
+                    rty::RefinedTypeVar::Value
+                }
+                v => v,
+            }),
+        };
+        self.param_refinement = Some(refinement);
+        self
+    }
+
+    pub fn ret_refinement(
+        &mut self,
+        refinement: rty::Refinement<rty::FunctionParamIdx>,
+    ) -> &mut Self {
+        let mut rty = self.inner.build(self.ret_ty).vacuous();
+        rty.refinement.push_conj(refinement);
+        self.ret_rty = Some(rty);
+        self
+    }
+
+    /// Records a refinement to install at a [`rty::TypePosition`].
+    ///
+    /// The first step must be [`rty::TypePositionStep::Param`] or
+    /// [`rty::TypePositionStep::Return`]; the remaining steps are forwarded to
+    /// [`rty::RefinedType::install_refinement_at`].
+    pub fn refinement_at(
+        &mut self,
+        position: &rty::TypePosition,
+        refinement: rty::Refinement<rty::FunctionParamIdx>,
+    ) -> &mut Self {
+        let (first, rest) = match position.steps().split_first() {
+            Some(pair) => pair,
+            None => panic!("type position applied to a function type must not be empty"),
+        };
+        match first {
+            rty::TypePositionStep::Param(idx) => {
+                if !self.param_rtys.contains_key(idx) {
+                    let rty = self.inner.build(self.param_tys[idx.index()].ty).vacuous();
+                    self.param_rtys.insert(*idx, rty);
+                }
+                self.param_rtys
+                    .get_mut(idx)
+                    .unwrap()
+                    .install_refinement_at(rest, refinement);
+            }
+            rty::TypePositionStep::Return => {
+                if self.ret_rty.is_none() {
+                    self.ret_rty = Some(self.inner.build(self.ret_ty).vacuous());
+                }
+                self.ret_rty
+                    .as_mut()
+                    .unwrap()
+                    .install_refinement_at(rest, refinement);
+            }
+            rty::TypePositionStep::TypeArg(_) => {
+                panic!("type position applied to a function type must start with a param or result step, not a type argument");
+            }
+        }
+        self
+    }
+}
+
+impl<'tcx, 'a, R> FunctionTemplateTypeBuilder<'tcx, 'a, R>
+where
+    R: TemplateRegistry,
+{
+    pub fn build(&mut self) -> rty::FunctionType {
+        let mut builder = rty::TemplateBuilder::default();
+        let mut param_rtys = IndexVec::<rty::FunctionParamIdx, _>::new();
+        // A refinement written on any parameter makes the precondition written, as `requires`
+        // does: the parameters it leaves out are unconstrained.
+        let infers_precondition = self.param_refinement.is_none() && self.param_rtys.is_empty();
+        for (idx, param_ty) in self.param_tys.iter().enumerate() {
+            let param_rty = self
+                .param_rtys
+                .get(&idx.into())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let is_last = idx == self.param_tys.len() - 1;
+                    if let Some(param_refinement) =
+                        self.param_refinement.as_ref().filter(|_| is_last)
+                    {
+                        let mut rty = self.inner.build(param_ty.ty).vacuous();
+                        rty.refinement.push_conj(param_refinement.clone());
+                        rty
+                    } else if is_last && infers_precondition {
+                        self.inner
+                            .for_template(self.registry)
+                            .with_scope(&builder)
+                            .build_refined(param_ty.ty)
+                    } else if self.param_refinement.is_some() {
+                        self.inner.build(param_ty.ty).vacuous()
+                    } else {
+                        self.inner
+                            .for_template(self.registry)
+                            .build(param_ty.ty)
+                            .vacuous()
+                    }
+                });
+            let param_rty = if param_ty.mutbl.is_mut() {
+                // elaboration: treat mutabully declared variables as own
+                param_rty.boxed()
+            } else {
+                param_rty
+            };
+            let param_sort = param_rty.ty.to_sort();
+            let param_idx = param_rtys.push(param_rty);
+            builder.add_dependency(param_idx, param_sort);
+        }
+
+        // elaboration: we need at least one predicate variable in parameter
+        if self.param_tys.is_empty() {
+            let param_rty = if let Some(param_refinement) = &self.param_refinement {
+                rty::RefinedType::new(rty::Type::unit(), param_refinement.clone())
+            } else {
+                let unit_ty = self.inner.tcx.types.unit;
+                self.inner
+                    .for_template(self.registry)
+                    .with_scope(&builder)
+                    .build_refined(unit_ty)
+            };
+            param_rtys.push(param_rty);
+        }
+
+        let ret_rty = self.ret_rty.clone().unwrap_or_else(|| {
+            self.inner
+                .for_template(self.registry)
+                .with_scope(&builder)
+                .build_refined(self.ret_ty)
+        });
+        rty::FunctionType::new(param_rtys, ret_rty).with_abi(self.abi)
+    }
+}
+
+fn discr_value<'tcx>(tcx: mir_ty::TyCtxt<'tcx>, discr: mir_ty::util::Discr<'tcx>) -> BigInt {
+    let (size, signed) = discr.ty.int_size_and_signed(tcx);
+    if signed {
+        size.sign_extend(discr.val).into()
+    } else {
+        discr.val.into()
+    }
+}

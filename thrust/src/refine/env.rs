@@ -1,0 +1,1646 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use pretty::{termcolor, Pretty};
+use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_index::IndexVec;
+use rustc_middle::mir::{Local, Place, PlaceElem};
+
+use crate::chc;
+use crate::chc::debug;
+use crate::pretty::PrettyDisplayExt as _;
+use crate::refine;
+use crate::rty::{self, ShiftExistential as _};
+
+rustc_index::newtype_index! {
+    #[orderable]
+    #[debug_format = "t{}"]
+    pub struct TempVarIdx { }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Var {
+    Local(Local),
+    Temp(TempVarIdx),
+}
+
+impl From<TempVarIdx> for Var {
+    fn from(idx: TempVarIdx) -> Self {
+        Var::Temp(idx)
+    }
+}
+
+impl From<Local> for Var {
+    fn from(local: Local) -> Self {
+        Var::Local(local)
+    }
+}
+
+impl std::fmt::Debug for Var {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Var::Local(local) => local.fmt(f),
+            Var::Temp(idx) => idx.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Display for Var {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &Var
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self).annotate(Var::color_spec())
+    }
+}
+
+impl Var {
+    fn color_spec() -> termcolor::ColorSpec {
+        termcolor::ColorSpec::new()
+    }
+
+    pub fn is_temp(&self) -> bool {
+        matches!(self, Var::Temp(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FlowBindingVariant {
+    pub fields: IndexVec<FieldIdx, TempVarIdx>,
+}
+
+#[derive(Debug, Clone)]
+enum FlowBinding {
+    Mut(TempVarIdx, TempVarIdx),
+    Box {
+        current: TempVarIdx,
+        elem: Box<rty::RefinedType<Var>>,
+    },
+    Tuple(Vec<TempVarIdx>),
+    Enum {
+        discr: TempVarIdx,
+        variants: IndexVec<VariantIdx, FlowBindingVariant>,
+        sym: chc::DatatypeSymbol,
+        args: rty::RefinedTypeArgs<Var>,
+        /// The variable that stands for the enum's value while its parts are those it was built
+        /// from.
+        value: EnumValue,
+    },
+}
+
+/// The variable `var` that stands for an enum's value, with the temporaries the value was built
+/// from (`parts`, see [`Env::value_parts`]): the environment states once that `var` is the value
+/// those parts make, and reads `var` while they are still the enum's parts.
+#[derive(Debug, Clone)]
+struct EnumValue {
+    var: TempVarIdx,
+    parts: Vec<TempVarIdx>,
+}
+
+/// A step of a place's projection, as the environment expands a local: the content of a `Box`
+/// or the current value of a `&mut` (`Deref`), a component of a tuple, a variant of an enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjStep {
+    Deref,
+    Field(usize),
+    Downcast(usize),
+}
+
+/// The enum places of a body's locals that are expanded into their discriminant and fields: those
+/// the body projects into a variant of, or reads the discriminant of, each a local and the steps
+/// to the enum, as the elaborated places of the body reach them.
+pub type EnumPlacesToExpand = HashSet<(Local, Vec<ProjStep>)>;
+
+/// Where a value is bound: the local and the steps from it, when the binding is of a local.
+type BindPath = Option<(Local, Vec<ProjStep>)>;
+
+fn then(path: &BindPath, step: ProjStep) -> BindPath {
+    path.as_ref().map(|(local, steps)| {
+        let mut steps = steps.clone();
+        steps.push(step);
+        (*local, steps)
+    })
+}
+
+impl FlowBinding {
+    fn replace_part(&mut self, old: TempVarIdx, new: TempVarIdx) {
+        let parts: Vec<&mut TempVarIdx> = match self {
+            FlowBinding::Mut(current, _) | FlowBinding::Box { current, .. } => vec![current],
+            FlowBinding::Tuple(xs) => xs.iter_mut().collect(),
+            FlowBinding::Enum { variants, .. } => variants
+                .iter_mut()
+                .flat_map(|variant| variant.fields.iter_mut())
+                .collect(),
+        };
+        for part in parts.into_iter().filter(|part| **part == old) {
+            *part = new;
+        }
+    }
+}
+
+impl std::fmt::Display for FlowBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlowBinding::Mut(current, final_) => write!(f, "mut <{:?}, {:?}>", current, final_),
+            FlowBinding::Box { current, .. } => write!(f, "box <{:?}>", current),
+            FlowBinding::Tuple(ts) => {
+                write!(f, "(")?;
+                for (i, t) in ts.iter().enumerate() {
+                    if i == 0 && ts.len() != 1 {
+                        write!(f, "{:?}", t)?;
+                    } else {
+                        write!(f, ", {:?}", t)?;
+                    }
+                }
+                write!(f, ")")
+            }
+            FlowBinding::Enum {
+                discr,
+                variants,
+                sym,
+                ..
+            } => {
+                write!(f, "#{:?} ", discr)?;
+                for (i, v) in variants.iter_enumerated() {
+                    if i.index() != 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}::{:?}(", sym, i)?;
+                    for (field_idx, field) in v.fields.iter().enumerate() {
+                        if field_idx != 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{:?}", field)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TempVarBinding {
+    Flow(FlowBinding),
+    Type(Box<rty::RefinedType<Var>>),
+}
+
+/// One step from a value to a value it holds, in a [`VarPath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathStep {
+    /// The current value of a `&mut`.
+    Current,
+    /// The final value of a `&mut`.
+    Final,
+    /// A component of a tuple.
+    Field(usize),
+    /// The discriminant of an enum value.
+    Discriminant,
+    /// A field of a variant of an enum value.
+    VariantField(VariantIdx, FieldIdx),
+}
+
+/// What a variable of the environment holds, as a local and the steps from it: the environment
+/// expands a local into temporaries, the content of a `Box` (no step), the current and final
+/// values of a `&mut`, the components of a tuple, and the discriminant and fields of an enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarPath {
+    pub local: Local,
+    pub steps: Vec<PathStep>,
+}
+
+/// The value a function's parameter, the local, had on entry, which a block's type keeps beside
+/// the local's current value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryValue(pub Local);
+
+/// What the existentials of an assumption hold, by their index, for the report: a [`VarPath`] or
+/// an [`EntryValue`].
+pub type ExistentialNames = HashMap<rty::ExistentialVarIdx, debug::ErasedVar>;
+
+impl VarPath {
+    fn then(&self, step: PathStep) -> VarPath {
+        let mut steps = self.steps.clone();
+        steps.push(step);
+        VarPath {
+            local: self.local,
+            steps,
+        }
+    }
+}
+
+impl TempVarBinding {
+    fn as_flow(&self) -> Option<&FlowBinding> {
+        match self {
+            TempVarBinding::Flow(binding) => Some(binding),
+            _ => None,
+        }
+    }
+
+    fn as_type(&self) -> Option<&rty::RefinedType<Var>> {
+        match self {
+            TempVarBinding::Type(rty) => Some(rty),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlaceTypeVar {
+    Var(Var),
+    Existential(rty::ExistentialVarIdx),
+}
+
+impl From<Var> for PlaceTypeVar {
+    fn from(v: Var) -> Self {
+        PlaceTypeVar::Var(v)
+    }
+}
+
+impl From<TempVarIdx> for PlaceTypeVar {
+    fn from(idx: TempVarIdx) -> Self {
+        PlaceTypeVar::Var(Var::Temp(idx))
+    }
+}
+
+impl From<rty::ExistentialVarIdx> for PlaceTypeVar {
+    fn from(ev: rty::ExistentialVarIdx) -> Self {
+        PlaceTypeVar::Existential(ev)
+    }
+}
+
+impl From<PlaceTypeVar> for rty::RefinedTypeVar<Var> {
+    fn from(v: PlaceTypeVar) -> Self {
+        match v {
+            PlaceTypeVar::Var(v) => rty::RefinedTypeVar::Free(v),
+            PlaceTypeVar::Existential(ev) => rty::RefinedTypeVar::Existential(ev),
+        }
+    }
+}
+
+impl rty::ShiftExistential for PlaceTypeVar {
+    fn shift_existential(self, amount: usize) -> Self {
+        match self {
+            PlaceTypeVar::Var(v) => PlaceTypeVar::Var(v),
+            PlaceTypeVar::Existential(ev) => PlaceTypeVar::Existential(ev + amount),
+        }
+    }
+}
+
+impl std::fmt::Debug for PlaceTypeVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PlaceTypeVar::Var(v) => v.fmt(f),
+            PlaceTypeVar::Existential(v) => v.fmt(f),
+        }
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &PlaceTypeVar
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match self {
+            PlaceTypeVar::Var(v) => v.pretty(allocator),
+            PlaceTypeVar::Existential(ev) => ev.pretty(allocator),
+        }
+    }
+}
+
+impl PlaceTypeVar {
+    pub fn into_var(self) -> Option<Var> {
+        match self {
+            PlaceTypeVar::Var(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// A builder for `PlaceType` and `Assumption`.
+///
+/// We often combine multiple [`PlaceType`]s and [`rty::RefinedType`]s into a single one in order to
+/// construct another [`PlaceType`], while retaining formulas from each. [`PlaceTypeBuilder`] helps
+/// this by properly managing existential variable indices.
+#[derive(Debug, Clone, Default)]
+pub struct PlaceTypeBuilder {
+    existentials: IndexVec<rty::ExistentialVarIdx, chc::Sort>,
+    formula: chc::Body<PlaceTypeVar>,
+}
+
+impl PlaceTypeBuilder {
+    pub fn subsume(&mut self, pty: PlaceType) -> (rty::Type<Var>, chc::Term<PlaceTypeVar>) {
+        let PlaceType {
+            ty,
+            existentials,
+            term,
+            formula,
+        } = pty;
+        self.formula
+            .push_conj(formula.map_var(|v| v.shift_existential(self.existentials.len())));
+        let term = term.map_var(|v| v.shift_existential(self.existentials.len()));
+        self.existentials.extend(existentials);
+        (ty, term)
+    }
+
+    pub fn subsume_rty(
+        &mut self,
+        rty: rty::RefinedType<Var>,
+    ) -> (rty::Type<Var>, rty::ExistentialVarIdx) {
+        let rty::RefinedType { ty, refinement } = rty;
+        let rty::Refinement { existentials, body } = refinement;
+        let value_var_ex = self.existentials.push(ty.to_sort());
+        self.formula.push_conj(body.map_var(|v| match v {
+            rty::RefinedTypeVar::Value => PlaceTypeVar::Existential(value_var_ex),
+            rty::RefinedTypeVar::Existential(ev) => {
+                PlaceTypeVar::Existential(ev + self.existentials.len())
+            }
+            rty::RefinedTypeVar::Free(v) => PlaceTypeVar::Var(v),
+        }));
+        self.existentials.extend(existentials);
+        (ty, value_var_ex)
+    }
+
+    pub fn push_formula(&mut self, formula: impl Into<chc::Body<PlaceTypeVar>>) {
+        self.formula.push_conj(formula);
+    }
+
+    pub fn push_existential(&mut self, sort: chc::Sort) -> rty::ExistentialVarIdx {
+        self.existentials.push(sort)
+    }
+
+    pub fn build(self, ty: rty::Type<Var>, term: chc::Term<PlaceTypeVar>) -> PlaceType {
+        PlaceType {
+            ty,
+            existentials: self.existentials,
+            term,
+            formula: self.formula,
+        }
+    }
+
+    pub fn build_assumption(self) -> Assumption {
+        Assumption {
+            existentials: self.existentials,
+            body: self.formula,
+        }
+    }
+}
+
+pub use crate::rty::EnumDefProvider;
+
+#[derive(Debug, Clone)]
+pub struct PlaceType {
+    pub ty: rty::Type<Var>,
+    pub existentials: IndexVec<rty::ExistentialVarIdx, chc::Sort>,
+    pub term: chc::Term<PlaceTypeVar>,
+    pub formula: chc::Body<PlaceTypeVar>,
+}
+
+impl From<PlaceType> for rty::RefinedType<Var> {
+    fn from(ty: PlaceType) -> Self {
+        let PlaceType {
+            ty,
+            existentials,
+            term,
+            formula,
+        } = ty;
+        let mut body = formula.map_var(Into::into);
+        if !ty.to_sort().is_singleton() {
+            body.push_conj(
+                chc::Term::var(rty::RefinedTypeVar::Value).equal_to(term.map_var(Into::into)),
+            );
+        }
+        let refinement = rty::Refinement::new(existentials, body);
+        rty::RefinedType::new(ty, refinement)
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &PlaceType
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let ty = self
+            .ty
+            .pretty(allocator)
+            .append(self.term.pretty(allocator).brackets());
+        let ty_and_formula = if self.formula.is_top() {
+            ty
+        } else {
+            let formula = self.formula.pretty(allocator);
+            ty.append(allocator.line())
+                .append(allocator.text("|"))
+                .append(allocator.space())
+                .append(formula)
+        };
+        if self.existentials.is_empty() {
+            if self.formula.is_top() {
+                ty_and_formula.group()
+            } else {
+                ty_and_formula.braces().group()
+            }
+        } else {
+            let existentials = allocator
+                .intersperse(
+                    self.existentials
+                        .iter_enumerated()
+                        .map(|(v, s)| v.pretty(allocator).append(allocator.text(":")).append(s)),
+                    allocator.text(",").append(allocator.line()),
+                )
+                .group();
+            allocator
+                .text("∃")
+                .append(existentials.nest(2))
+                .append(allocator.text("."))
+                .append(allocator.line().append(ty_and_formula).nest(2))
+                .braces()
+                .group()
+        }
+    }
+}
+
+impl PlaceType {
+    pub fn with_ty_and_term(ty: rty::Type<Var>, term: chc::Term<Var>) -> Self {
+        PlaceType {
+            ty,
+            existentials: IndexVec::new(),
+            term: term.map_var(PlaceTypeVar::Var),
+            formula: Default::default(),
+        }
+    }
+
+    pub fn deref(self) -> PlaceType {
+        let mut builder = PlaceTypeBuilder::default();
+        let (inner_ty, inner_term) = builder.subsume(self);
+        let inner_ty = inner_ty.into_pointer().unwrap();
+        let (ty, value_var_ex) = builder.subsume_rty(*inner_ty.elem);
+
+        let term = chc::Term::var(value_var_ex.into());
+        builder.push_formula(term.clone().equal_to(inner_ty.kind.deref_term(inner_term)));
+        builder.build(ty, term)
+    }
+
+    pub fn tuple_proj(self, idx: usize) -> PlaceType {
+        let mut builder = PlaceTypeBuilder::default();
+        let (inner_ty, inner_term) = builder.subsume(self);
+        let inner_ty = inner_ty.into_tuple().unwrap();
+        let Some(elem) = inner_ty.elems.get(idx) else {
+            rustc_middle::ty::tls::with(|tcx| {
+                tcx.dcx().fatal(format!(
+                    "thrust: component {idx} of the tuple `{}` is read, but it has {}: a struct \
+                     read through a `Model` with fewer components than its fields is not supported",
+                    inner_ty.display(),
+                    inner_ty.elems.len()
+                ))
+            })
+        };
+        let (ty, value_var_ex) = builder.subsume_rty(elem.clone());
+
+        let term = chc::Term::var(value_var_ex.into());
+        builder.push_formula(term.clone().equal_to(inner_term.tuple_proj(idx)));
+        builder.build(ty, term)
+    }
+
+    pub fn downcast<T>(
+        self,
+        variant_idx: VariantIdx,
+        field_idx: FieldIdx,
+        enum_defs: T,
+    ) -> PlaceType
+    where
+        T: EnumDefProvider,
+    {
+        let mut builder = PlaceTypeBuilder::default();
+        let (inner_ty, inner_term) = builder.subsume(self);
+        let inner_ty = inner_ty.into_enum().unwrap();
+        let def = enum_defs.enum_def(&inner_ty.symbol);
+        let variant = &def.variants[variant_idx];
+
+        // The field is `sel_C(inner)` under `is_C(inner)`, the variant the place is read at.
+        let mut rty = variant.field_tys[field_idx.index()].clone().vacuous();
+        rty.instantiate_ty_params(inner_ty.args.clone());
+        if let Some(facts) = rty::int_range_type_facts(&rty.ty, &enum_defs) {
+            rty.refinement.push_conj(facts);
+        }
+        let sort = chc::DatatypeSort::new(def.name.clone(), inner_ty.arg_sorts());
+        let rty = rty.boxed();
+        let field = chc::Term::datatype_selector(
+            sort.clone(),
+            variant.name.clone(),
+            field_idx.index(),
+            rty.ty.to_sort(),
+            inner_term.clone(),
+        );
+        let (ty, field_ex_var) = builder.subsume_rty(rty);
+        let term = chc::Term::var(field_ex_var.into());
+        builder.push_formula(term.clone().equal_to(field));
+        builder.push_formula(chc::Atom::new(
+            chc::Pred::Tester(variant.name.clone()),
+            vec![inner_term],
+        ));
+        builder.build(ty, term)
+    }
+
+    pub fn boxed(self) -> PlaceType {
+        let mut builder = PlaceTypeBuilder::default();
+        let (inner_ty, inner_term) = builder.subsume(self);
+        let term = chc::Term::box_(inner_term);
+        let ty = rty::PointerType::own(inner_ty).into();
+        builder.build(ty, term)
+    }
+
+    fn mut_with(self, prophecy: TempVarIdx, elem: rty::RefinedType<Var>) -> PlaceType {
+        let mut builder = PlaceTypeBuilder::default();
+        let (_, current) = builder.subsume(self);
+        let ty = rty::PointerType {
+            kind: rty::PointerKind::Ref(rty::RefKind::Mut),
+            elem: Box::new(elem),
+        };
+        let term = chc::Term::mut_(current, chc::Term::var(prophecy.into()));
+        builder.build(ty.into(), term)
+    }
+
+    pub fn immut(self) -> PlaceType {
+        let mut builder = PlaceTypeBuilder::default();
+        let (inner_ty, inner_term) = builder.subsume(self);
+        let ty = rty::PointerType::immut_to(inner_ty).into();
+        let term = chc::Term::box_(inner_term);
+        builder.build(ty, term)
+    }
+
+    pub fn tuple(ptys: Vec<PlaceType>) -> PlaceType {
+        let mut builder = PlaceTypeBuilder::default();
+        let mut tys = Vec::new();
+        let mut terms = Vec::new();
+
+        for ty in ptys {
+            let (ty, term) = builder.subsume(ty);
+            tys.push(ty);
+            terms.push(term);
+        }
+
+        let ty = rty::TupleType::new(tys);
+        let term = chc::Term::tuple(terms);
+        builder.build(ty.into(), term)
+    }
+
+    pub fn enum_(
+        enum_ty: rty::EnumType<Var>,
+        matcher_pred: chc::Pred,
+        discr: TempVarIdx,
+        field_tys: Vec<PlaceType>,
+    ) -> PlaceType {
+        let mut builder = PlaceTypeBuilder::default();
+        let mut terms = Vec::new();
+
+        for ty in field_tys {
+            let (_, term) = builder.subsume(ty);
+            terms.push(term);
+        }
+
+        let ty: rty::Type<_> = enum_ty.clone().into();
+        let value_var_ev = builder.push_existential(ty.to_sort());
+        let term = chc::Term::var(value_var_ev.into());
+        let mut pred_args = terms;
+        pred_args.push(chc::Term::var(value_var_ev.into()));
+        builder.push_formula(chc::Atom::new(matcher_pred, pred_args));
+        builder.push_formula(
+            chc::Term::var(discr.into()).equal_to(chc::Term::datatype_discr(
+                enum_ty.symbol.clone(),
+                chc::Term::var(value_var_ev.into()),
+            )),
+        );
+        builder.build(ty, term)
+    }
+}
+
+pub type Assumption = rty::Formula<PlaceTypeVar>;
+
+#[derive(Debug, Clone)]
+pub struct Env<T> {
+    locals: BTreeMap<Local, rty::RefinedType<Var>>,
+    flow_locals: BTreeMap<Local, FlowBinding>,
+    temp_vars: IndexVec<TempVarIdx, TempVarBinding>,
+    /// The temporaries bound to a parameter's value on entry.
+    entry_values: HashMap<TempVarIdx, EntryValue>,
+    assumptions: Vec<Assumption>,
+    /// What the existentials of an assumption hold, by its index in `assumptions`.
+    assumption_names: HashMap<usize, ExistentialNames>,
+
+    enum_defs: T,
+
+    enum_expansion_depth_limit: usize,
+
+    /// The variables that stand for enum values: determined by the parts, they are variables of
+    /// the clauses but no argument of a template.
+    enum_values: HashSet<TempVarIdx>,
+    /// The enum places of the body's locals to expand; any other enum place of a local is bound
+    /// to its value as one variable.
+    enum_places_to_expand: EnumPlacesToExpand,
+}
+
+impl<T> rty::ClauseScope for Env<T>
+where
+    T: EnumDefProvider,
+{
+    fn enum_defs(&self) -> Option<&dyn EnumDefProvider> {
+        Some(&self.enum_defs)
+    }
+
+    fn build_clause(&self) -> chc::ClauseBuilder {
+        let mut builder = chc::ClauseBuilder::default();
+        for (v, sort) in self.dependencies() {
+            builder.add_mapped_var(v, sort);
+        }
+        let paths = self.temp_paths();
+        for (var, rty) in self.bindings() {
+            if matches!(var, Var::Temp(t) if self.enum_values.contains(&t)) {
+                // Its facts are those of the parts it is built from.
+                continue;
+            }
+            let mut origin = debug::origin::Entry::binding(var, rty);
+            if let Some(chc_var) = builder.find_mapped_var(var) {
+                origin.add_described_var_mapping(var, chc_var, self.described(var, &paths));
+            }
+            let formula = rty.formula_with(Some(&self.enum_defs));
+            let mut instantiator = formula
+                .clone()
+                .map_free_var(|v| builder.mapped_var(v))
+                .instantiate();
+            for (ev, sort) in formula.existentials() {
+                let tv = builder.add_var(sort.clone());
+                origin.add_existential_var_mapping(ev, tv);
+                instantiator.existential(ev, tv);
+            }
+            if !rty.ty.to_sort().is_singleton() {
+                instantiator.value_var(builder.mapped_var(var));
+            }
+            builder.add_environment(instantiator.instantiate(), origin);
+        }
+        for (i, assumption) in self.assumptions.iter().enumerate() {
+            let mut origin = debug::origin::Entry::assumption(assumption);
+            let mut evs = HashMap::new();
+            let names = self.assumption_names.get(&i);
+            for (ev, sort) in assumption.existentials.iter_enumerated() {
+                let tv = builder.add_var(sort.clone());
+                match names.and_then(|names| names.get(&ev)) {
+                    Some(name) => origin.add_described_var_mapping(ev, tv, name.clone()),
+                    None => origin.add_existential_var_mapping(ev, tv),
+                }
+                evs.insert(ev, tv);
+            }
+            let body = assumption.body.clone().map_var(|v| match v {
+                PlaceTypeVar::Var(v) => builder.mapped_var(v),
+                PlaceTypeVar::Existential(ev) => evs[&ev],
+            });
+            builder.add_environment(body, origin);
+        }
+        builder
+    }
+}
+
+impl<T> refine::TemplateScope for Env<T>
+where
+    T: EnumDefProvider,
+{
+    type Var = Var;
+    fn build_template(&self) -> rty::TemplateBuilder<Var> {
+        let mut builder = rty::TemplateBuilder::default();
+        let paths = self.temp_paths();
+        for (v, sort) in self.dependencies() {
+            if matches!(v, Var::Temp(t) if self.enum_values.contains(&t)) {
+                continue;
+            }
+            builder.add_described_dependency(v, sort, self.described(v, &paths));
+        }
+        builder
+    }
+}
+
+impl<T> Env<T>
+where
+    T: EnumDefProvider,
+{
+    pub fn new(enum_defs: T) -> Self {
+        Env {
+            locals: Default::default(),
+            flow_locals: Default::default(),
+            temp_vars: IndexVec::new(),
+            entry_values: HashMap::new(),
+            assumptions: Vec::new(),
+            assumption_names: HashMap::new(),
+            enum_defs,
+            enum_expansion_depth_limit: std::env::var("THRUST_ENUM_EXPANSION_DEPTH_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+            enum_values: HashSet::new(),
+            enum_places_to_expand: EnumPlacesToExpand::new(),
+        }
+    }
+
+    /// Expands only the enum places in `places` of the locals bound from now on; any other enum
+    /// place of a local is bound to its value as one variable.
+    pub fn set_enum_places_to_expand(&mut self, places: EnumPlacesToExpand) {
+        self.enum_places_to_expand = places;
+    }
+
+    /// Whether the enum at `path` is expanded into its discriminant and fields.
+    fn expands_enum_at(&self, path: &BindPath) -> bool {
+        match path {
+            Some(at) => self.enum_places_to_expand.contains(at),
+            // A temporary rebound to borrow through it (`flow_part`) is expanded as its type is.
+            None => true,
+        }
+    }
+
+    /// The path from a local to each temporary the environment expands it into.
+    pub fn temp_paths(&self) -> HashMap<TempVarIdx, VarPath> {
+        let mut paths = HashMap::new();
+        for (local, binding) in &self.flow_locals {
+            let path = VarPath {
+                local: *local,
+                steps: Vec::new(),
+            };
+            self.walk_flow(binding, &path, &mut paths);
+        }
+        paths
+    }
+
+    fn walk_flow(
+        &self,
+        binding: &FlowBinding,
+        path: &VarPath,
+        paths: &mut HashMap<TempVarIdx, VarPath>,
+    ) {
+        let children: Vec<(TempVarIdx, VarPath)> = match binding {
+            FlowBinding::Box { current, .. } => vec![(*current, path.clone())],
+            FlowBinding::Mut(current, final_) => vec![
+                (*current, path.then(PathStep::Current)),
+                (*final_, path.then(PathStep::Final)),
+            ],
+            FlowBinding::Tuple(elems) => elems
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (*t, path.then(PathStep::Field(i))))
+                .collect(),
+            FlowBinding::Enum {
+                discr, variants, ..
+            } => std::iter::once((*discr, path.then(PathStep::Discriminant)))
+                .chain(variants.iter_enumerated().flat_map(|(v, variant)| {
+                    variant
+                        .fields
+                        .iter_enumerated()
+                        .map(move |(f, t)| (*t, path.then(PathStep::VariantField(v, f))))
+                }))
+                .collect(),
+        };
+        for (temp, child) in children {
+            if let Some(TempVarBinding::Flow(inner)) = self.temp_vars.get(temp) {
+                self.walk_flow(inner, &child, paths);
+            }
+            paths.insert(temp, child);
+        }
+    }
+
+    /// What `var` holds, as a local and the steps from it (see [`VarPath`]), kept with its type
+    /// erased for the report; `var` itself when it is no temporary of a local.
+    fn described(&self, var: Var, paths: &HashMap<TempVarIdx, VarPath>) -> debug::ErasedVar {
+        self.description(var, paths)
+            .unwrap_or_else(|| debug::ErasedVar::new(var))
+    }
+
+    /// What `var` holds, when it is a local, a temporary of one or a parameter's value on entry.
+    pub fn description(
+        &self,
+        var: Var,
+        paths: &HashMap<TempVarIdx, VarPath>,
+    ) -> Option<debug::ErasedVar> {
+        match var {
+            Var::Local(local) => Some(debug::ErasedVar::new(VarPath {
+                local,
+                steps: Vec::new(),
+            })),
+            Var::Temp(temp) => match (paths.get(&temp), self.entry_values.get(&temp)) {
+                (Some(path), _) => Some(debug::ErasedVar::new(path.clone())),
+                (None, Some(entry)) => Some(debug::ErasedVar::new(*entry)),
+                (None, None) => None,
+            },
+        }
+    }
+
+    /// Binds a temporary to the value parameter `local` had on entry.
+    pub fn bind_entry_value(&mut self, local: Local, rty: rty::RefinedType<Var>) -> Var {
+        let var = self.immut_bind_tmp(rty);
+        if let Var::Temp(temp) = var {
+            self.entry_values.insert(temp, EntryValue(local));
+        }
+        var
+    }
+
+    pub fn push_temp_var(&mut self, ty: rty::Type<Var>) -> TempVarIdx {
+        self.temp_vars
+            .push(TempVarBinding::Type(Box::new(rty::RefinedType::unrefined(
+                ty,
+            ))))
+    }
+
+    // when var = Var::Temp(idx), idx must be temp_vars.next_index() in bind_*
+    fn bind_own(
+        &mut self,
+        var: Var,
+        ty: rty::PointerType<Var>,
+        refinement: rty::Refinement<Var>,
+        depth: usize,
+        path: BindPath,
+    ) {
+        // note that the given var is unbound here, so be careful of using indices around temp_vars
+        let current_refinement = refinement
+            .subst_value_var(|| chc::Term::box_(chc::Term::var(rty::RefinedTypeVar::Value)));
+        let current = match var {
+            Var::Local(local) => {
+                let current = self.temp_vars.next_index();
+                self.flow_locals.insert(
+                    local,
+                    FlowBinding::Box {
+                        current,
+                        elem: ty.elem.clone(),
+                    },
+                );
+                current
+            }
+            Var::Temp(temp) => {
+                // next_index must be `temp`
+                let current = self.temp_vars.next_index() + 1;
+                let binding = FlowBinding::Box {
+                    current,
+                    elem: ty.elem.clone(),
+                };
+                assert_eq!(temp, self.temp_vars.push(TempVarBinding::Flow(binding)));
+                current
+            }
+        };
+        let mut inner_ty = *ty.elem;
+        inner_ty.extend_refinement(current_refinement);
+        self.bind_impl(
+            current.into(),
+            inner_ty,
+            depth,
+            then(&path, ProjStep::Deref),
+        );
+    }
+
+    fn bind_mut(
+        &mut self,
+        var: Var,
+        ty: rty::PointerType<Var>,
+        refinement: rty::Refinement<Var>,
+        depth: usize,
+        path: BindPath,
+    ) {
+        // note that the given var is unbound here, so be careful of using indices around temp_vars
+        let next_index = self.temp_vars.next_index();
+        let (final_, current) = if var.is_temp() {
+            (next_index + 1, next_index + 2)
+        } else {
+            (next_index, next_index + 1)
+        };
+        let current_refinement = refinement.subst_value_var(|| {
+            chc::Term::mut_(
+                chc::Term::var(rty::RefinedTypeVar::Value),
+                chc::Term::var(rty::RefinedTypeVar::Free(final_.into())),
+            )
+        });
+        let binding = FlowBinding::Mut(current, final_);
+        match var {
+            Var::Local(local) => {
+                self.flow_locals.insert(local, binding);
+            }
+            Var::Temp(temp) => {
+                assert_eq!(temp, self.temp_vars.push(TempVarBinding::Flow(binding)));
+            }
+        };
+        assert_eq!(
+            final_,
+            self.temp_vars.push(TempVarBinding::Type(ty.elem.clone()))
+        );
+        let mut inner_ty = *ty.elem;
+        inner_ty.extend_refinement(current_refinement);
+        self.bind_impl(
+            current.into(),
+            inner_ty,
+            depth,
+            then(&path, ProjStep::Deref),
+        );
+    }
+
+    fn bind_tuple(
+        &mut self,
+        var: Var,
+        ty: rty::TupleType<Var>,
+        refinement: rty::Refinement<Var>,
+        depth: usize,
+        path: BindPath,
+    ) {
+        if let Var::Temp(temp) = var {
+            // XXX: allocate `temp` once to invoke bind_var recursively
+            let dummy = FlowBinding::Tuple(Vec::new());
+            assert_eq!(temp, self.temp_vars.push(TempVarBinding::Flow(dummy)));
+        }
+
+        let mut xs = Vec::new();
+        for (i, elem) in ty.elems.iter().enumerate() {
+            let x = self.temp_vars.next_index();
+            xs.push(x);
+            self.bind_impl(
+                x.into(),
+                elem.clone(),
+                depth,
+                then(&path, ProjStep::Field(i)),
+            );
+        }
+        let assumption = {
+            let tuple_ty = PlaceType::tuple(
+                xs.iter()
+                    .copied()
+                    .map(|x| self.var_type(x.into()))
+                    .collect(),
+            );
+            let mut existentials = tuple_ty.existentials;
+            let mut formula = refinement.body.subst_var(|v| match v {
+                rty::RefinedTypeVar::Value => tuple_ty.term.clone(),
+                rty::RefinedTypeVar::Free(v) => chc::Term::var(PlaceTypeVar::Var(v)),
+                rty::RefinedTypeVar::Existential(ev) => {
+                    chc::Term::var(PlaceTypeVar::Existential(ev + existentials.len()))
+                }
+            });
+            formula.push_conj(tuple_ty.formula);
+            existentials.extend(refinement.existentials);
+            Assumption::new(existentials, formula)
+        };
+        self.assume(assumption);
+        let binding = FlowBinding::Tuple(xs.clone());
+        match var {
+            Var::Local(local) => {
+                self.flow_locals.insert(local, binding);
+            }
+            Var::Temp(temp) => {
+                self.temp_vars[temp] = TempVarBinding::Flow(binding);
+            }
+        }
+    }
+
+    fn bind_enum(
+        &mut self,
+        var: Var,
+        ty: rty::EnumType<Var>,
+        refinement: rty::Refinement<Var>,
+        depth: usize,
+        path: BindPath,
+    ) {
+        if let Var::Temp(temp) = var {
+            // XXX: allocate `temp` once to invoke bind_var recursively
+            let dummy = FlowBinding::Tuple(Vec::new());
+            assert_eq!(temp, self.temp_vars.push(TempVarBinding::Flow(dummy)));
+        }
+
+        let def = self.enum_defs.enum_def(&ty.symbol);
+        let matcher_pred = chc::MatcherPred::new(ty.symbol.clone(), ty.arg_sorts());
+
+        let discr_var =
+            self.temp_vars
+                .push(TempVarBinding::Type(Box::new(rty::RefinedType::unrefined(
+                    rty::Type::int(),
+                ))));
+
+        let mut variants = IndexVec::new();
+        for (variant_idx, variant_def) in def.variants.iter().enumerate() {
+            let mut fields = IndexVec::new();
+            for (field_idx, field_ty) in variant_def.field_tys.iter().enumerate() {
+                let field_path = then(
+                    &then(&path, ProjStep::Downcast(variant_idx)),
+                    ProjStep::Field(field_idx),
+                );
+                let x = self.temp_vars.next_index();
+                fields.push(x);
+                let mut field_ty = field_ty.clone().vacuous();
+                field_ty.instantiate_ty_params(ty.args.clone());
+                let guarded_field_ty = field_ty.guarded(
+                    chc::Term::var(discr_var.into())
+                        .equal_to(chc::Term::int(variant_def.discr.clone()))
+                        .into(),
+                );
+                let field_pointer = rty::PointerType::own_refined(guarded_field_ty);
+                self.bind_impl(
+                    x.into(),
+                    rty::RefinedType::unrefined(field_pointer.into()),
+                    depth,
+                    field_path,
+                );
+            }
+            variants.push(FlowBindingVariant { fields });
+        }
+
+        let existentials = refinement.existentials;
+        let value_ty = rty::Type::Enum(ty.clone()).strip_refinement().vacuous();
+        let value =
+            self.temp_vars
+                .push(TempVarBinding::Type(Box::new(rty::RefinedType::unrefined(
+                    value_ty,
+                ))));
+        self.enum_values.insert(value);
+        let value_var = PlaceTypeVar::Var(value.into());
+        let mut assumption = Assumption::new(
+            existentials,
+            refinement.body.map_var(|v| match v {
+                rty::RefinedTypeVar::Value => value_var,
+                rty::RefinedTypeVar::Free(v) => PlaceTypeVar::Var(v),
+                rty::RefinedTypeVar::Existential(ev) => PlaceTypeVar::Existential(ev),
+            }),
+        );
+        let mut pred_args: Vec<_> = variants
+            .iter()
+            .flat_map(|v| &v.fields)
+            .map(|&x| {
+                let ty = self.var_type(x.into());
+                assumption.body.push_conj(
+                    ty.formula
+                        .map_var(|v| v.shift_existential(assumption.existentials.len())),
+                );
+                let term = ty
+                    .term
+                    .map_var(|v| v.shift_existential(assumption.existentials.len()));
+                assumption.existentials.extend(ty.existentials);
+                term
+            })
+            .collect();
+        pred_args.push(chc::Term::var(value_var));
+        assumption
+            .body
+            .push_conj(chc::Atom::new(matcher_pred.into(), pred_args));
+        assumption
+            .body
+            .push_conj(
+                chc::Term::var(discr_var.into()).equal_to(chc::Term::datatype_discr(
+                    def.name.clone(),
+                    chc::Term::var(value_var),
+                )),
+            );
+        self.assume(assumption);
+
+        let parts = self.enum_parts(discr_var, &variants);
+        let binding = FlowBinding::Enum {
+            discr: discr_var,
+            variants,
+            sym: def.name.clone(),
+            args: ty.args.clone(),
+            value: EnumValue { var: value, parts },
+        };
+        match var {
+            Var::Local(local) => {
+                self.flow_locals.insert(local, binding);
+            }
+            Var::Temp(temp) => {
+                self.temp_vars[temp] = TempVarBinding::Flow(binding);
+            }
+        }
+    }
+
+    fn bind_var(&mut self, var: Var, rty: rty::RefinedType<Var>) {
+        match var {
+            Var::Local(local) => {
+                self.locals.insert(local, rty);
+            }
+            Var::Temp(temp) => {
+                assert_eq!(
+                    temp,
+                    self.temp_vars.push(TempVarBinding::Type(Box::new(rty)))
+                );
+            }
+        }
+    }
+
+    fn bind_impl(&mut self, var: Var, rty: rty::RefinedType<Var>, depth: usize, path: BindPath) {
+        if depth >= self.enum_expansion_depth_limit {
+            self.bind_var(var, rty);
+            return;
+        }
+        match rty.ty {
+            rty::Type::Pointer(ty) if ty.is_own() => {
+                self.bind_own(var, ty, rty.refinement, depth, path)
+            }
+            rty::Type::Pointer(ty) if ty.is_mut() => {
+                self.bind_mut(var, ty, rty.refinement, depth, path)
+            }
+            rty::Type::Tuple(ty) if !ty.is_unit() => {
+                self.bind_tuple(var, ty, rty.refinement, depth, path)
+            }
+            rty::Type::Enum(ty) if self.expands_enum_at(&path) => {
+                self.bind_enum(var, ty, rty.refinement, depth + 1, path)
+            }
+            _ => self.bind_var(var, rty),
+        }
+    }
+
+    pub fn mut_bind(&mut self, local: Local, rty: rty::RefinedType<Var>) {
+        let rty_disp = rty.clone();
+        self.bind_impl(local.into(), rty, 0, Some((local, Vec::new())));
+        tracing::debug!(local = ?local, rty = %rty_disp.display(), place_type = %self.local_type(local).display(), "mut_bind");
+    }
+
+    pub fn immut_bind(&mut self, local: Local, rty: rty::RefinedType<Var>) {
+        let rty_disp = rty.clone();
+        self.bind_var(local.into(), rty);
+        tracing::debug!(local = ?local, rty = %rty_disp.display(), place_type = %self.local_type(local).display(), "immut_bind");
+    }
+
+    pub fn immut_bind_tmp(&mut self, rty: rty::RefinedType<Var>) -> Var {
+        let idx = self
+            .temp_vars
+            .push(TempVarBinding::Type(Box::new(rty.clone())));
+        tracing::debug!(temp = ?idx, rty = %rty.display(), "immut_bind_tmp");
+        Var::Temp(idx)
+    }
+
+    pub fn assume(&mut self, assumption: impl Into<Assumption>) {
+        let assumption = assumption.into();
+        tracing::debug!(assumption = %assumption.display(), "assume");
+        self.assumptions.push(assumption);
+    }
+
+    /// Assumes `assumption`, whose existentials hold what `names` says.
+    pub fn assume_described(&mut self, assumption: Assumption, names: ExistentialNames) {
+        if !names.is_empty() {
+            self.assumption_names.insert(self.assumptions.len(), names);
+        }
+        self.assume(assumption);
+    }
+
+    /// What the existentials of each assumption hold, by its index in [`Env::assumptions`].
+    pub fn assumption_names(&self, i: usize) -> Option<&ExistentialNames> {
+        self.assumption_names.get(&i)
+    }
+
+    pub fn extend_assumptions(&mut self, assumptions: Vec<impl Into<Assumption>>) {
+        self.assumptions
+            .extend(assumptions.into_iter().map(Into::into));
+    }
+
+    pub fn dependencies(&self) -> impl Iterator<Item = (Var, chc::Sort)> + '_ {
+        // TODO: consider cloning here again
+        self.locals
+            .iter()
+            .map(|(local, rty)| (Var::Local(*local), rty.ty.to_sort()))
+            .filter(|(_, s)| !s.is_singleton())
+            .chain(
+                self.temp_vars.iter_enumerated().filter_map(|(idx, b)| {
+                    b.as_type().map(|rty| (Var::Temp(idx), rty.ty.to_sort()))
+                }),
+            )
+    }
+
+    fn bindings(&self) -> impl Iterator<Item = (Var, &rty::RefinedType<Var>)> + '_ {
+        self.locals
+            .iter()
+            .map(|(local, rty)| (Var::Local(*local), rty))
+            .chain(
+                self.temp_vars
+                    .iter_enumerated()
+                    .filter_map(|(idx, b)| b.as_type().map(|rty| (Var::Temp(idx), rty))),
+            )
+    }
+
+    pub fn vars(&self) -> impl Iterator<Item = (Var, &rty::RefinedType<Var>)> + '_ {
+        self.bindings().filter(|(_, rty)| rty.is_refined())
+    }
+
+    pub fn assumptions(&self) -> &[Assumption] {
+        &self.assumptions
+    }
+
+    pub fn contains_local(&self, local: Local) -> bool {
+        self.locals.contains_key(&local) || self.flow_locals.contains_key(&local)
+    }
+
+    pub fn is_non_flow_local(&self, local: Local) -> bool {
+        self.locals.contains_key(&local)
+    }
+
+    /// The temporaries `binding` holds, through the flow bindings of its parts, in order. An
+    /// enum's value is determined by them: a part that changes is replaced by another temporary
+    /// (a write, a borrow), and a temporary bound to a type keeps its term.
+    fn value_parts(&self, binding: &FlowBinding) -> Vec<TempVarIdx> {
+        let mut parts = Vec::new();
+        self.push_value_parts(binding, &mut parts);
+        parts
+    }
+
+    /// [`Self::value_parts`] of an enum binding being built from `discr` and `variants`.
+    fn enum_parts(
+        &self,
+        discr: TempVarIdx,
+        variants: &IndexVec<VariantIdx, FlowBindingVariant>,
+    ) -> Vec<TempVarIdx> {
+        let mut parts = Vec::new();
+        let temps =
+            std::iter::once(discr).chain(variants.iter().flat_map(|v| v.fields.iter().copied()));
+        for part in temps {
+            self.push_part(part, &mut parts);
+        }
+        parts
+    }
+
+    fn push_part(&self, part: TempVarIdx, parts: &mut Vec<TempVarIdx>) {
+        parts.push(part);
+        if let Some(TempVarBinding::Flow(inner)) = self.temp_vars.get(part) {
+            self.push_value_parts(inner, parts);
+        }
+    }
+
+    fn push_value_parts(&self, binding: &FlowBinding, parts_out: &mut Vec<TempVarIdx>) {
+        let parts: Vec<TempVarIdx> = match binding {
+            FlowBinding::Mut(current, final_) => vec![*current, *final_],
+            FlowBinding::Box { current, .. } => vec![*current],
+            FlowBinding::Tuple(xs) => xs.clone(),
+            FlowBinding::Enum {
+                discr, variants, ..
+            } => std::iter::once(*discr)
+                .chain(variants.iter().flat_map(|v| v.fields.iter().copied()))
+                .collect(),
+        };
+        for part in parts {
+            self.push_part(part, parts_out);
+        }
+    }
+
+    fn flow_binding(&self, var: Var) -> Option<&FlowBinding> {
+        match var {
+            Var::Local(local) => self.flow_locals.get(&local),
+            Var::Temp(temp) => self.temp_vars[temp].as_flow(),
+        }
+    }
+
+    fn insert_flow_binding(&mut self, var: Var, binding: FlowBinding) {
+        match var {
+            Var::Local(local) => {
+                self.flow_locals.insert(local, binding);
+            }
+            Var::Temp(temp) => {
+                self.temp_vars[temp] = TempVarBinding::Flow(binding);
+            }
+        }
+    }
+
+    fn var(&self, var: Var) -> Option<&rty::RefinedType<Var>> {
+        match var {
+            Var::Local(local) => self.locals.get(&local),
+            Var::Temp(temp) => self.temp_vars[temp].as_type(),
+        }
+    }
+
+    pub fn var_type(&self, var: Var) -> PlaceType {
+        // TODO: should this driven by type as the rule does?
+        match self.flow_binding(var) {
+            Some(FlowBinding::Box { current, elem }) => {
+                let mut builder = PlaceTypeBuilder::default();
+                let (_, term) = builder.subsume(self.var_type((*current).into()));
+                let ty = rty::PointerType::own_refined(*elem.clone());
+                builder.build(ty.into(), term.boxed())
+            }
+            Some(&FlowBinding::Mut(current, final_)) => {
+                let current_ty = self.var_type(current.into());
+                let elem = self.var(final_.into()).expect("unbound prophecy").clone();
+                current_ty.mut_with(final_, elem)
+            }
+            Some(FlowBinding::Tuple(vs)) => {
+                let tys = vs.iter().map(|&v| self.var_type(v.into())).collect();
+                PlaceType::tuple(tys)
+            }
+            Some(
+                binding @ FlowBinding::Enum {
+                    discr,
+                    variants,
+                    sym,
+                    args,
+                    value,
+                },
+            ) => {
+                if value.parts == self.value_parts(binding) {
+                    let enum_ty = rty::EnumType::new(sym.clone(), args.clone());
+                    return PlaceType::with_ty_and_term(
+                        enum_ty.into(),
+                        chc::Term::var(value.var.into()),
+                    );
+                }
+                let field_tys: Vec<_> = variants
+                    .iter()
+                    .flat_map(|v| &v.fields)
+                    .map(|&v| self.var_type(v.into()))
+                    .collect();
+
+                let enum_ty = rty::EnumType::new(sym.clone(), args.clone());
+                let matcher_pred = chc::MatcherPred::new(sym.clone(), enum_ty.arg_sorts()).into();
+                PlaceType::enum_(enum_ty, matcher_pred, *discr, field_tys)
+            }
+            None => {
+                let rty = self.var(var).expect("unbound var");
+                let sort = rty.ty.to_sort();
+                // A variable of a singleton sort is not registered as a clause variable (see
+                // `dependencies`), so it must not be referred to by name. Such a sort has exactly
+                // one value, and that value stands for the variable instead.
+                let term = if sort.is_singleton() {
+                    chc::Term::default_for(&sort)
+                } else {
+                    chc::Term::var(var)
+                };
+                PlaceType::with_ty_and_term(rty.ty.clone(), term)
+            }
+        }
+    }
+
+    pub fn local_type(&self, local: Local) -> PlaceType {
+        self.var_type(local.into())
+    }
+
+    pub fn var_projections<V: chc::Var>(
+        &self,
+        var: Var,
+        term: chc::Term<V>,
+    ) -> HashMap<Var, chc::Term<V>> {
+        let mut projections = HashMap::from([(var, term.clone())]);
+        match self.flow_binding(var) {
+            Some(FlowBinding::Box { current, .. }) => {
+                projections.extend(self.var_projections((*current).into(), term.box_current()));
+            }
+            Some(FlowBinding::Mut(current, final_)) => {
+                projections.insert((*final_).into(), term.clone().mut_final());
+                projections.extend(self.var_projections((*current).into(), term.mut_current()));
+            }
+            Some(FlowBinding::Tuple(fields)) => {
+                for (index, field) in fields.iter().enumerate() {
+                    projections.extend(
+                        self.var_projections((*field).into(), term.clone().tuple_proj(index)),
+                    );
+                }
+            }
+            Some(FlowBinding::Enum { discr, sym, .. }) => {
+                projections.insert(
+                    (*discr).into(),
+                    chc::Term::datatype_discr(sym.clone(), term),
+                );
+            }
+            None => {}
+        }
+        projections
+    }
+
+    /// Reconstructs a flow value using constructors, without existential variables.
+    fn var_term(&self, var: Var) -> chc::Term<Var> {
+        match self.flow_binding(var) {
+            Some(FlowBinding::Box { current, .. }) => self.var_term((*current).into()).boxed(),
+            Some(&FlowBinding::Mut(current, final_)) => {
+                chc::Term::mut_(self.var_term(current.into()), chc::Term::var(final_.into()))
+            }
+            Some(FlowBinding::Tuple(fields)) => chc::Term::tuple(
+                fields
+                    .iter()
+                    .map(|field| self.var_term((*field).into()))
+                    .collect(),
+            ),
+            Some(FlowBinding::Enum {
+                discr,
+                variants,
+                sym,
+                args,
+                ..
+            }) => {
+                let def = self.enum_defs.enum_def(sym);
+                let args = rty::EnumType::new(sym.clone(), args.clone()).arg_sorts();
+                let mut term = None;
+                for (variant, fields) in def.variants.iter().zip(variants).rev() {
+                    let fields = fields
+                        .fields
+                        .iter()
+                        .map(|field| self.var_term((*field).into()))
+                        .collect();
+                    let value = chc::Term::datatype_ctor(
+                        sym.clone(),
+                        args.clone(),
+                        variant.name.clone(),
+                        fields,
+                    );
+                    term = Some(match term {
+                        None => value,
+                        Some(other) => chc::Term::ite(
+                            chc::Term::var((*discr).into())
+                                .eq(chc::Term::int(variant.discr.clone())),
+                            value,
+                            other,
+                        ),
+                    });
+                }
+                term.expect("borrow through an inhabited enum")
+            }
+            None => self
+                .var_type(var)
+                .term
+                .map_var(|var| var.into_var().unwrap()),
+        }
+    }
+
+    fn borrow_var(&mut self, var: Var, prophecy: TempVarIdx) -> PlaceType {
+        match self
+            .flow_binding(var)
+            .expect("borrowing unbound var")
+            .clone()
+        {
+            FlowBinding::Box { current: x, elem } => {
+                let inner_ty = self.var_type(x.into());
+                self.temp_vars[prophecy] = TempVarBinding::Type(elem.clone());
+                self.insert_flow_binding(
+                    var,
+                    FlowBinding::Box {
+                        current: prophecy,
+                        elem: elem.clone(),
+                    },
+                );
+                inner_ty.mut_with(prophecy, *elem)
+            }
+            FlowBinding::Mut(x1, x2) => {
+                let inner_ty = self.var_type(x1.into());
+                let elem = self.var(x2.into()).expect("unbound prophecy").clone();
+                self.temp_vars[prophecy] = TempVarBinding::Type(Box::new(elem.clone()));
+                self.insert_flow_binding(var, FlowBinding::Mut(prophecy, x2));
+                inner_ty.mut_with(prophecy, elem)
+            }
+            _ => panic!("invalid borrow"),
+        }
+    }
+
+    /// `part` of `parent`, given a flow binding when the environment holds it as a plain
+    /// variable of a `&mut` or `Box` type, so that a borrow can go through it: the prophecy of a
+    /// borrow that `parent` was assigned through (`r = &mut b` for a mutable local `r`), or a
+    /// pointer bound past the enum expansion depth. The fresh binding is equal to it and takes
+    /// its place in `parent`.
+    fn flow_part(&mut self, parent: Var, part: TempVarIdx) -> TempVarIdx {
+        if self.flow_binding(part.into()).is_some() {
+            return part;
+        }
+        let ty = &self.var(part.into()).expect("unbound var").ty;
+        if !ty.as_pointer().is_some_and(|ty| ty.is_own() || ty.is_mut()) {
+            return part;
+        }
+        let rty = rty::RefinedType::refined_with_term(ty.clone(), chc::Term::var(part.into()));
+        let fresh = self.temp_vars.next_index();
+        self.bind_impl(fresh.into(), rty, 0, None);
+        let mut binding = self.flow_binding(parent).expect("unbound parent").clone();
+        binding.replace_part(part, fresh);
+        self.insert_flow_binding(parent, binding);
+        fresh
+    }
+
+    pub fn borrow_place(&mut self, place: Place<'_>, prophecy_var: TempVarIdx) -> PlaceType {
+        let mut var = place.local.into();
+        let mut invariants = Vec::new();
+
+        let mut it = place.projection.into_iter();
+        loop {
+            let Some(elem) = it.next() else {
+                break;
+            };
+            let (part, invariant) = match (elem, self.flow_binding(var).expect("deref unbound var"))
+            {
+                (PlaceElem::Deref, FlowBinding::Box { current, elem }) => {
+                    (*current, Some(elem.refinement.clone()))
+                }
+                (PlaceElem::Deref, &FlowBinding::Mut(current, final_)) => {
+                    let elem = self.var(final_.into()).expect("unbound prophecy");
+                    (current, Some(elem.refinement.clone()))
+                }
+                (PlaceElem::Field(idx, _), FlowBinding::Tuple(xs)) => (xs[idx.as_usize()], None),
+                (PlaceElem::Downcast(_, variant_idx), FlowBinding::Enum { variants, .. }) => {
+                    let Some(PlaceElem::Field(field_idx, _)) = it.next() else {
+                        panic!("downcast not followed by field")
+                    };
+                    (variants[variant_idx].fields[field_idx], None)
+                }
+                _ => unimplemented!("elem={:?}", elem),
+            };
+            let part = self.flow_part(var, part);
+            if let Some(refinement) = invariant {
+                invariants.push((part.into(), refinement));
+            }
+            var = part.into();
+        }
+
+        let mut borrowed = self.borrow_var(var, prophecy_var);
+        let rty::Type::Pointer(pointer) = &mut borrowed.ty else {
+            unreachable!();
+        };
+        // borrow_var replaces the borrowed value with prophecy_var in the environment.
+        // Reconstruct each parent after that update, then replace prophecy_var with
+        // Value to express the parent's invariant as a refinement of the borrowed pointee.
+        for (parent, refinement) in invariants {
+            if refinement.is_top() {
+                continue;
+            }
+            let term = self.var_term(parent).map_var(rty::RefinedTypeVar::Free);
+            let invariant = refinement
+                .subst_value_var(|| term.clone())
+                .map_var(|var| match var {
+                    rty::RefinedTypeVar::Free(var) if var == prophecy_var.into() => {
+                        rty::RefinedTypeVar::Value
+                    }
+                    var => var,
+                });
+            pointer.elem.refinement.push_conj(invariant);
+        }
+        self.temp_vars[prophecy_var] = TempVarBinding::Type(pointer.elem.clone());
+        borrowed
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Path {
+    Local(Local),
+    Deref(Box<Path>),
+    TupleProj(Box<Path>, usize),
+    Downcast(Box<Path>, VariantIdx, FieldIdx),
+}
+
+impl<'tcx> From<Place<'tcx>> for Path {
+    fn from(place: Place<'tcx>) -> Self {
+        let mut it = place.projection.into_iter();
+        let mut path = Path::Local(place.local);
+        loop {
+            path = match it.next() {
+                Some(PlaceElem::Deref) => Path::Deref(Box::new(path)),
+                Some(PlaceElem::Field(idx, _)) => Path::TupleProj(Box::new(path), idx.as_usize()),
+                Some(PlaceElem::Downcast(_, variant_idx)) => {
+                    let Some(PlaceElem::Field(field_idx, _)) = it.next() else {
+                        panic!("downcast not followed by field")
+                    };
+                    Path::Downcast(Box::new(path), variant_idx, field_idx)
+                }
+                None => break,
+                _ => unimplemented!(),
+            };
+        }
+        path
+    }
+}
+
+impl<T> Env<T>
+where
+    T: EnumDefProvider,
+{
+    fn path_type(&self, path: &Path) -> PlaceType {
+        match path {
+            Path::Local(local) => self.local_type(*local),
+            Path::Deref(path) => self.path_type(path).deref(),
+            Path::TupleProj(path, idx) => self.path_type(path).tuple_proj(*idx),
+            Path::Downcast(path, variant_idx, field_idx) => {
+                self.path_type(path)
+                    .downcast(*variant_idx, *field_idx, &self.enum_defs)
+            }
+        }
+    }
+
+    pub fn place_type(&self, place: Place) -> PlaceType {
+        self.path_type(&place.into())
+    }
+
+    fn dropping_assumption(&mut self, path: &Path) -> Assumption {
+        let PlaceType {
+            ty,
+            mut existentials,
+            term,
+            mut formula,
+        } = self.path_type(path);
+        let mut fresh = |sort| chc::Term::var(existentials.push(sort).into());
+        formula.push_conj(ty.resolution(term, &self.enum_defs, &mut fresh));
+        Assumption::new(existentials, formula)
+    }
+
+    pub fn drop_local(&mut self, local: Local) {
+        self.drop_path(&Path::Local(local));
+    }
+
+    pub fn drop_place(&mut self, place: Place) {
+        self.drop_path(&place.into());
+    }
+
+    fn drop_path(&mut self, path: &Path) {
+        let assumption = self.dropping_assumption(path);
+        if !assumption.is_top() {
+            self.assume(assumption);
+        }
+    }
+}

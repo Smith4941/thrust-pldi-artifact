@@ -1,0 +1,57 @@
+unsat
+; solver: solver: tests/thrust-pcsat-wrapper ; preprocessor: ; salt: fptprove=44c298e58b config=./config/solver/pcsat_thrust.json
+(set-logic HORN)
+(declare-forall-sort a0)
+(declare-forall-sort a1)
+(declare-datatypes ((A0_Mut<Int> 0)) (
+  (par () (
+    (mut<Int> (mut_current<Int> Int) (mut_final<Int> Int))
+  ))
+))
+(declare-datatypes ((A1_Tuple<Int-Int> 0)) (
+  (par () (
+    (tuple<Int-Int> (tuple_proj<Int-Int>.0 Int) (tuple_proj<Int-Int>.1 Int))
+  ))
+))
+(declare-datatypes ((A2_Mut<Tuple<Int-Int>> 0)) (
+  (par () (
+    (mut<Tuple<Int-Int>> (mut_current<Tuple<Int-Int>> A1_Tuple<Int-Int>) (mut_final<Tuple<Int-Int>> A1_Tuple<Int-Int>))
+  ))
+))
+(declare-datatypes ((A3_Tuple 0)) (
+  (par () (
+    (tuple )
+  ))
+))
+(declare-datatypes ((A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int> 0)) (
+  (par () (
+    (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Int> )
+    (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Int> (_getd_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some.0<Int> Int))
+  ))
+))
+(define-fun datatype_discr<A0_Mut<Int>> ((x A0_Mut<Int>)) Int (ite ((_ is mut<Int>) x) 0 (- 1)))
+(define-fun matcher_pred<A0_Mut<Int>> ((x0 Int) (x1 Int) (v A0_Mut<Int>)) Bool (or (= v (mut<Int> x0 x1))))
+(define-fun datatype_discr<A1_Tuple<Int-Int>> ((x A1_Tuple<Int-Int>)) Int (ite ((_ is tuple<Int-Int>) x) 0 (- 1)))
+(define-fun matcher_pred<A1_Tuple<Int-Int>> ((x0 Int) (x1 Int) (v A1_Tuple<Int-Int>)) Bool (or (= v (tuple<Int-Int> x0 x1))))
+(define-fun datatype_discr<A2_Mut<Tuple<Int-Int>>> ((x A2_Mut<Tuple<Int-Int>>)) Int (ite ((_ is mut<Tuple<Int-Int>>) x) 0 (- 1)))
+(define-fun matcher_pred<A2_Mut<Tuple<Int-Int>>> ((x0 A1_Tuple<Int-Int>) (x1 A1_Tuple<Int-Int>) (v A2_Mut<Tuple<Int-Int>>)) Bool (or (= v (mut<Tuple<Int-Int>> x0 x1))))
+(define-fun datatype_discr<A3_Tuple> ((x A3_Tuple)) Int (ite ((_ is tuple) x) 0 (- 1)))
+(define-fun matcher_pred<A3_Tuple> ((v A3_Tuple)) Bool (or (= v tuple)))
+(define-fun datatype_discr<A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>> ((x A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>)) Int (ite ((_ is d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Int>) x) 0 (ite ((_ is d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Int>) x) 1 (- 1))))
+(define-fun matcher_pred<A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>> ((x0 Int) (v A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>)) Bool (or (= v d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Int>) (= v (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Int> x0))))
+(declare-forall-fun q_produces_498055f897b73d13c0dd8d3fcf281509<a0> (a0 (Seq a1) a0) Bool :law (and (forall ((q$3 a0)) (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$3 (as seq.empty (Seq a1)) q$3)) (forall ((q$4 a0) (q$5 (Seq a1)) (q$6 a0) (q$7 (Seq a1)) (q$8 a0)) (=> (and (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$4 q$5 q$6) (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$6 q$7 q$8)) (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$4 (seq.++ q$5 q$7) q$8))) (forall ((q$9 a0)) (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$9 (as seq.empty (Seq a1)) q$9)) (forall ((q$10 a0) (q$11 (Seq a1)) (q$12 a0) (q$13 (Seq a1)) (q$14 a0)) (=> (and (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$10 q$11 q$12) (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$12 q$13 q$14)) (q_produces_498055f897b73d13c0dd8d3fcf281509<a0> q$10 (seq.++ q$11 q$13) q$14)))))
+(define-fun p_invariant_498055f897b73d13e2ff179efab8703f_0 ((v0 A1_Tuple<Int-Int>)) Bool true)
+(define-fun p_completed_498055f897b73d136d334b52b1f505be_1 ((v0 A2_Mut<Tuple<Int-Int>>)) Bool (and (= (mut_current<Tuple<Int-Int>> v0) (mut_final<Tuple<Int-Int>> v0)) (>= (tuple_proj<Int-Int>.0 (mut_current<Tuple<Int-Int>> v0)) (tuple_proj<Int-Int>.1 (mut_current<Tuple<Int-Int>> v0)))))
+(define-fun p_produces_498055f897b73d1313a65731886a8fca_2 ((v0 A1_Tuple<Int-Int>) (v1 (Seq Int)) (v2 A1_Tuple<Int-Int>)) Bool (and (and (and (and (= (tuple_proj<Int-Int>.1 v0) (tuple_proj<Int-Int>.1 v2)) (<= (tuple_proj<Int-Int>.0 v0) (tuple_proj<Int-Int>.0 v2))) (or (not (> (seq.len v1) 0)) (<= (tuple_proj<Int-Int>.0 v2) (tuple_proj<Int-Int>.1 v2)))) (= (seq.len v1) (- (tuple_proj<Int-Int>.0 v2) (tuple_proj<Int-Int>.0 v0)))) (forall ((q$1 Int)) (or (not (and (<= 0 q$1) (< q$1 (seq.len v1)))) (= (seq.nth v1 q$1) (+ (tuple_proj<Int-Int>.0 v0) q$1))))))
+(declare-dep-exists-fun p0 () (A1_Tuple<Int-Int> A1_Tuple<Int-Int>) Bool)
+(declare-dep-exists-fun p1 () (A1_Tuple<Int-Int> A1_Tuple<Int-Int> (Seq Int) A1_Tuple<Int-Int> (Seq Int) A1_Tuple<Int-Int> A1_Tuple<Int-Int> (Seq Int) A1_Tuple<Int-Int> (Seq Int)) Bool)
+(declare-dep-exists-fun p2 () (A2_Mut<Tuple<Int-Int>> A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>) Bool)
+(declare-dep-exists-fun p3 () (A2_Mut<Tuple<Int-Int>> A2_Mut<Tuple<Int-Int>>) Bool)
+(assert (forall ((v0 A1_Tuple<Int-Int>) (v1 A1_Tuple<Int-Int>) (v2 A3_Tuple) (v3 A1_Tuple<Int-Int>)) (=> (and (= v1 v0) (p0 v1 v0) (= v3 v1) (not (p_produces_498055f897b73d1313a65731886a8fca_2 v3 (as seq.empty (Seq Int)) v3))) false)))
+(assert (forall ((v0 A1_Tuple<Int-Int>) (v1 A1_Tuple<Int-Int>)) (=> (and  true) (p0 v1 v1))))
+(assert (forall ((v0 A1_Tuple<Int-Int>) (v1 (Seq Int)) (v2 A1_Tuple<Int-Int>) (v3 (Seq Int)) (v4 A1_Tuple<Int-Int>) (v5 A1_Tuple<Int-Int>) (v6 (Seq Int)) (v7 A1_Tuple<Int-Int>) (v8 (Seq Int)) (v9 A1_Tuple<Int-Int>) (v10 A3_Tuple) (v11 A1_Tuple<Int-Int>) (v12 (Seq Int)) (v13 A1_Tuple<Int-Int>) (v14 (Seq Int)) (v15 A1_Tuple<Int-Int>)) (=> (and (= v5 v0) (= v6 v1) (= v7 v2) (= v8 v3) (= v9 v4) (p1 v9 v0 v1 v2 v3 v4 v5 v6 v7 v8) (= v11 v5) (= v12 v6) (= v13 v7) (= v14 v8) (= v15 v9) (not (p_produces_498055f897b73d1313a65731886a8fca_2 v11 (seq.++ v12 v14) v15))) false)))
+(assert (forall ((v0 A1_Tuple<Int-Int>) (v1 (Seq Int)) (v2 A1_Tuple<Int-Int>) (v3 (Seq Int)) (v4 A1_Tuple<Int-Int>) (v5 A1_Tuple<Int-Int>)) (=> (and  (and (p_produces_498055f897b73d1313a65731886a8fca_2 v0 v1 v2) (p_produces_498055f897b73d1313a65731886a8fca_2 v2 v3 v5))) (p1 v5 v0 v1 v2 v3 v5 v0 v1 v2 v3))))
+(assert (forall ((v0 A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>) (v1 Int) (v2 A1_Tuple<Int-Int>) (v3 Int) (v4 Int) (v5 A2_Mut<Tuple<Int-Int>>) (v6 Int) (v7 Int) (v8 Int) (v9 A2_Mut<Tuple<Int-Int>>) (v10 A1_Tuple<Int-Int>) (v11 Int) (v12 Int) (v13 A2_Mut<Tuple<Int-Int>>) (v14 A1_Tuple<Int-Int>) (v15 Int) (v16 Int) (v17 A2_Mut<Tuple<Int-Int>>) (v18 A1_Tuple<Int-Int>) (v19 Int) (v20 Int) (v21 Bool) (v22 Int) (v23 Int) (v24 A1_Tuple<Int-Int>) (v25 Int) (v26 Int) (v27 A2_Mut<Tuple<Int-Int>>) (v28 Int) (v29 A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>) (v30 A2_Mut<Tuple<Int-Int>>) (v31 A2_Mut<Tuple<Int-Int>>)) (=> (and (= v0 (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Int> v1)) (= v9 (mut<Tuple<Int-Int>> (tuple<Int-Int> v3 v4) v2)) (= v10 (mut_current<Tuple<Int-Int>> v9)) (= v11 (tuple_proj<Int-Int>.0 v10)) (= v12 v11) (= v1 v12) (= (mut<Int> v8 v7) (mut<Int> v3 v6)) (= v21 (> v22 v23)) (= v13 (mut<Tuple<Int-Int>> (tuple<Int-Int> v25 v26) v24)) (= v14 (mut_current<Tuple<Int-Int>> v13)) (= v15 (tuple_proj<Int-Int>.0 v14)) (= v16 v15) (= v22 v16) (= v17 (mut<Tuple<Int-Int>> (tuple<Int-Int> v25 v26) v24)) (= v18 (mut_current<Tuple<Int-Int>> v17)) (= v19 (tuple_proj<Int-Int>.1 v18)) (= v20 v19) (= v23 v20) (p3 v27 (mut<Tuple<Int-Int>> (tuple<Int-Int> v25 v26) v24)) (= v21 false) (= (mut<Tuple<Int-Int>> (tuple<Int-Int> v3 v4) v2) (mut<Tuple<Int-Int>> (tuple<Int-Int> v25 v26) v24)) (= v5 v27) (= v28 (mut_current<Int> (mut<Int> v8 v7))) (= (mut_final<Int> (mut<Int> v8 v7)) (+ v28 1)) (= (mut_final<Tuple<Int-Int>> (mut<Tuple<Int-Int>> (tuple<Int-Int> v6 v4) v2)) (mut_current<Tuple<Int-Int>> (mut<Tuple<Int-Int>> (tuple<Int-Int> v6 v4) v2))) (= v29 v0) (= v31 v5) true) (p2 v31 v29))))
+(assert (forall ((v0 A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>) (v1 A2_Mut<Tuple<Int-Int>>) (v2 A2_Mut<Tuple<Int-Int>>) (v3 A1_Tuple<Int-Int>) (v4 Int) (v5 Int) (v6 A2_Mut<Tuple<Int-Int>>) (v7 A1_Tuple<Int-Int>) (v8 Int) (v9 Int) (v10 Bool) (v11 Int) (v12 Int) (v13 A1_Tuple<Int-Int>) (v14 Int) (v15 Int) (v16 A2_Mut<Tuple<Int-Int>>) (v17 A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>) (v18 A2_Mut<Tuple<Int-Int>>) (v19 A2_Mut<Tuple<Int-Int>>)) (=> (and (= v0 d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Int>) (= v10 (> v11 v12)) (= v2 (mut<Tuple<Int-Int>> (tuple<Int-Int> v14 v15) v13)) (= v3 (mut_current<Tuple<Int-Int>> v2)) (= v4 (tuple_proj<Int-Int>.0 v3)) (= v5 v4) (= v11 v5) (= v6 (mut<Tuple<Int-Int>> (tuple<Int-Int> v14 v15) v13)) (= v7 (mut_current<Tuple<Int-Int>> v6)) (= v8 (tuple_proj<Int-Int>.1 v7)) (= v9 v8) (= v12 v9) (p3 v16 (mut<Tuple<Int-Int>> (tuple<Int-Int> v14 v15) v13)) (not (= v10 false)) (= (mut_final<Tuple<Int-Int>> (mut<Tuple<Int-Int>> (tuple<Int-Int> v14 v15) v13)) (mut_current<Tuple<Int-Int>> (mut<Tuple<Int-Int>> (tuple<Int-Int> v14 v15) v13))) (= v1 v16) (= v17 v0) (= v19 v1) true) (p2 v19 v17))))
+(assert (forall ((v0 A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>) (v1 A2_Mut<Tuple<Int-Int>>) (v2 A2_Mut<Tuple<Int-Int>>) (v3 A4_d_Option_dc33fea427b8ae3cee3022bbf94c4dcc<Int>)) (=> (and (p2 v1 v0) (= v2 v1) (= v3 v0) (not (and (and (p_invariant_498055f897b73d13e2ff179efab8703f_0 (mut_final<Tuple<Int-Int>> v2)) (=> (= v3 d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.None<Int>) (p_completed_498055f897b73d136d334b52b1f505be_1 v2))) (forall ((q$0 Int)) (=> (= v3 (d_Option_dc33fea427b8ae3cee3022bbf94c4dcc.Some<Int> q$0)) (p_produces_498055f897b73d1313a65731886a8fca_2 (mut_current<Tuple<Int-Int>> v2) (seq.unit q$0) (mut_final<Tuple<Int-Int>> v2))))))) false)))
+(assert (forall ((v0 A2_Mut<Tuple<Int-Int>>) (v1 A2_Mut<Tuple<Int-Int>>)) (=> (and  (p_invariant_498055f897b73d13e2ff179efab8703f_0 (mut_current<Tuple<Int-Int>> v1))) (p3 v1 v1))))

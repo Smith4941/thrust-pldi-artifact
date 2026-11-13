@@ -1,0 +1,202 @@
+//@error-in-other-file: Unsat
+//@compile-flags: -C debug-assertions=off
+//@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper THRUST_SOLVER_TIMEOUT_SECS=300
+
+// Scalability evaluation, variant written, k = 8. Fail twin: the loop of `repeat` stops one step early, so its body breaks its postcondition.
+
+#[thrust_macros::context]
+trait Step {
+    #[thrust_macros::requires(Self::inv(x))]
+    #[thrust_macros::ensures(Self::inv(result) && result > x)]
+    fn step(&self, x: i64) -> i64;
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool;
+}
+
+#[thrust_macros::context]
+#[thrust_macros::requires(T::inv(x) && n >= 0)]
+#[thrust_macros::ensures(T::inv(result) && result >= x + n)]
+fn repeat<T: Step>(a: &T, x: i64, n: i64) -> i64 {
+    let mut v = x;
+    let mut i = 0;
+    while i + 1 < n {
+        thrust_macros::invariant!(
+            |v: i64, i: i64, x: thrust_models::FnParam<i64>| T::inv(v) && v >= x.at_entry() + i
+        );
+        v = a.step(v);
+        i += 1;
+    }
+    v
+}
+
+#[derive(PartialEq)]
+struct S0 {}
+
+impl thrust_models::Model for S0 {
+    type Ty = S0;
+}
+
+#[thrust_macros::context]
+impl Step for S0 {
+    fn step(&self, x: i64) -> i64 {
+        x + 1
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 0
+    }
+}
+
+#[derive(PartialEq)]
+struct S1 {}
+
+impl thrust_models::Model for S1 {
+    type Ty = S1;
+}
+
+#[thrust_macros::context]
+impl Step for S1 {
+    fn step(&self, x: i64) -> i64 {
+        x + 2
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 1
+    }
+}
+
+#[derive(PartialEq)]
+struct S2 {}
+
+impl thrust_models::Model for S2 {
+    type Ty = S2;
+}
+
+#[thrust_macros::context]
+impl Step for S2 {
+    fn step(&self, x: i64) -> i64 {
+        x + 3
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 2
+    }
+}
+
+#[derive(PartialEq)]
+struct S3 {}
+
+impl thrust_models::Model for S3 {
+    type Ty = S3;
+}
+
+#[thrust_macros::context]
+impl Step for S3 {
+    fn step(&self, x: i64) -> i64 {
+        x + 1
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 3
+    }
+}
+
+#[derive(PartialEq)]
+struct S4 {}
+
+impl thrust_models::Model for S4 {
+    type Ty = S4;
+}
+
+#[thrust_macros::context]
+impl Step for S4 {
+    fn step(&self, x: i64) -> i64 {
+        x + 2
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 4
+    }
+}
+
+#[derive(PartialEq)]
+struct S5 {}
+
+impl thrust_models::Model for S5 {
+    type Ty = S5;
+}
+
+#[thrust_macros::context]
+impl Step for S5 {
+    fn step(&self, x: i64) -> i64 {
+        x + 3
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 5
+    }
+}
+
+#[derive(PartialEq)]
+struct S6 {}
+
+impl thrust_models::Model for S6 {
+    type Ty = S6;
+}
+
+#[thrust_macros::context]
+impl Step for S6 {
+    fn step(&self, x: i64) -> i64 {
+        x + 1
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 6
+    }
+}
+
+#[derive(PartialEq)]
+struct S7 {}
+
+impl thrust_models::Model for S7 {
+    type Ty = S7;
+}
+
+#[thrust_macros::context]
+impl Step for S7 {
+    fn step(&self, x: i64) -> i64 {
+        x + 2
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 7
+    }
+}
+
+fn main() {
+    let r_s0 = repeat(&S0 {}, 0, 3);
+    assert!(r_s0 >= 3);
+    let r_s1 = repeat(&S1 {}, 1, 3);
+    assert!(r_s1 >= 4);
+    let r_s2 = repeat(&S2 {}, 2, 3);
+    assert!(r_s2 >= 5);
+    let r_s3 = repeat(&S3 {}, 3, 3);
+    assert!(r_s3 >= 6);
+    let r_s4 = repeat(&S4 {}, 4, 3);
+    assert!(r_s4 >= 7);
+    let r_s5 = repeat(&S5 {}, 5, 3);
+    assert!(r_s5 >= 8);
+    let r_s6 = repeat(&S6 {}, 6, 3);
+    assert!(r_s6 >= 9);
+    let r_s7 = repeat(&S7 {}, 7, 3);
+    assert!(r_s7 >= 10);
+}

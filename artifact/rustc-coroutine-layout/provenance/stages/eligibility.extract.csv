@@ -1,0 +1,10 @@
+marker,source,lines
+,target.rs,"26,28,33,278-281"
+// //== local to the case study: the iterator trait and `Enumerate` (rewrites.md R9),target.rs,"26,28,33,36,40-41,45-46,54-56,69-70,83,152,155,705-708,735-736,752-753,983-985"
+"// //== ./../rustc_index/src/bit_set.rs (verbatim from bitset.rs, stage 3/4)",target.rs,"58-62,64-73,75-97,99-106,108-123,125-189,191-204,206-227,229-276"
+"// //== ./../rustc_index/src/idx.rs (verbatim from bitset.rs, stage 3/4, plus",target.rs,"281-309,322-323,325-354,356-367"
+// //== ./../rustc_index/src/slice.rs (new for this stage),target.rs,"369,373-381,383-472,478-479,481,488-492,500-519"
+// //== ./../rustc_index/src/vec.rs (new for this stage),target.rs,"521-635,639,642-645,653-655,657,660-662"
+// //== ./src/layout/coroutine.rs,target.rs,"664,667-673"
+// //== Thrust model declarations,target.rs,"7,32-33,55-56,69,134,2161-2162,2164-2165,2167-2168,2170-2176,2180,2272-2273"
+"// //== stage 5 spec: `coroutine_saved_local_eligibility` (README.md, stage 5)",target.rs,"7,14,674-696,701-729,734-759,761-764,2274"

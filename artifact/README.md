@@ -1,0 +1,280 @@
+# Evaluation artifact
+
+The inputs, the scripts and the rows of the PLDI 2027 evaluation. The verified programs are tests
+of the Thrust tree (`thrust/`) or files of this directory; which inputs a research question runs,
+and what each is expected to answer, is data: one `runs.csv` per question. What the anonymised
+replication package contains is packaging.md.
+
+## Layout
+
+| Path | What it is |
+| --- | --- |
+| `comparison-creusot/` | RQ1 and RQ2: Creusot's iterator benchmark and its Thrust tests ([README](comparison-creusot/README.md)) |
+| `comparison-verus/` | RQ1: the same benchmark ported to Verus, with its counts and runs (README); not in the replication package |
+| `comparison-flux/` | RQ1, Flux: the benchmark's cases ported to Flux, their line counts, runs and properties (README); not in the replication package |
+| `comparison-prusti/` | RQ1, a further tool: the benchmark's cases ported to Prusti, their runs and counts (`prusti.csv`), not read by the scripts below (README); not in the replication package |
+| `scalability-evaluation/` | RQ3: one generic function at k = 1 to 32 instances, the programs and their generators `generate.py` and `generate_chains.py` (std adapter chains) ([README](scalability-evaluation/README.md)) |
+| `scalability-input-families/` | RQ3, supplementary: generic functions with other bodies ([README](scalability-input-families/README.md)) |
+| `rustc-coroutine-layout/` | RQ4: the case study on rustc's coroutine layout ([README](rustc-coroutine-layout/README.md)) |
+| `capability-probes/` | five programs in Creusot, Thrust, Verus, Flux and Prusti behind the capability matrix (README); not part of the package |
+| `results/<date>-<fptprove commit>/` | the rows of a run (`rq1.csv`, `rq3.csv`, `families.csv`, `rq4.csv`; `smoke.log` and `tables.log` ignored) and its `versions.env` |
+| `count-annotations/` | the counter of the lines and annotations the tables print (a Rust crate, below) |
+| `reproduce.sh` | the entry point that reproduces the tables and figures ([below](#reproducing-the-paper)) |
+| `scripts/` | the scripts below; `solver.Dockerfile` and `thrust-coar-native-wrapper` are the solver files of the package |
+| `package/` | the README and licence texts of the replication package |
+| `probes/` | development probes, not part of the evaluation or of the package |
+
+`results/2026-11-13-ab598199/` is the run the paper reports: Thrust fork `main` ab598199, solver
+built from fptprove 44c298e58b with cvc5 1.4.1 (record). The other directories under `results/` are earlier runs in the
+format of the scripts they were taken with.
+
+## Reproducing the paper
+
+`reproduce.sh` is the entry point; it delegates to `scripts/run.py` and `scripts/run-evaluation.sh`
+and `-n` lists what a step would run. Run it from the root of a checkout (or of the replication
+package), with a built Thrust tree (`--thrust`, default `thrust/`, the package's) at the Thrust commit `T` of `OUT/versions.env` and the solver image
+`coar:F` ([the solver image](#the-solver-image)).
+
+```bash
+mkdir -p OUT && cp artifact/results/<run>/versions.env OUT/   # F and T of the reported run
+artifact/reproduce.sh -n quick OUT     # what each step runs, without running it
+artifact/reproduce.sh quick OUT        # the quick run: 16 runs at 60 s, verdicts against the expected ones
+artifact/reproduce.sh full OUT         # every step on the printed inputs, three runs each, 300 s per call
+artifact/reproduce.sh --thrust <tree> tables   # the tables and figures from the reported rows
+```
+
+Each step of `full` is a step of `run-evaluation.sh` (below); a table or figure is written to
+`../paper/sections/{tables,figures}/`. The times are the steps of the reported run on 32 threads and
+94 GiB, from its record: four
+containers at once and the older scripts the record names, so for `full` they are estimates. They hold on an otherwise idle machine of that size; under load the
+verdicts stand but the seconds do not (protocol). The tables and
+figures committed under `../paper/sections/` follow that run; the ledger's counts for RQ1 and RQ4
+(C5, C8) are of later trees (decisions.md D74). The lists have changed since
+that run (RQ2's std loops among them), so `tables` on the reported rows stops at `main` on the
+inputs the run lacks; the final run replaces the rows.
+
+| Paper | Claim (ledger) | Step of `full` | Inputs | Output | Time |
+| --- | --- | --- | --- | --- | --- |
+| Table `tab:creusot` (RQ1) | C4, C5 | `rq1`, `tables` | `comparison-creusot/runs.csv`; the Creusot columns are recorded in `comparison-creusot/creusot.csv`, not rerun | `tables/creusot.tex`, `rq1.csv` | 27 min |
+| Table `tab:creusot-inferred` (RQ2) | C6 | `rq1`, `tables` | the `inferred` rows of the same list | `tables/creusot-inferred.tex`, `rq1.csv` | (with RQ1) |
+| Figure `fig:scalability-iterators` (RQ3); supplementary Table `tab:scalability-iterators`, Figure `fig:scalability` and Table `tab:scalability` | C7 | `rq3`, `tables` | `scalability-evaluation/runs.csv`, generated by `generate.py` | `figures/scalability-iterators.tex`, `tables/scalability-iterators.tex`, `figures/scalability.tex`, `tables/scalability.tex`, `rq3.csv` | 3 min |
+| Figure `fig:scalability-families` (RQ3, supplementary) | C7 | `families`, `tables` | `scalability-input-families/runs.csv` | `figures/scalability-families.tex`, `families.csv` | 3 min |
+| Table `tab:coroutine` (RQ4) | C8 | `rq4`, `tables` | `rustc-coroutine-layout/runs.csv`, `rows.csv` | `tables/coroutine.tex`, `rq4.csv` | 5 min |
+| The example programs of Sections 2 to 4 and the pass and fail tests behind Section 6 | C1 to C3 (the examples), C4 to C8 (the tests behind the RQs) | none: the test suite is a development check, `(cd thrust && cargo test --test ui)`; `full` runs ten of its tests as `smoke` | the test suite of the Thrust tree | its summary | 8 min in the reported run |
+
+The reported run took 47 minutes (the whole test suite 8, `rq1` 27, `rq3` 3, `families` 3, `rq4`
+5, `tables` under 1). `full` stops when a `smoke` test fails. The reported run's eight failing tests of the whole suite
+are listed in its record, not rerun alone, which by the protocol makes them not failures yet; a
+failing test is rerun alone before it is judged.
+
+`quick` runs `range`, `iter_mut` and `map_call` of RQ1, `inferred_k1` and `inferred_k2` of RQ3 (both
+settings) and `lemmas` of RQ4, each with its fail twin, once each with a 60 s cap, and fails when a
+verdict differs from the expected one or a row of the chosen ids is missing; it writes
+`quick-rq*.csv`, which `tables` does not read. In the reported run these inputs give the expected
+verdicts (record): the RQ1 and RQ3 ones
+within 3 s, `lemmas`, the RQ4 root with a fail twin, in 35.8 s, and its twin's 60 parts in 71.9 s
+of solver time, which the quick run spends one part at a time.
+
+Not reproduced by these steps: the Creusot side of Table `tab:creusot` (recorded in
+`comparison-creusot/creusot.csv`, which the `creusot` step of `run-evaluation.sh` writes with Creusot installed); the Verus, Flux
+and Prusti ports (verus-rq1.py, comparison-flux,
+comparison-prusti), which run their own tools; the capability matrix
+and the introduction's table of verifiers, which are written from
+capability-matrix.md; and `sat` re-verification
+(`run.py --check-solution`).
+
+## Scripts
+
+- `scripts/run.py LIST OUT` verifies the printed rows of a `runs.csv` and writes one row per run
+  to OUT. A list row names an input (`id`), its `setting` (empty, or `generic` and `per_instance` in
+  RQ3), its `side` (`pass`, `fail`, or `inferred` for a pass test with its loop invariants
+  removed), the `expect`ed verdict, the `file` (a path in the Thrust tree, or relative to the
+  list when it starts with `./`), `env`, variables for that row, and `printed`, `yes` for an input
+  whose result a table or figure prints; `run.py` runs those and their fail twins (the `fail` rows
+  of the same id and setting), which check that a property can fail. `--diagnostic` also runs the
+  other rows, the inputs kept for diagnosis and the twins of unprinted inputs
+  (decisions.md D107). An output row records the
+  verdict, `wall_s` (the wall time of the run's `thrust-rustc` command: Thrust's analysis and
+  constraint generation and every solver call, the time the tables print, D123), `time_s` (the
+  solver calls alone, recorded and not printed), the query's size and hash, the load and the containers of other
+  runs, the input (`file`, its sha256, `env`), the solver settings (command, `config`, `cpus`,
+  `memory`, timeout), and what ran: the Thrust commit and whether its tree had uncommitted changes,
+  the sha256 of `thrust-rustc`, the image id and the fptprove commit it was built from, and this
+  repository's commit. Before it starts, `run.py` checks these against the tree, the binary and
+  the image and stops on a mismatch (the checks are listed in the docstring of `scripts/run.py`). A run that gives no verdict
+  is recorded as `oom` (the solver ran out of its container's memory; tables print OOM, and the
+  RQ3 figures draw it as its own marker, out of memory), `error`, `killed` or
+  `interrupted` (stopped with Ctrl-C); with `--skip-sizes-past-cap` (RQ3, D113) a size after one
+  every run of which reached the cap is not run and is recorded as `skipped`, no answer, printed `--` and drawn with no marker. `-n` checks the same
+  and prints the runs with their settings, `check_solution` included, without starting them;
+  `--only` takes ids and stops on one the selected rows lack. `--check-solution` (with `--image`) runs CoAR with its solution check on:
+  `run.py` writes the image's configuration plus `"check_solution": true` to
+  `OUT.d/<run>/solver-config.json` and runs the fork's `tests/thrust-pcsat-wrapper` with
+  `COAR_CONFIG_DIR` and `THRUST_PCSAT_OUTPUT` set (the fork must include them), which keeps the
+  solver's output in `OUT.d/<run>/solver.out`. The columns `check_solution` (`on` or `off`),
+  `check_passed`, `unchecked` and `check_failed` hold the counts of the `(sat-check ...)` line of
+  that output and are empty when the check was off or the line is absent (an `unsat`, a timeout).
+  With the check on, a `sat` without the line is recorded as `error` and one with `check_failed`
+  above 0 as `check-failed`; a `sat` with unchecked counts keeps its verdict and the columns say
+  how many. The check adds to the times, so `tables.py` stops on rows with `check_solution`
+  on.
+- A split root (D78, D125; the rule is in the protocol) sets
+  exactly `THRUST_SPLIT=1`, with `THRUST_SPLIT_GOALS=1` or with `#[thrust::split_goals]` on the
+  functions whose goals are split, in its header and runs from the RQ4 list
+  (`rustc-coroutine-layout/runs.csv`) only. `time_s` is the sum of the parts' solver calls (a part
+  cut at the timeout logs no call and counts the timeout) and `wall_s` the root's wall time, which
+  the table prints (D123); `parts` is the number from Thrust's
+  note, and a run without the note, or whose note says the parts are the classes of clauses (the
+  fallback on a clause that is not definite, or no function marked), is an `error`. The timeout is the limit of each part and replaces the header's. A split set by a row's
+  env, in another list, under `--check-solution`, or with `THRUST_CACHE_DIR` or `THRUST_REPORT*`
+  set stops the run; `-n` marks a split row. `--parts-at-once N` solves N parts at a time
+  (`THRUST_SPLIT=N`) and is recorded in `parts_at_once`; the evaluation solves four parts at a time
+  and the roots one after another (D122, D126).
+- Verdict cache (D124): `--keep-verdicts` gives each run Thrust's `THRUST_CACHE_DIR` in a directory
+  of its own, `OUT.d/<run>/verdicts/`, new when the run starts, so no measured time is a cached
+  answer; `cache_hits` records the parts of a split root taken from its own run's cache (a part
+  whose query equals another of the root's), and `tables.py` refuses such a row.
+  `--reuse-verdicts DIR` runs with the cache DIR, read and written, for checking verdicts; its
+  rows' `verdict_cache` is `reused` and `tables.py` refuses them. Both set `THRUST_CACHE_SALT` to
+  the fptprove commit and `COAR_CONFIG`.
+- `scripts/tables.py [-n] RUN` writes Tables `tab:creusot`, `tab:creusot-inferred`, `tab:coroutine`,
+  `tab:scalability-iterators` and `tab:scalability` and Figures `fig:scalability-iterators`,
+  `fig:scalability` and `fig:scalability-families` under
+  `../paper/sections/` from the rows of a run and the counts below. What a cell means is in its
+  docstring; a cell gives the pass side's result and time, as
+  the evaluation protocol defines it (D90), and the fail twins
+  that are not refuted are listed on stderr for the record. It stops on a row that ran another file
+  than its list names now, from a tree with uncommitted changes, with an `interrupted` row, with
+  a printed row of its list missing for a run number (any row, once the run holds a row that is not
+  printed), with a fail twin that answered `sat`, or on an input it reads that its list does not
+  mark printed, or on rows without `wall_s`, the time every cell prints (D123), which rows taken
+  before `run.py` recorded it lack; it
+  checks every source before it writes a file, and with `-n` prints the files instead of writing
+  them. When every result cell of a table is `sat`, its result columns are left out (D81). `scripts/test_tables.py` tests that rule (`python3 -m unittest test_tables` in `scripts/`).
+- `count-annotations` (the crate `count-annotations/`, built on `syn`) counts the verified
+  programs; each command prints a CSV the tables read, with its rules in the header of its module
+  under `src/`:
+  - `creusot THRUST_TREE CASE_ITEMS_CSV`: `comparison-creusot/annotations.csv`, the code and
+    specification lines of the Thrust tests of Table `tab:creusot`, in the case part each test's
+    row of `comparison-creusot/case-items.csv` names; with `--creusot` on `comparison-creusot/creusot-port`
+    and `comparison-creusot/creusot-case-items.csv`, the same counts of Creusot's per-case files, recorded in
+    `comparison-creusot/creusot.csv` (D84).
+  - `coroutine THRUST_TREE PARTS_CSV UPSTREAM_DIR`: `rustc-coroutine-layout/stages.csv`, the counts
+    per stage, from the module tree the stage roots include, split into stages by
+    `rustc-coroutine-layout/parts.csv`; only functions the upstream copy in `UPSTREAM_DIR` has count as verified (D74), the others are `added` in `functions.csv`; `--functions` prints `functions.csv`, the functions they
+    count, and `--rows` prints `rows.csv`, the same counts per row of Table `tab:coroutine` (a
+    rustc function of at least 40 lines of code, or the rest of a source file, with `rustc_index`'s files as one, D82) with the stage
+    roots that check the row's functions; the `assumes`, `opaque`, `reveals` and `assume_stmts` columns of `stages.csv` and `rows.csv` count the
+    functions under assumptions and the `#[thrust::opaque]`, `#[thrust::reveal]` and `assume!`
+    annotations per stage (D78, D79), `trusted_helpers` the added helpers marked trusted or ignored, which are annotations and not in `trusted_functions` (D79), `spec_lines` the specification lines by the rule of `creusot`'s `spec_lines`, with the whole of each added function, `contracts_inferred` the analyzed functions whose contract is inferred (D83), and `functions_checked` the verified and assumed functions, of which they are a part, `generic_contracts_inferred` and `generic_functions_checked` the generic ones of the two (D83), `functions_extracted` the added functions other than lemmas and law proofs, which a rewrite extracted from rustc's functions; a part `std` of `parts.csv` is a std stand-in, counted nowhere. `creusot` counts a line that holds code and spec as both (D83). `scripts/stage-report-check.py [--list] STAGES FUNCTIONS_CSV REPORT...` checks `functions.csv`
+    against the `THRUST_REPORT=functions` reports (JSON) of the stage roots: what each root's run
+    checks, trusts, ignores or checks under the `assumes` it lists; `--list` prints the selected
+    functions with their `assumes` count without comparing.
+    `scripts/rq4-function-reports.sh [-n] THRUST_TREE IMAGE OUTDIR` writes those reports, one per
+    pass root of `rustc-coroutine-layout/runs.csv` (`-n` lists them).
+  - Loops counted by `coroutine` are `while`, `loop` and `for PAT in` with any pattern. The
+    committed CSVs counted only `for x in`; decisions.md D97 is their
+    regeneration. `coroutine --functions` prints the counts per function and writes nothing.
+  - `scalability PROGRAMS_DIR`: `scalability-evaluation/code-lines.csv`, the lines of code of the
+    RQ3 programs.
+  - `prusti [--lines ID] DIR CASES_CSV`: the code and specification lines, trusted items and
+    lemma calls of the Prusti ports (`comparison-prusti/`, its `case-items.csv`; not in the replication package), counted by the
+    line rule of `creusot` (a line holding code and spec counts in both, D84, D85); `--lines` lists one part's lines with their kind.
+    `comparison-prusti/make_table.py` writes `prusti.csv` from them.
+- `scripts/run-evaluation.sh OUT STEP...` runs the steps of the evaluation (below).
+- `scripts/creusot-time.py --creusot <checkout> [--creusot-std-build <dir>] OUT` times Creusot's
+  side of `tab:creusot` from each case's file in `comparison-creusot/creusot-port/` to the proof
+  search's result: the translation by the checkout's release `creusot-rustc` and the search from
+  scratch under one clock, three runs (D123). It prints per case the value of `creusot.csv`'s
+  `wall` and with `--write-creusot-csv` writes it; `-n` prints the commands and checks the tools.
+  It needs Creusot 3620de437 installed; `run-evaluation.sh`'s `creusot` step runs it.
+- `scripts/verus-rq1.py` (not in the replication package, with the port) counts, verifies and tabulates the Verus port in `comparison-verus/`
+  (`list` prints the cases and commands; usage in its docstring and in that README). It is not a
+  step of `run-evaluation.sh`.
+- `scripts/build-coar-image.sh`, `scripts/make-package.sh` and `scripts/check-anonymity.sh` are the
+  authors' tools for the solver images (below) and the package, and `scripts/solver-config/` holds a solver configuration the
+  evaluation does not use; the package carries none of them.
+
+## Running the evaluation
+
+The measurement protocol (timeouts, containers, baselines) is
+../docs/evaluation/README.md; the scripts implement it. A run needs
+a Thrust tree at commit T, committed and built with `cargo build --release` (`run.py` runs
+`target/release/thrust-rustc`, D123), the solver image `coar:<F>` built from fptprove
+commit F (below), and a directory OUT whose `versions.env` names the commits:
+
+```bash
+mkdir -p OUT && printf 'F=<fptprove commit>\nT=<Thrust commit>\n' > OUT/versions.env
+artifact/scripts/run-evaluation.sh -n --thrust <tree> OUT all   # the commands and every run
+artifact/scripts/run-evaluation.sh --thrust <tree> OUT all
+```
+
+The steps are `smoke` (ten ui tests of the tree, into `smoke.log`; a failure stops the run), `rq1` and `rq3` (three runs per input,
+`--runs`; `rq1` first checks, when the tree is a git checkout, that RQ2's inferred inputs are the
+tests of `T` without their invariants, `comparison-creusot/noinv.py --check`), `families` (one run,
+60 s), `rq4` (one run, one input at a time, a split root's parts four at a time: D126), `creusot`
+(Creusot's side of `tab:creusot` by `scripts/creusot-time.py`, after the solver steps so that
+nothing else runs; it needs `--creusot` and writes `creusot.csv`'s `wall`) and `tables`, which runs the three
+`count-annotations` commands on the tree (which must be at the run's Thrust commit `T` without
+uncommitted changes; the step checks it when the tree is a git checkout) and then `tables.py`,
+whose list of unrefuted fail twins goes to `tables.log`, and `verdicts`, which merges the
+verdicts each run kept (`run.py --keep-verdicts`, passed by every step but `rq4`, D124) into `OUT/verdicts/`, the
+cache the package ships, and stops on an entry two runs wrote differently. Every solver call gets 300 s
+unless the step says otherwise, and `--jobs` (default 4) containers run at once, each with 4 CPUs
+and 8 GB (D126); `rq1` runs two whatever `--jobs` is (D127), and `rq4` up to four, each with 4 CPUs and 8 GB. A step runs the printed rows
+of its list, the inputs the paper's tables and figures print, and their fail twins; `--diagnostic` adds the inputs
+kept for diagnosis and the twins of unprinted inputs (D107), and `smoke` is the default's check of the build and the image, with
+five pass and fail pairs. A step writes new rows only: it stops when its
+rows (`OUT/rq1.csv` and so on) or their directories exist, and `all` then runs no later step; name
+the remaining steps to resume. The run directory is committed with the
+rows (`*.csv`), `versions.env` and `verdicts/`; the per-run directories (`*.d/`, with Thrust's log and the
+emitted query) and the logs are ignored, since emission is deterministic and each row's
+`query_sha256` names its query.
+
+The counts and every table and figure of a committed run are regenerated in one step from its
+rows and the source of the tree at its commit `T`; it needs cargo, no build of Thrust and no
+solver. The lists the tables join the rows with change over time, so the step runs in a checkout
+of this repository at the commit the rows record (`research`). Rows from before that column are
+regenerated at the commit that last holds their lists: `results/2026-10-04-72b698b93/` at
+3199732, where this reproduces the committed tables and figures:
+
+```bash
+git worktree add <checkout> 3199732
+cd <checkout> && artifact/scripts/run-evaluation.sh --thrust <tree> artifact/results/2026-10-04-72b698b93 tables
+```
+
+To check the verdicts of a committed run quickly, run the steps with its cache; the solver is
+called only for a query the cache lacks, so the verdicts come back within minutes, and the
+rows' times are not measurements (`tables.py` refuses them):
+
+```bash
+artifact/scripts/run-evaluation.sh --thrust <tree> --reuse-verdicts artifact/results/<run>/verdicts OUT rq1 rq3 families rq4
+```
+
+Without `--reuse-verdicts` every run starts from an empty cache of its own: a cold run, whose times
+are measurements.
+
+## One example
+
+```bash
+artifact/scripts/run.py --thrust <tree> --thrust-commit <T> --fptprove-commit <F> \
+    --image coar:<F> --only range artifact/comparison-creusot/runs.csv /tmp/range.csv
+```
+
+prints `range.pass.1 sat` and `range.fail.1 unsat` with their times. `--solver $PWD/solver/thrust-coar-native-wrapper`, from the replication package, in place of
+`--image` runs the solver of its `solver/coar.zip` without Docker; the rows then name no image and
+take F as given. `--dirty` lets a development run use a tree with uncommitted changes; its rows
+record the tree as dirty, and `tables.py` refuses them.
+
+## The solver image
+
+Thrust calls the solver through the tree's `tests/thrust-pcsat-wrapper`, which starts a container
+of `COAR_IMAGE` per query; `run.py` sets it from `--image`. A measurement is identified by the
+fptprove commit the image was built from, which `run.py` reads from the image's `fptprove` label.
+An image built before the label existed has only its tag `coar:<F>`, a name its builder gave;
+`run.py` then takes the commit from the tag. The image takes opam's newest Z3 at build time, so
+a record also names the Z3 version of its `libz3.so`. CoAR calls cvc5 when one is on its `PATH`,
+which fptprove's image does not carry; `scripts/build-coar-image.sh <fptprove checkout>` builds
+`coar:<F>` and `coar:<F>-cvc5-1.4.1`, which adds cvc5 1.4.1's official static release (checked by
+its sha256), the image the evaluation runs (every row of the reported run names it). It labels both with `fptprove=<F>` and
+refuses a checkout with uncommitted changes.

@@ -1,0 +1,1336 @@
+--- a/provenance/stages/univariant.extract.rs
++++ b/tests/ui/pass/rustc_coroutine/univariant.rs
+@@ -1,10 +1,35 @@
++//@ignore-on-host: draft, stops at slice indexing by `IntoSliceIdx::Output` in the generic `Index` impl of `IndexSlice`, which has no specification (see README.md)
+ //@edition: 2024
+ #![feature(new_range_api)]
+-
+-
+-
++//@compile-flags: -Adead_code -C debug-assertions=off
++//@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper THRUST_TRY_SPECS=1
++
++// Extracted from tests/ui/pass/rustc_coroutine/target.rs (rustc's
++// rustc_abi::LayoutCalculator::univariant / univariant_biased and
++// LayoutData::scalar_pair, adapted). Stage 6 of the rustc_coroutine plan
++// (README.md, "stage 6"). The value types (Size/Align/Integer/../Niche/
++// TargetDataLayout) are copied from the already-annotated tests/ui/pass/
++// rustc_coroutine/values.rs (same underlying code, stage 1) rather than
++// re-derived, for the same reason as eligibility.rs reusing bitset.rs.
++// `IndexSlice`/`IndexVec`/`Idx` are copied from eligibility.rs (stage 2/4/5)
++// including its `IndexSlice` `Model` workaround (see the comment on that impl
++// there for why `type Ty = Self` is impossible). This file is a DRAFT: it is
++// not expected to verify (`ignore-on-host` above); `univariant`,
++// `univariant_biased` and `scalar_pair` all stay `#[thrust::trusted]` per the
++// stage plan (their bodies are not re-verified here, only `univariant` gets a
++// non-trivial contract).
++
++use thrust_models::{exists, forall};
++use thrust_models::model::{Seq};
++
++use std::cmp;
++use std::convert::TryInto;
+ use std::fmt::Debug;
+ use std::hash::Hash;
++use std::iter::FromIterator;
++use std::marker::PhantomData;
++use std::ops::{Add, AddAssign, Deref};
++use std::range::RangeInclusive;
+ use std::slice::SliceIndex;
+ 
+ // //== ./../rustc_hashes/src/lib.rs
+@@ -39,24 +64,67 @@
+ 
+ // //== ./../rustc_index/src/idx.rs (from bitset.rs, stage 2/4)
+ 
++#[thrust_macros::context]
+ pub trait Idx: Copy + 'static + Eq + PartialEq + Debug + Hash {
++    #[thrust_macros::predicate]
++    fn index_is(self, i: usize) -> bool;
++
++    /// Precondition of `Self::new(idx)`. See eligibility.rs's copy of this
++    /// trait for why only the `usize` instantiation is covered here.
++    #[thrust_macros::predicate]
++    fn can_new(idx: usize) -> bool;
++
++    #[thrust_macros::requires(Self::can_new(idx))]
++    #[thrust_macros::ensures(Self::index_is(result, idx))]
+     fn new(idx: usize) -> Self;
+ 
++    #[thrust_macros::ensures(Self::index_is(self, result))]
+     fn index(self) -> usize;
+ 
+     #[inline]
++    #[thrust_macros::requires(forall(|i: USize, a: USize|
++        Self::index_is(*self, i) && a == amount ==> Self::can_new(i + a)))]
++    #[thrust::trusted]
+     fn increment_by(&mut self, amount: usize) {
+         *self = self.plus(amount);
+     }
+ 
+     #[inline]
+     #[must_use = "Use `increment_by` if you wanted to update the index in-place"]
++    #[thrust_macros::requires(forall(|i: USize, a: USize|
++        Self::index_is(self, i) && a == amount ==> Self::can_new(i + a)))]
++    #[thrust::trusted]
+     fn plus(self, amount: usize) -> Self {
+         Self::new(self.index() + amount)
+     }
+-}
+-
++
++    // `index` is a function, so an element has exactly one index. Creusot gets this for free from
++    // a logic function; `index_is` is a predicate, so the two halves are laws.
++    #[thrust_macros::law]
++    #[thrust_macros::requires(Self::index_is(*a, i) && Self::index_is(*a, j))]
++    #[thrust_macros::ensures(i == j)]
++    #[thrust::trusted]
++    fn index_is_unique(a: &Self, i: usize, j: usize) {}
++
++    #[thrust_macros::law]
++    #[thrust_macros::ensures(exists(|i: USize| Self::index_is(*a, i)))]
++    #[thrust::trusted]
++    fn index_is_total(a: &Self) {}
++}
++
++#[thrust_macros::context]
+ impl Idx for usize {
++    #[thrust_macros::predicate]
++    fn index_is(self, i: usize) -> bool {
++        // i == self
++        i == self
++    }
++
++    #[thrust_macros::predicate]
++    fn can_new(idx: usize) -> bool {
++        true
++    }
++
+     #[inline]
+     fn new(idx: usize) -> Self {
+         idx
+@@ -67,7 +135,22 @@
+     }
+ }
+ 
++// `in_memory_order: IndexVec<u32, FieldIdx>` (FieldsShape::Arbitrary,
++// VariantLayout) needs `u32: Idx`; idx.rs verifies these bodies.
++#[thrust_macros::context]
+ impl Idx for u32 {
++    #[thrust_macros::predicate]
++    fn index_is(self, i: usize) -> bool {
++        // i == self
++        i == self
++    }
++
++    #[thrust_macros::predicate]
++    fn can_new(idx: usize) -> bool {
++        // idx <= u32::MAX
++        idx <= 4294967295usize
++    }
++
+     #[inline]
+     fn new(idx: usize) -> Self {
+         assert!(idx <= u32::MAX as usize);
+@@ -79,7 +162,7 @@
+     }
+ }
+ 
+-/// Own iterator standing in for `(start..end).map(I::new)`: yields
++/// Own iterator standing in for `(start..end).map(I::new)`.
+ pub struct IdxRange<I: Idx> {
+     start: usize,
+     end: usize,
+@@ -110,12 +193,26 @@
+     }
+ }
+ 
++#[thrust_macros::context]
++pub trait IntoSliceIdx<I, T: ?Sized + thrust_models::Model<Ty: PartialEq>> {
+     type Output: SliceIndex<T>;
++
++    /// `out` is the slice position `self` selects.
++    #[thrust_macros::predicate]
++    fn into_is(self, out: Self::Output) -> bool;
++
+     fn into_slice_idx(self) -> Self::Output;
+ }
+ 
+-impl<I: Idx, T> IntoSliceIdx<I, [T]> for I {
++#[thrust_macros::context]
++impl<I: Idx, T: thrust_models::Model<Ty: PartialEq>> IntoSliceIdx<I, [T]> for I {
+     type Output = usize;
++
++    #[thrust_macros::predicate]
++    fn into_is(self, out: usize) -> bool {
++        <I as Idx>::index_is(self, out)
++    }
++
+     #[inline]
+     fn into_slice_idx(self) -> Self::Output {
+         self.index()
+@@ -170,8 +267,12 @@
+     }
+ }
+ 
++#[thrust_macros::context]
+ impl<I: Idx, T> IndexSlice<I, T> {
+     #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::requires(true)]
++    #[thrust_macros::ensures(*result == *raw)]
+     pub const fn from_raw(raw: &[T]) -> &Self {
+         let ptr: *const [T] = raw;
+ 
+@@ -179,6 +280,9 @@
+     }
+ 
+     #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::requires(true)]
++    #[thrust_macros::ensures(*result == *raw && !result == !raw)]
+     pub fn from_raw_mut(raw: &mut [T]) -> &mut Self {
+         let ptr: *mut [T] = raw;
+ 
+@@ -220,26 +324,60 @@
+     }
+ }
+ 
+-impl<I: Idx, T, R: IntoSliceIdx<I, [T]>> Index<R> for IndexSlice<I, T> {
++impl<I: Idx, T: thrust_models::Model<Ty: PartialEq>, R: IntoSliceIdx<I, [T]>> std::ops::Index<R> for IndexSlice<I, T> {
+     type Output = <R::Output as SliceIndex<[T]>>::Output;
+ 
++    #[thrust::trusted]
+     #[inline]
+     fn index(&self, index: R) -> &Self::Output {
+         &self.raw[index.into_slice_idx()]
+     }
+ }
+ 
+-impl<I: Idx, T, R: IntoSliceIdx<I, [T]>> IndexMut<R> for IndexSlice<I, T> {
++impl<I: Idx, T: thrust_models::Model<Ty: PartialEq>, R: IntoSliceIdx<I, [T]>> std::ops::IndexMut<R> for IndexSlice<I, T> {
++    #[thrust::trusted]
+     #[inline]
+     fn index_mut(&mut self, index: R) -> &mut Self::Output {
+         &mut self.raw[index.into_slice_idx()]
+     }
+ }
+ 
++// `Index`/`IndexMut` are foreign traits, so the contract is an extern spec (the impl methods
++// are `trusted`). `IntoSliceIdx` has one impl, `I: Idx` into `usize`, through `Idx::index_is`.
++#[thrust::extern_spec_fn]
++#[thrust_macros::requires(forall(|i: USize| <R as IntoSliceIdx<I, [T]>>::into_is(index, i) ==> i < (*slf).len()))]
++#[thrust_macros::ensures(forall(|i: USize| <R as IntoSliceIdx<I, [T]>>::into_is(index, i) ==> *result == (*slf)[i]))]
++fn _extern_spec_index_slice_index<I: Idx + thrust_models::Model<Ty: PartialEq>, T: thrust_models::Model, R: IntoSliceIdx<I, [T], Output = usize> + thrust_models::Model>(slf: &IndexSlice<I, T>, index: R) -> &T
++where
++    <T as thrust_models::Model>::Ty: PartialEq,
++    <R as thrust_models::Model>::Ty: PartialEq,
++{
++    <IndexSlice<I, T> as std::ops::Index<R>>::index(slf, index)
++}
++
++#[thrust::extern_spec_fn]
++#[thrust_macros::requires(forall(|i: USize| <R as IntoSliceIdx<I, [T]>>::into_is(index, i) ==> i < (*slf).len()))]
++#[thrust_macros::ensures(forall(|i: USize| <R as IntoSliceIdx<I, [T]>>::into_is(index, i)
++    ==> (*result == (*slf)[i] && !slf == (*slf).store(i, !result))))]
++fn _extern_spec_index_slice_index_mut<I: Idx + thrust_models::Model<Ty: PartialEq>, T: thrust_models::Model, R: IntoSliceIdx<I, [T], Output = usize> + thrust_models::Model>(slf: &mut IndexSlice<I, T>, index: R) -> &mut T
++where
++    <T as thrust_models::Model>::Ty: PartialEq,
++    <R as thrust_models::Model>::Ty: PartialEq,
++{
++    <IndexSlice<I, T> as std::ops::IndexMut<R>>::index_mut(slf, index)
++}
++
+ // //== ./../rustc_index/src/vec.rs (from eligibility.rs, stage 2)
+ 
+ use std::borrow::{Borrow, BorrowMut};
+-use std::ops::{Deref, DerefMut};
++use std::ops::{Deref as _, DerefMut};
++
++/// The model of `usize` and `u64`, which carries its width while `THRUST_INT_RANGE` is set.
++#[cfg(not(thrust_int_range))]
++type USize = thrust_models::model::UInt;
++#[cfg(thrust_int_range)]
++type USize = thrust_models::model::UIntN<64>;
++
+ 
+ #[derive(Clone, PartialEq, Eq, Hash)]
+ #[repr(transparent)]
+@@ -287,6 +425,18 @@
+     }
+ }
+ 
++impl<I: Idx, T> IndexVec<I, T> {
++    #[inline]
++    pub fn as_slice(&self) -> &IndexSlice<I, T> {
++        IndexSlice::from_raw(&self.raw)
++    }
++
++    #[inline]
++    pub fn as_mut_slice(&mut self) -> &mut IndexSlice<I, T> {
++        IndexSlice::from_raw_mut(&mut self.raw)
++    }
++}
++
+ impl<I: Idx, T> DerefMut for IndexVec<I, T> {
+     #[inline]
+     fn deref_mut(&mut self) -> &mut Self::Target {
+@@ -308,6 +458,9 @@
+ 
+ impl<I: Idx, T> FromIterator<T> for IndexVec<I, T> {
+     #[inline]
++    // Not analysed and not callable: its only caller, the `collect` in `univariant_biased`, is
++    // trusted, and std.rs's iterator specifications are not used (rewrites.md R9).
++    #[thrust::ignored]
+     fn from_iter<J>(iter: J) -> Self
+     where
+         J: IntoIterator<Item = T>,
+@@ -327,36 +480,568 @@
+ }
+ 
+ // //== ./src/layout.rs / ./src/layout/simple.rs value types (verbatim from
+-
+-
+-}
++// values.rs, stage 1, with its existing `dl_wf` / `prim_wf` specs)
+ 
+ #[derive(Copy, Clone, /*Debug,*/ PartialEq, Eq)]
+-
+-
+-
+-
+-
+-}
+-
+-    }
+-
+-    #[thrust::trusted]
+-
+-
+-        }
+-
+-            } else {
+-        }
+-
++pub struct PointerSpec {
++    pointer_size: Size,
++
++    pointer_align: Align,
++
++    pointer_offset: Size,
++
++    _is_fat: bool,
++}
++
++#[derive(/*Debug,*/ PartialEq, Eq)]
++pub struct TargetDataLayout {
++    pub endian: Endian,
++    pub i1_align: Align,
++    pub i8_align: Align,
++    pub i16_align: Align,
++    pub i32_align: Align,
++    pub i64_align: Align,
++    pub i128_align: Align,
++    pub f16_align: Align,
++    pub f32_align: Align,
++    pub f64_align: Align,
++    pub f128_align: Align,
++    pub aggregate_align: Align,
++
++    pub vector_align: Vec<(Size, Align)>,
++
++    pub default_address_space: AddressSpace,
++    pub default_address_space_pointer_spec: PointerSpec,
++
++    address_space_info: Vec<(AddressSpace, PointerSpec)>,
++
++    pub instruction_address_space: AddressSpace,
++
++    pub c_enum_min_size: Integer,
++}
++
++// `address_space_info` is reached in a formula through a sequence equal to it, as in values.rs.
++#[thrust_macros::context]
++impl TargetDataLayout {
++    // What `pointer_size_in` and `pointer_align_in` require of the address space `c`, as in
++    // values.rs.
++    #[thrust_macros::predicate]
++    fn pointer_space_ok(self, c: AddressSpace) -> bool {
++        c == self.default_address_space
++            || exists(|s: Seq<(AddressSpace, PointerSpec)>, i: USize|
++                s == self.address_space_info && 0 <= i && i < s.len() && s[i].0 == c)
++    }
++
++    // `n` is the pointer size of the address space `c`, as in values.rs.
++    #[thrust_macros::predicate]
++    fn pointer_size_is(self, c: AddressSpace, n: Size) -> bool {
++        (c == self.default_address_space && n == self.default_address_space_pointer_spec.pointer_size)
++            || (!(c == self.default_address_space)
++                && exists(|s: Seq<(AddressSpace, PointerSpec)>, i: USize|
++                    s == self.address_space_info
++                        && 0 <= i
++                        && i < s.len()
++                        && s[i].0 == c
++                        && n == s[i].1.pointer_size
++                        && forall(|j: USize| !(0 <= j && j < i) || !(s[j].0 == c))))
++    }
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::requires(((*self).default_address_space_pointer_spec.pointer_size.raw == 2
++        || (*self).default_address_space_pointer_spec.pointer_size.raw == 4
++        || (*self).default_address_space_pointer_spec.pointer_size.raw == 8))]
++    #[thrust_macros::ensures(result >= 1)]
++    pub fn obj_size_bound(&self) -> u64 {
++        match self.pointer_size().bits() {
++            16 => 1 << 15,
++            32 => 1 << 31,
++            64 => 1 << 61,
++            bits => panic!("obj_size_bound: unknown pointer bit size {bits}"),
++        }
++    }
++
++    #[inline]
++    pub fn pointer_size(&self) -> Size {
++        self.default_address_space_pointer_spec.pointer_size
++    }
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::requires(Self::pointer_space_ok(*self, c))]
++    #[thrust_macros::ensures(Self::pointer_size_is(*self, c, result))]
++    pub fn pointer_size_in(&self, c: AddressSpace) -> Size {
++        if c == self.default_address_space {
++            return self.default_address_space_pointer_spec.pointer_size;
++        }
++
++        if let Some(e) = self.address_space_info.iter().find(|(a, _)| a == &c) {
++            e.1.pointer_size
+         } else {
++            panic!("Use of unknown address space");
++        }
++    }
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::requires(Self::pointer_space_ok(*self, c))]
++    #[thrust_macros::ensures(true)]
++    pub fn pointer_align_in(&self, c: AddressSpace) -> AbiAlign {
++        AbiAlign::new(if c == self.default_address_space {
++            self.default_address_space_pointer_spec.pointer_align
++        } else if let Some(e) = self.address_space_info.iter().find(|(a, _)| a == &c) {
++            e.1.pointer_align
++        } else {
++            panic!("Use of unknown address space");
+         })
+     }
+ }
+ 
++// `dl_of(cx, dl)`: `dl` is the layout `cx.data_layout()` returns, as in values.rs.
++#[thrust_macros::context]
++pub trait HasDataLayout {
++    #[thrust_macros::predicate]
++    fn dl_of(self, dl: TargetDataLayout) -> bool;
++
++    #[thrust_macros::ensures(Self::dl_of(*self, *result))]
++    fn data_layout(&self) -> &TargetDataLayout;
++}
++
++#[thrust_macros::context]
++impl HasDataLayout for TargetDataLayout {
++    #[thrust_macros::predicate]
++    fn dl_of(self, dl: TargetDataLayout) -> bool {
++        self == dl
++    }
++
++    #[inline]
++    fn data_layout(&self) -> &TargetDataLayout {
++        self
++    }
++}
++
++#[thrust_macros::context]
++impl HasDataLayout for &TargetDataLayout {
++    #[thrust_macros::predicate]
++    fn dl_of(self, dl: TargetDataLayout) -> bool {
++        *self == dl
++    }
++
++    #[inline]
++    fn data_layout(&self) -> &TargetDataLayout {
++        (**self).data_layout()
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq)]
++pub enum Endian {
++    Little,
++    Big,
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Size {
++    raw: u64,
++}
++
++#[thrust_macros::context]
++impl Size {
++    pub const ZERO: Size = Size { raw: 0 };
++
++    #[thrust::trusted]
++    #[thrust::callable]
++    pub fn from_bits(bits: impl TryInto<u64>) -> Size {
++        let bits = bits.try_into().ok().unwrap();
++        Size {
++            raw: bits.div_ceil(8),
++        }
++    }
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust::callable]
++    pub fn from_bytes(bytes: impl TryInto<u64>) -> Size {
++        let bytes: u64 = bytes.try_into().ok().unwrap();
++        Size { raw: bytes }
++    }
++
++    #[inline]
++    pub fn bytes(self) -> u64 {
++        self.raw
++    }
++
++    // Trusted: the body's `checked_mul` panics on overflow; overflow is out
++    // of scope (see the stage plan), so the spec states the no-overflow
++    // result.
++    #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::ensures(result == self.raw * 8)]
++    pub fn bits(self) -> u64 {
++        #[cold]
++        #[thrust::trusted]
++        #[thrust::callable]
++        fn overflow(bytes: u64) -> ! {
++            panic!("Size::bits: {bytes} bytes in bits doesn't fit in u64")
++        }
++
++        self.bytes()
++            .checked_mul(8)
++            .unwrap_or_else(|| overflow(self.bytes()))
++    }
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust::callable]
++    pub fn align_to(self, align: Align) -> Size {
++        let mask = align.bytes() - 1;
++        Size::from_bytes((self.bytes() + mask) & !mask)
++    }
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::requires(forall(|dl: TargetDataLayout| !C::dl_of(*cx, dl)
++        || dl.default_address_space_pointer_spec.pointer_size.raw == 2
++        || dl.default_address_space_pointer_spec.pointer_size.raw == 4
++        || dl.default_address_space_pointer_spec.pointer_size.raw == 8))]
++    #[thrust_macros::ensures(true)]
++    pub fn checked_add<C: HasDataLayout>(self, offset: Size, cx: &C) -> Option<Size> {
++        let dl = cx.data_layout();
++
++        let bytes = self.bytes().checked_add(offset.bytes())?;
++
++        if bytes < dl.obj_size_bound() {
++            Some(Size::from_bytes(bytes))
++        } else {
++            None
++        }
++    }
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust::callable]
++    pub fn unsigned_int_max(&self) -> u128 {
++        u128::MAX >> (128 - self.bits())
++    }
++}
++
++impl Add for Size {
++    type Output = Size;
++    #[inline]
++    #[thrust::trusted]
++    #[thrust::callable]
++    fn add(self, other: Size) -> Size {
++        Size::from_bytes(self.bytes().checked_add(other.bytes()).unwrap_or_else(|| {
++            panic!(
++                "Size::add: {} + {} doesn't fit in u64",
++                self.bytes(),
++                other.bytes()
++            )
++        }))
++    }
++}
++
++impl AddAssign for Size {
++    #[inline]
++    fn add_assign(&mut self, other: Size) {
++        *self = *self + other;
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Align {
++    pow2: u8,
++}
++
++#[thrust_macros::context]
++impl Align {
++    pub const ONE: Align = Align { pow2: 0 };
++    pub const EIGHT: Align = Align { pow2: 3 };
++
++    pub const MAX: Align = Align { pow2: 29 };
++
++    #[inline]
++    #[thrust::trusted]
++    #[thrust_macros::ensures(result >= 1)]
++    pub const fn bytes(self) -> u64 {
++        1 << self.pow2
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, Hash /*Debug*/)]
++pub struct AbiAlign {
++    pub abi: Align,
++}
++
++impl AbiAlign {
++    #[inline]
++    pub fn new(align: Align) -> AbiAlign {
++        AbiAlign { abi: align }
++    }
++
++    #[inline]
++    pub fn min(self, other: AbiAlign) -> AbiAlign {
++        AbiAlign {
++            abi: self.abi.min(other.abi),
++        }
++    }
++
++    #[inline]
++    pub fn max(self, other: AbiAlign) -> AbiAlign {
++        AbiAlign {
++            abi: self.abi.max(other.abi),
++        }
++    }
++}
++
++impl Deref for AbiAlign {
++    type Target = Align;
++
++    fn deref(&self) -> &Self::Target {
++        &self.abi
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash /*Debug*/)]
++pub enum Integer {
++    I8,
++    I16,
++    I32,
++    I64,
++    I128,
++}
++
++#[thrust_macros::context]
++impl Integer {
++    #[inline]
++    pub fn size(self) -> Size {
++        use Integer::*;
++        match self {
++            I8 => Size::from_bytes(1),
++            I16 => Size::from_bytes(2),
++            I32 => Size::from_bytes(4),
++            I64 => Size::from_bytes(8),
++            I128 => Size::from_bytes(16),
++        }
++    }
++
++    pub fn align<C: HasDataLayout>(self, cx: &C) -> AbiAlign {
++        use Integer::*;
++        let dl = cx.data_layout();
++
++        AbiAlign::new(match self {
++            I8 => dl.i8_align,
++            I16 => dl.i16_align,
++            I32 => dl.i32_align,
++            I64 => dl.i64_align,
++            I128 => dl.i128_align,
++        })
++    }
++
++    // Trusted: the match arms use u128 constants beyond the i64 range Thrust
++    // models integer literals with.
++    #[inline]
++    #[thrust::trusted]
++    #[thrust::callable]
++    pub fn fit_unsigned(x: u128) -> Integer {
++        use Integer::*;
++        match x {
++            0..=0x0000_0000_0000_00ff => I8,
++            0..=0x0000_0000_0000_ffff => I16,
++            0..=0x0000_0000_ffff_ffff => I32,
++            0..=0xffff_ffff_ffff_ffff => I64,
++            _ => I128,
++        }
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash /*Debug*/)]
++pub enum Float {
++    F16,
++    F32,
++    F64,
++    F128,
++}
++
++#[thrust_macros::context]
++impl Float {
++    pub fn size(self) -> Size {
++        use Float::*;
++
++        match self {
++            F16 => Size::from_bits(16),
++            F32 => Size::from_bits(32),
++            F64 => Size::from_bits(64),
++            F128 => Size::from_bits(128),
++        }
++    }
++
++    pub fn align<C: HasDataLayout>(self, cx: &C) -> AbiAlign {
++        use Float::*;
++        let dl = cx.data_layout();
++
++        AbiAlign::new(match self {
++            F16 => dl.f16_align,
++            F32 => dl.f32_align,
++            F64 => dl.f64_align,
++            F128 => dl.f128_align,
++        })
++    }
++}
++
++#[derive(Copy, Clone, PartialEq, Eq, Hash /*Debug*/)]
++pub enum Primitive {
++    USize(Integer, bool),
++    Float(Float),
++    Pointer(AddressSpace),
++}
++
++#[thrust_macros::context]
++impl Primitive {
++    // A pointer's size and alignment are looked up in the layout `cx` names, as in values.rs.
++    #[thrust_macros::requires(forall(|dl: TargetDataLayout, a: AddressSpace|
++        !(C::dl_of(*cx, dl) && self == Primitive::Pointer(a)) || TargetDataLayout::pointer_space_ok(dl, a)))]
++    #[thrust::callable]
++    pub fn size<C: HasDataLayout>(self, cx: &C) -> Size {
++        use Primitive::*;
++        let dl = cx.data_layout();
++
++        match self {
++            USize(i, _) => i.size(),
++            Float(f) => f.size(),
++            Pointer(a) => dl.pointer_size_in(a),
++        }
++    }
++
++    #[thrust_macros::requires(forall(|dl: TargetDataLayout, a: AddressSpace|
++        !(C::dl_of(*cx, dl) && self == Primitive::Pointer(a)) || TargetDataLayout::pointer_space_ok(dl, a)))]
++    #[thrust::callable]
++    pub fn align<C: HasDataLayout>(self, cx: &C) -> AbiAlign {
++        use Primitive::*;
++        let dl = cx.data_layout();
++
++        match self {
++            USize(i, _) => i.align(dl),
++            Float(f) => f.align(dl),
++            Pointer(a) => dl.pointer_align_in(a),
++        }
++    }
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++pub struct WrappingRange {
++    pub start: u128,
++    pub end: u128,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Hash /*Debug*/)]
++pub enum Scalar {
++    Initialized {
++        value: Primitive,
++
++        valid_range: WrappingRange,
++    },
++    Union {
++        value: Primitive,
++    },
++}
++
++#[thrust_macros::context]
++impl Scalar {
++    pub fn primitive(&self) -> Primitive {
++        match *self {
++            Scalar::Initialized { value, .. } | Scalar::Union { value } => value,
++        }
++    }
++
++
++    #[thrust_macros::impl_trait_names(C)]
++    #[thrust_macros::requires(forall(|dl: TargetDataLayout, p: Primitive, r: WrappingRange, a: AddressSpace|
++        !(C::dl_of(*cx, dl)
++            && (self == Scalar::Initialized { value: p, valid_range: r } || self == Scalar::Union { value: p })
++            && p == Primitive::Pointer(a))
++            || TargetDataLayout::pointer_space_ok(dl, a)))]
++    #[thrust::callable]
++    pub fn align(self, cx: &impl HasDataLayout) -> AbiAlign {
++        self.primitive().align(cx)
++    }
++
++    #[thrust_macros::impl_trait_names(C)]
++    #[thrust_macros::requires(forall(|dl: TargetDataLayout, p: Primitive, r: WrappingRange, a: AddressSpace|
++        !(C::dl_of(*cx, dl)
++            && (self == Scalar::Initialized { value: p, valid_range: r } || self == Scalar::Union { value: p })
++            && p == Primitive::Pointer(a))
++            || TargetDataLayout::pointer_space_ok(dl, a)))]
++    #[thrust::callable]
++    pub fn size(self, cx: &impl HasDataLayout) -> Size {
++        self.primitive().size(cx)
++    }
++}
++
++#[derive(Copy, Clone, /*Debug,*/ PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct AddressSpace(pub u32);
++
++#[derive(Clone, Copy, PartialEq, Eq, Hash /*Debug*/)]
++pub struct Niche {
++    pub offset: Size,
++    pub value: Primitive,
++    pub valid_range: WrappingRange,
++}
++
++#[thrust_macros::context]
++impl Niche {
++    // `niche_wf`: what `available` requires of the niche under the data layout `dl`.
++    #[thrust_macros::predicate]
++    fn wf_in(self, dl: TargetDataLayout) -> bool {
++        forall(|a: AddressSpace| !(self.value == Primitive::Pointer(a))
++            || (TargetDataLayout::pointer_space_ok(dl, a)
++                && forall(|n: Size| !TargetDataLayout::pointer_size_is(dl, a, n) || n.raw * 8 <= 128)))
++    }
++    #[thrust_macros::requires(forall(|dl: TargetDataLayout, r: WrappingRange, a: AddressSpace|
++        !(C::dl_of(*cx, dl) && scalar == Scalar::Initialized { value: Primitive::Pointer(a), valid_range: r })
++            || (TargetDataLayout::pointer_space_ok(dl, a)
++                && forall(|n: Size| !TargetDataLayout::pointer_size_is(dl, a, n) || n.raw * 8 <= 128))))]
++    pub fn from_scalar<C: HasDataLayout>(cx: &C, offset: Size, scalar: Scalar) -> Option<Self> {
++        let Scalar::Initialized { value, valid_range } = scalar else {
++            return None;
++        };
++        let niche = Niche {
++            offset,
++            value,
++            valid_range,
++        };
++        if niche.available(cx) > 0 {
++            Some(niche)
++        } else {
++            None
++        }
++    }
++
++    // Trusted: the bit operations of the body are not modelled. The `requires` is that of
++    // `value.size(cx)` and the `assert!`'s bound on a pointer's size, as in values.rs.
++    #[thrust::trusted]
++    #[thrust_macros::requires(forall(|dl: TargetDataLayout, a: AddressSpace|
++        !(C::dl_of(*cx, dl) && (*self).value == Primitive::Pointer(a))
++            || (TargetDataLayout::pointer_space_ok(dl, a)
++                && forall(|n: Size| !TargetDataLayout::pointer_size_is(dl, a, n) || n.raw * 8 <= 128))))]
++    #[thrust_macros::ensures(true)]
++    pub fn available<C: HasDataLayout>(&self, cx: &C) -> u128 {
++        let Self {
++            value,
++            valid_range: v,
++            ..
++        } = *self;
++        let size = value.size(cx);
++        assert!(size.bits() <= 128);
++        let max_value = size.unsigned_int_max();
++
++        let niche = v.end.wrapping_add(1)..v.start;
++        niche.end.wrapping_sub(niche.start) & max_value
++    }
++}
++
+ // //== ./src/lib.rs (verbatim from the target)
+ 
+-#[derive(Clone, Copy, PartialEq, Eq, Default)]
++#[derive(Copy, Clone, PartialEq, Eq, Default)]
+ pub struct ReprFlags(u8);
+ 
+ impl ReprFlags {
+@@ -404,7 +1089,7 @@
+     Fixed(Integer, bool),
+ }
+ 
+-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
++#[derive(Copy, Clone, /*Debug,*/ Eq, PartialEq)]
+ pub enum ScalableElt {
+     ElementCount(u16),
+ 
+@@ -452,9 +1137,202 @@
+ 
+ // //== ./src/layout.rs / ./src/layout/coroutine.rs value types (verbatim)
+ 
+-
+-}
+-
++#[derive(PartialEq, Eq, Hash, Clone /*Debug*/)]
++pub enum FieldsShape<FieldIdx: Idx> {
++    Primitive,
++
++    Union(std::num::NonZeroUsize),
++
++    Array {
++        stride: Size,
++        count: u64,
++    },
++
++    Arbitrary {
++        offsets: IndexVec<FieldIdx, Size>,
++
++        in_memory_order: IndexVec<u32, FieldIdx>,
++    },
++}
++
++// `IndexVec`'s model here is the struct itself, so a formula reaches the sequences through
++// the `raw` field, and the memory order's elements at their model type through `Seq`'s
++// `PartialEq` with the `Vec`.
++#[thrust_macros::context]
++impl<FieldIdx: Idx + thrust_models::Model<Ty: PartialEq>> FieldsShape<FieldIdx> {
++    /// `self` is `Arbitrary` over `n` fields: `n` offsets, and a memory order listing each
++    /// field below `n` exactly once.
++    #[thrust_macros::predicate]
++    fn arbitrary_of(self, n: USize) -> bool {
++        exists(|o: IndexVec<FieldIdx, Size>, m: IndexVec<u32, FieldIdx>,
++                ms: Seq<<FieldIdx as thrust_models::Model>::Ty>|
++            self == FieldsShape::Arbitrary { offsets: o, in_memory_order: m }
++                && ms == m.raw
++                && o.raw.len() == n
++                && ms.len() == n
++                && forall(|k: USize, i: USize|
++                    !(0 <= k && k < n && <FieldIdx as Idx>::index_is(ms[k], i)) || (0 <= i && i < n))
++                && forall(|k: USize, k2: USize, i: USize|
++                    !(0 <= k && k < n && 0 <= k2 && k2 < n && !(k == k2)
++                        && <FieldIdx as Idx>::index_is(ms[k], i))
++                        || !<FieldIdx as Idx>::index_is(ms[k2], i)))
++    }
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Hash /*Debug*/)]
++pub struct NumScalableVectors(pub u8);
++
++#[derive(Clone, Copy, PartialEq, Eq, Hash /*Debug*/)]
++pub enum BackendRepr {
++    Scalar(Scalar),
++    ScalarPair(Scalar, Scalar),
++    SimdScalableVector {
++        element: Scalar,
++        count: u64,
++        number_of_vectors: NumScalableVectors,
++    },
++    SimdVector {
++        element: Scalar,
++        count: u64,
++    },
++
++    Memory {
++        sized: bool,
++    },
++}
++
++impl BackendRepr {
++    #[inline]
++    pub fn is_unsized(&self) -> bool {
++        match *self {
++            BackendRepr::Scalar(_)
++            | BackendRepr::ScalarPair(..)
++            | BackendRepr::SimdScalableVector { .. }
++            | BackendRepr::SimdVector { .. } => false,
++            BackendRepr::Memory { sized } => !sized,
++        }
++    }
++}
++
++#[derive(PartialEq, Eq, Hash, Clone /*Debug*/)]
++pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
++    Empty,
++
++    Single {
++        index: VariantIdx,
++    },
++
++    Multiple {
++        tag: Scalar,
++        tag_encoding: TagEncoding<VariantIdx>,
++        tag_field: FieldIdx,
++        variants: IndexVec<VariantIdx, VariantLayout<FieldIdx>>,
++    },
++}
++
++#[derive(PartialEq, Eq, Hash, Copy, Clone /*Debug*/)]
++pub enum TagEncoding<VariantIdx: Idx> {
++    Direct,
++
++    Niche {
++        untagged_variant: VariantIdx,
++
++        niche_variants: RangeInclusive<VariantIdx>,
++
++        niche_start: u128,
++    },
++}
++
++#[derive(PartialEq, Eq, Hash, Clone)]
++pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
++    pub fields: FieldsShape<FieldIdx>,
++
++    pub variants: Variants<FieldIdx, VariantIdx>,
++
++    pub backend_repr: BackendRepr,
++
++    pub largest_niche: Option<Niche>,
++
++    pub uninhabited: bool,
++
++    pub align: AbiAlign,
++    pub size: Size,
++
++    pub max_repr_align: Option<Align>,
++
++    pub unadjusted_abi_align: Align,
++
++    pub randomization_seed: Hash64,
++}
++
++impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
++    pub fn is_uninhabited(&self) -> bool {
++        self.uninhabited
++    }
++}
++
++impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
++    #[inline]
++    pub fn is_unsized(&self) -> bool {
++        self.backend_repr.is_unsized()
++    }
++
++    pub fn is_zst(&self) -> bool {
++        match self.backend_repr {
++            BackendRepr::Scalar(_)
++            | BackendRepr::ScalarPair(..)
++            | BackendRepr::SimdScalableVector { .. }
++            | BackendRepr::SimdVector { .. } => false,
++            BackendRepr::Memory { sized } => sized && self.size.bytes() == 0,
++        }
++    }
++}
++
++#[derive(Copy, Clone /*Debug*/)]
++pub enum StructKind {
++    AlwaysSized,
++
++    MaybeUnsized,
++
++    Prefixed(Size, Align),
++}
++
++#[derive(PartialEq, Eq, Hash, Clone /*Debug*/)]
++pub struct VariantLayout<FieldIdx: Idx> {
++    pub size: Size,
++    pub backend_repr: BackendRepr,
++    pub field_offsets: IndexVec<FieldIdx, Size>,
++    fields_in_memory_order: IndexVec<u32, FieldIdx>,
++    largest_niche: Option<Niche>,
++    uninhabited: bool,
++}
++
++impl<FieldIdx: Idx> VariantLayout<FieldIdx> {
++    pub fn from_layout(layout: LayoutData<FieldIdx, impl Idx>) -> Self {
++        let FieldsShape::Arbitrary {
++            offsets,
++            in_memory_order,
++        } = layout.fields
++        else {
++            panic!();
++        };
++
++        Self {
++            size: layout.size,
++            backend_repr: layout.backend_repr,
++            field_offsets: offsets,
++            fields_in_memory_order: in_memory_order,
++            largest_niche: layout.largest_niche,
++            uninhabited: layout.uninhabited,
++        }
++    }
++
++    pub fn is_uninhabited(&self) -> bool {
++        self.uninhabited
++    }
++
++    pub fn has_fields(&self) -> bool {
++        self.field_offsets.len() > 0
+     }
+ }
+ 
+@@ -497,7 +1375,15 @@
+     }
+ }
+ 
++impl<I: Idx, T, const N: usize> From<[T; N]> for IndexVec<I, T> {
++    #[inline]
++    fn from(array: [T; N]) -> Self {
++        IndexVec::from_raw(array.into())
++    }
++}
++
+ // //== ./src/layout.rs: LayoutCalculator (verbatim; `univariant`/
++// `univariant_biased` stay trusted, per the stage plan)
+ 
+ enum NicheBias {
+     Start,
+@@ -524,17 +1410,60 @@
+ type LayoutCalculatorResult<FieldIdx, VariantIdx, F> =
+     Result<LayoutData<FieldIdx, VariantIdx>, LayoutCalculatorError<F>>;
+ 
++// The layout an `F` dereferences to, for a contract to name: `layout_is(f, l)` says `**f` is `l`.
++// Rewrite (rewrites.md S10): `F`'s bound `Deref<Target = &'a LayoutData<..>>` becomes this trait,
++// which has it as a supertrait (probes/layout_ref_niche.rs).
++#[thrust_macros::context]
++pub trait LayoutRef<'a, FieldIdx: Idx, VariantIdx: Idx>:
++    Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + Copy + thrust_models::Model
++{
++    #[thrust_macros::predicate]
++    fn layout_is(self, l: LayoutData<FieldIdx, VariantIdx>) -> bool;
++}
++
+ #[derive(Clone, Copy /*Debug*/)]
+ pub struct LayoutCalculator<Cx> {
+     pub cx: Cx,
+ }
+ 
++// Stage 6 spec (README.md, "stage 6"). `requires` is the panic condition of `univariant` and
++// `univariant_biased` apart from the data layout and the field layouts: `fields.indices()`
++// builds every field index up to `fields.len()`, the single variant is `VariantIdx::new(0)`,
++// and `MaybeUnsized` takes `fields.len() - 1`, which wraps below zero (overflow checks are off)
++// so that the slice `[..end]` panics; and `dl_wf` of the data layout `self.cx` names (the
++// default pointer size is 2, 4 or 8 bytes, which `Size::checked_add` needs), named by
++// `Cx::dl_of(*self, dl)` since the calculator's model is `self.cx`'s; and `niche_wf` of every
++// field's largest niche under that layout (`Niche::wf_in`, which `Niche::available` and
++// `Primitive::size` need), the field's layout named by `LayoutRef::layout_is`. Not stated: that
++// the `NicheBias::End` layout succeeds and keeps a niche whenever the `Start` one does (the two
++// `unwrap_without_debug`s). `ensures`: an `Ok` layout has `Arbitrary` fields over
++// `fields.len()` fields, its memory order a permutation (`FieldsShape::arbitrary_of`).
++#[thrust_macros::context]
+ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
+     #[thrust::trusted]
++    #[thrust_macros::requires(
++        forall(|k: USize| !(0 <= k && k <= (*fields).len()) || <FieldIdx as Idx>::can_new(k))
++            && forall(|z: USize| !(z == 0usize) || <VariantIdx as Idx>::can_new(z))
++            && (matches!(kind, StructKind::MaybeUnsized) ==> (*fields).len() > 0)
++            && forall(|dl: TargetDataLayout| !Cx::dl_of(*self, dl)
++                || dl.default_address_space_pointer_spec.pointer_size.raw == 2
++                || dl.default_address_space_pointer_spec.pointer_size.raw == 4
++                || dl.default_address_space_pointer_spec.pointer_size.raw == 8)
++            && forall(|dl: TargetDataLayout, i: usize, l: LayoutData<FieldIdx, VariantIdx>, n: Niche|
++                !(Cx::dl_of(*self, dl)
++                    && 0 <= i
++                    && i < (*fields).len()
++                    && F::layout_is((*fields)[i], l)
++                    && l.largest_niche == Some(n))
++                    || Niche::wf_in(n, dl))
++    )]
++    #[thrust_macros::ensures(forall(|l: LayoutData<FieldIdx, VariantIdx>|
++        result != Ok(l) || FieldsShape::<FieldIdx>::arbitrary_of(l.fields, (*fields).len())))]
+     pub fn univariant<
+         'a,
+         FieldIdx: Idx,
+         VariantIdx: Idx,
++        F: LayoutRef<'a, FieldIdx, VariantIdx> + thrust_models::Model<Ty: PartialEq>,
+     >(
+         &self,
+         fields: &IndexSlice<FieldIdx, F>,
+@@ -555,6 +1484,7 @@
+                         let alt_layout = self
+                             .univariant_biased(fields, repr, kind, NicheBias::End)
+                             .unwrap_without_debug();
++                        let alt_niche = alt_layout.largest_niche.unwrap_without_debug();
+                         let alt_head_space = alt_niche.offset.bytes();
+                         let alt_niche_len = alt_niche.value.size(dl).bytes();
+                         let alt_tail_space =
+@@ -581,6 +1511,7 @@
+         'a,
+         FieldIdx: Idx,
+         VariantIdx: Idx,
++        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + Copy + thrust_models::Model<Ty: PartialEq>,
+     >(
+         &self,
+         fields: &IndexSlice<FieldIdx, F>,
+@@ -877,10 +1808,39 @@
+     }
+ }
+ 
++trait Unwrap<T> {
++    fn unwrap_without_debug(self) -> T;
++}
++
++impl<T, E> Unwrap<T> for Result<T, E> {
++    fn unwrap_without_debug(self) -> T {
++        let Ok(item) = self else {
++            panic!();
++        };
++        item
++    }
++}
++
++impl<T> Unwrap<T> for Option<T> {
++    fn unwrap_without_debug(self) -> T {
++        let Some(item) = self else {
++            panic!();
++        };
++        item
++    }
++}
++
+ // //== Thrust model declarations
+ 
+-}
+-
++impl<I: Idx, T> thrust_models::Model for IndexVec<I, T> {
++    type Ty = Self;
++}
++
++// See eligibility.rs's copy of this impl for why `type Ty = Self` is
++// impossible (`IndexSlice`'s `raw: [T]` makes it unsized) and why the `[T]`
++// model is reused instead.
++impl<I: Idx, T: thrust_models::Model> thrust_models::Model for IndexSlice<I, T> {
++    type Ty = <[T] as thrust_models::Model>::Ty;
+ }
+ 
+ impl<'a, T> thrust_models::Model for SliceIter<'a, T> {
+@@ -889,10 +1849,11 @@
+ impl<'a, I: Idx, T> thrust_models::Model for IterEnumerated<'a, I, T> {
+     type Ty = Self;
+ }
+-impl<I: Idx, T> thrust_models::Model for IndexVec<I, T> {
+-    type Ty = Self;
+-}
+-impl<Cx> thrust_models::Model for LayoutCalculator<Cx> {
++impl<I: Idx> thrust_models::Model for IdxRange<I> {
++    type Ty = Self;
++}
++
++impl thrust_models::Model for Hash64 {
+     type Ty = Self;
+ }
+ impl thrust_models::Model for PointerSpec {
+@@ -928,11 +1889,27 @@
+ impl thrust_models::Model for Scalar {
+     type Ty = Self;
+ }
+-    type Ty = Self;
+-}
+ impl thrust_models::Model for AddressSpace {
+     type Ty = Self;
+ }
++impl thrust_models::Model for Niche {
++    type Ty = Self;
++}
++impl thrust_models::Model for ReprFlags {
++    type Ty = Self;
++}
++impl thrust_models::Model for IntegerType {
++    type Ty = Self;
++}
++impl thrust_models::Model for ScalableElt {
++    type Ty = Self;
++}
++impl thrust_models::Model for ReprOptions {
++    type Ty = Self;
++}
++impl<FieldIdx: Idx> thrust_models::Model for FieldsShape<FieldIdx> {
++    type Ty = Self;
++}
+ impl thrust_models::Model for NumScalableVectors {
+     type Ty = Self;
+ }
+@@ -954,10 +1931,55 @@
+ impl<FieldIdx: Idx> thrust_models::Model for VariantLayout<FieldIdx> {
+     type Ty = Self;
+ }
+-}
+-
+-    }
+-}
+-
+-    }
+-}
++impl<F: thrust_models::Model> thrust_models::Model for LayoutCalculatorError<F> {
++    type Ty = LayoutCalculatorError<<F as thrust_models::Model>::Ty>;
++}
++// The calculator's model is its one field's, so that a contract names `self.cx`'s data layout
++// through `Cx::dl_of(*self, dl)` (probes/calculator_dl.rs).
++impl<Cx: thrust_models::Model> thrust_models::Model for LayoutCalculator<Cx> {
++    type Ty = <Cx as thrust_models::Model>::Ty;
++}
++impl thrust_models::Model for NicheBias {
++    type Ty = Self;
++}
++
++// The derived `PartialOrd` and `Ord` of `Size` and `Align` compare the single field, so `max` and
++// `min` are specified through the field's order, as std.rs does for the integers. `Size`
++// compares `raw: u64`, `Align` compares `pow2: u8`.
++#[thrust_macros::context]
++impl PartialOrdSpec for Size {
++    #[thrust_macros::predicate]
++    fn compares(self, other: Self, ord: Option<std::cmp::Ordering>) -> bool {
++        (self.raw < other.raw && ord == Some(std::cmp::Ordering::Less))
++            || (self.raw == other.raw && ord == Some(std::cmp::Ordering::Equal))
++            || (self.raw > other.raw && ord == Some(std::cmp::Ordering::Greater))
++    }
++
++    fn compares_functional(
++        a: &Self,
++        b: &Self,
++        x: Option<std::cmp::Ordering>,
++        y: Option<std::cmp::Ordering>,
++    ) {
++    }
++}
++
++#[thrust_macros::context]
++impl PartialOrdSpec for Align {
++    #[thrust_macros::predicate]
++    fn compares(self, other: Self, ord: Option<std::cmp::Ordering>) -> bool {
++        (self.pow2 < other.pow2 && ord == Some(std::cmp::Ordering::Less))
++            || (self.pow2 == other.pow2 && ord == Some(std::cmp::Ordering::Equal))
++            || (self.pow2 > other.pow2 && ord == Some(std::cmp::Ordering::Greater))
++    }
++
++    fn compares_functional(
++        a: &Self,
++        b: &Self,
++        x: Option<std::cmp::Ordering>,
++        y: Option<std::cmp::Ordering>,
++    ) {
++    }
++}
++
++fn main() {}

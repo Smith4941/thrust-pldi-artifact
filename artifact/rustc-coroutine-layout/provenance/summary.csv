@@ -1,0 +1,24 @@
+file,kept,added,changed
+extraction.patch,1694,340,102
+rewrites/01-standalone-crate.patch,,31,16
+rewrites/02-word-iter.patch,,29,2
+rewrites/03-idx-range.patch,,39,7
+rewrites/04-slice-iter.patch,,58,6
+rewrites/05-for-to-while-let.patch,,16,8
+rewrites/06-panic-messages.patch,,4,2
+rewrites/07-question-mark.patch,,12,4
+rewrites/08-trusted-markers.patch,,78,0
+rewrites/09-model-declarations.patch,,122,0
+rewrites/10-header-comment.patch,,19,0
+stages/bitset.fail.patch,,7,13
+stages/bitset.patch,279,311,14
+stages/eligibility.patch,697,1022,66
+stages/idx.fail.patch,,3,2
+stages/idx.patch,86,253,7
+stages/indexvec.fail.patch,,4,2
+stages/indexvec.patch,86,141,18
+stages/layout.patch,1427,1823,95
+stages/univariant.patch,963,1072,50
+stages/values.fail.patch,,9,2
+stages/values.patch,521,424,48
+# thrust d635f6b9

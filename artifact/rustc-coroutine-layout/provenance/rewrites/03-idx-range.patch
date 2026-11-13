@@ -1,0 +1,93 @@
+From a20970a2be0a53d5be46736773211ca29ab9ee13 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Replace Range::map(I::new) iterators with an own IdxRange
+ struct
+
+BitMatrix::rows and IndexSlice::indices returned std adapters over a fn
+item, which Thrust cannot type. IdxRange yields I::new(n) for n in
+start..end, which is the same sequence. The one for loop over rows()
+becomes an explicit while let so no std IntoIterator body is involved.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/main.rs | 46 +++++++++++++++++++++----
+ 1 file changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/src/main.rs b/src/main.rs
+index 434dbe92..b9766dc2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -175,8 +175,8 @@ pub struct BitMatrix<R: Idx, C: Idx> {
+ }
+ 
+ impl<R: Idx, C: Idx> BitMatrix<R, C> {
+-    pub fn rows(&self) -> impl Iterator<Item = R> {
+-        (0..self.num_rows).map(R::new)
++    pub fn rows(&self) -> IdxRange<R> {
++        IdxRange::new(0, self.num_rows)
+     }
+ 
+     fn range(&self, row: R) -> (usize, usize) {
+@@ -268,6 +268,39 @@ impl Idx for u32 {
+     }
+ }
+ 
++/// Own iterator standing in for `(start..end).map(I::new)`: yields
++/// `I::new(start)`, `I::new(start + 1)`, ..., `I::new(end - 1)`.
++#[derive(Clone)]
++pub struct IdxRange<I: Idx> {
++    start: usize,
++    end: usize,
++    marker: PhantomData<I>,
++}
++
++impl<I: Idx> IdxRange<I> {
++    fn new(start: usize, end: usize) -> IdxRange<I> {
++        IdxRange {
++            start,
++            end,
++            marker: PhantomData,
++        }
++    }
++}
++
++impl<I: Idx> Iterator for IdxRange<I> {
++    type Item = I;
++
++    fn next(&mut self) -> Option<I> {
++        if self.start < self.end {
++            let n = self.start;
++            self.start += 1;
++            Some(I::new(n))
++        } else {
++            None
++        }
++    }
++}
++
+ pub trait IntoSliceIdx<I, T: ?Sized> {
+     type Output: SliceIndex<T>;
+     fn into_slice_idx(self) -> Self::Output;
+@@ -330,11 +363,9 @@ impl<I: Idx, T> IndexSlice<I, T> {
+     }
+ 
+     #[inline]
+-    pub fn indices(
+-        &self,
+-    ) -> impl DoubleEndedIterator<Item = I> + ExactSizeIterator + Clone + 'static {
++    pub fn indices(&self) -> IdxRange<I> {
+         let _ = I::new(self.len());
+-        (0..self.len()).map(|n| I::new(n))
++        IdxRange::new(0, self.len())
+     }
+ 
+     #[inline]
+@@ -569,7 +600,8 @@ fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: I
+         }
+     }
+ 
+-    for local_a in storage_conflicts.rows() {
++    let mut rows = storage_conflicts.rows();
++    while let Some(local_a) = rows.next() {
+         let conflicts_a = storage_conflicts.count(local_a);
+         if ineligible_locals.contains(local_a) {
+             continue;

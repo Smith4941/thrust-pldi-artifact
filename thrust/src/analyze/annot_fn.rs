@@ -1,0 +1,3252 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use pretty::{termcolor, Pretty};
+use rustc_hir::{
+    def_id::{DefId, LocalDefId},
+    HirId,
+};
+use rustc_index::IndexVec;
+use rustc_middle::mir;
+use rustc_middle::ty::{self as mir_ty, TyCtxt, TypeFoldable};
+
+use crate::analyze::{self, did_cache::DefIdCache};
+use crate::chc;
+use crate::refine::{self, TypeBuilder};
+use crate::rty;
+
+/// The Rust signature of the callee of a `pre!`/`post!`: its argument types and its result type.
+struct CalleeSig<'tcx> {
+    inputs: Vec<mir_ty::Ty<'tcx>>,
+    output: mir_ty::Ty<'tcx>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FormulaFn<'tcx> {
+    params: IndexVec<rty::FunctionParamIdx, mir_ty::Ty<'tcx>>,
+    // TODO: remove once we stop relying on debug info to map parameters
+    // `None` for a parameter bound by a pattern, as the closure upvars tuple is.
+    param_idents: IndexVec<rty::FunctionParamIdx, Option<rustc_span::symbol::Ident>>,
+    ret: mir_ty::Ty<'tcx>,
+    body: FormulaFnBody,
+    /// [`FormulaFn::witnessed_formula`], when it differs from the formula.
+    witnessed: Option<chc::Formula<rty::FunctionParamIdx>>,
+    /// The binders and the body of the formula when it is a call of `exists`, as written. The
+    /// stored formula may read an enum's payload through selectors instead
+    /// (`Formula::exists_over_payload`); a `witness` instantiates this form.
+    exists: Option<ExistsParts>,
+    pre_receivers: Vec<mir_ty::Ty<'tcx>>,
+}
+
+/// The binders of an `exists` and its body.
+type ExistsParts = (
+    Vec<(chc::UserQuantifiedVarId, chc::Sort)>,
+    chc::Formula<rty::FunctionParamIdx>,
+);
+
+/// The translated body: a formula, or a term for a `#[thrust_macros::logic]` function.
+#[derive(Debug, Clone)]
+pub enum FormulaFnBody {
+    Formula(chc::Formula<rty::FunctionParamIdx>),
+    Term(chc::Term<rty::FunctionParamIdx>),
+}
+
+/// The source name a parameter of a formula function lifted out of a function body
+/// (`invariant!`, `ghost!`) refers to.
+///
+/// The lifted function is free, where `self` is not a legal parameter name, so a formula
+/// naming the receiver gets a synthetic parameter instead. It stands for the value that
+/// debug info records as `self`.
+pub fn lifted_param_source_name(ident: rustc_span::symbol::Ident) -> rustc_span::Symbol {
+    if ident.name.as_str() == "__thrust_self" {
+        rustc_span::Symbol::intern("self")
+    } else {
+        ident.name
+    }
+}
+
+/// The parameter of the enclosing function whose entry value a parameter of a lifted loop
+/// invariant names, written `old!(x)` and spelled `__thrust_old_x` by `thrust_macros`; `None` for
+/// any other parameter.
+pub fn entry_value_param_name(ident: rustc_span::symbol::Ident) -> Option<rustc_span::Symbol> {
+    ident
+        .name
+        .as_str()
+        .strip_prefix("__thrust_old_")
+        .map(rustc_span::Symbol::intern)
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &FormulaFn<'_>
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator
+            .intersperse(
+                self.params.iter_enumerated().map(|(idx, ty)| {
+                    idx.pretty(allocator)
+                        .append(": ")
+                        .append(allocator.as_string(ty))
+                }),
+                ", ",
+            )
+            .enclose("|", "|")
+            .group()
+            .append(match &self.body {
+                FormulaFnBody::Formula(formula) => formula.pretty(allocator),
+                FormulaFnBody::Term(term) => term.pretty(allocator),
+            })
+            .group()
+    }
+}
+
+impl<'tcx> FormulaFn<'tcx> {
+    pub fn formula(&self) -> &chc::Formula<rty::FunctionParamIdx> {
+        let FormulaFnBody::Formula(formula) = &self.body else {
+            panic!("a logic function has a term body");
+        };
+        formula
+    }
+
+    pub fn body(&self) -> &FormulaFnBody {
+        &self.body
+    }
+
+    /// The binders and the body of the formula when it is a call of `exists`, as written.
+    pub fn exists_parts(&self) -> Option<&ExistsParts> {
+        self.exists.as_ref()
+    }
+
+    /// The formula a `proof_assert!` checks and a `choose!` refines its value by: the formula
+    /// with each conjunct `thrust_models::witness(φ, t)`, which [`Self::formula`] reads as `φ`,
+    /// replaced by the body of `φ`'s `exists` at `t`.
+    pub fn witnessed_formula(&self) -> &chc::Formula<rty::FunctionParamIdx> {
+        self.witnessed.as_ref().unwrap_or_else(|| self.formula())
+    }
+
+    pub fn ret(&self) -> mir_ty::Ty<'tcx> {
+        self.ret
+    }
+
+    /// The types whose precondition the formula reads with `pre!`, at its generic arguments,
+    /// directly or in the body of a predicate it calls: a closure or a type parameter for a
+    /// closure receiver, a function item's type for a function.
+    pub fn pre_receivers(&self) -> &[mir_ty::Ty<'tcx>] {
+        &self.pre_receivers
+    }
+
+    pub fn params(&self) -> &IndexVec<rty::FunctionParamIdx, mir_ty::Ty<'tcx>> {
+        &self.params
+    }
+
+    pub fn param_idents(
+        &self,
+    ) -> &IndexVec<rty::FunctionParamIdx, Option<rustc_span::symbol::Ident>> {
+        &self.param_idents
+    }
+
+    pub fn to_require_formula(&self) -> chc::Formula<rty::FunctionParamIdx> {
+        self.formula().clone()
+    }
+
+    /// Lowers an `ensures` formula function into a postcondition formula.
+    ///
+    /// Relies on the layout produced by `thrust_macros::ensures`: parameter `0`
+    /// is the function's return value (bound to [`rty::RefinedTypeVar::Value`])
+    /// and parameters `1..n` are the enclosing function's parameters in order
+    /// (mapped to [`rty::RefinedTypeVar::Free`]).
+    pub fn to_ensure_formula(&self) -> chc::Formula<rty::RefinedTypeVar<rty::FunctionParamIdx>> {
+        self.formula().clone().map_var(|v| {
+            if v.as_usize() == 0 {
+                rty::RefinedTypeVar::Value
+            } else {
+                rty::RefinedTypeVar::Free(rty::FunctionParamIdx::from(v.as_usize() - 1))
+            }
+        })
+    }
+
+    /// Lowers a refinement-type formula function (generated by the `param` /
+    /// `ret` / `sig` macros) into a [`rty::Refinement`].
+    ///
+    /// Relies on the layout produced by those macros: parameter `0` is the
+    /// refinement's value binder (mapped to [`rty::RefinedTypeVar::Value`])
+    /// and the remaining parameters carry the formula's free variables,
+    /// mapped to [`rty::RefinedTypeVar::Free`].
+    pub fn to_refinement(&self) -> rty::Refinement<rty::FunctionParamIdx> {
+        value_refinement(self.formula().clone())
+    }
+
+    /// [`Self::witnessed_formula`] as a refinement, laid out as [`Self::to_refinement`].
+    pub fn to_witnessed_refinement(&self) -> rty::Refinement<rty::FunctionParamIdx> {
+        value_refinement(self.witnessed_formula().clone())
+    }
+}
+
+/// `formula` as a refinement of its parameter `0`, with the parameters after it as its free
+/// variables.
+fn value_refinement(
+    formula: chc::Formula<rty::FunctionParamIdx>,
+) -> rty::Refinement<rty::FunctionParamIdx> {
+    formula
+        .map_var(|v| {
+            if v.as_usize() == 0 {
+                rty::RefinedTypeVar::Value
+            } else {
+                rty::RefinedTypeVar::Free(rty::FunctionParamIdx::from(v.as_usize() - 1))
+            }
+        })
+        .into()
+}
+
+/// `expr` past the blocks and the temporaries scopes around it.
+fn peel_wrappers<'tcx>(mut expr: &'tcx rustc_hir::Expr<'tcx>) -> &'tcx rustc_hir::Expr<'tcx> {
+    loop {
+        match expr.kind {
+            rustc_hir::ExprKind::Block(block, _) if block.stmts.is_empty() => match block.expr {
+                Some(inner) => expr = inner,
+                None => return expr,
+            },
+            rustc_hir::ExprKind::DropTemps(inner) => expr = inner,
+            _ => return expr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AmbiguousBinOp {
+    Eq,
+    Ne,
+    Ge,
+    Le,
+    Gt,
+    Lt,
+}
+
+#[derive(Debug, Clone)]
+enum FormulaOrTerm<T> {
+    Formula(chc::Formula<T>),
+    Term(chc::Term<T>),
+    BinOp(chc::Term<T>, AmbiguousBinOp, chc::Term<T>),
+    And(Box<FormulaOrTerm<T>>, Box<FormulaOrTerm<T>>),
+    Or(Box<FormulaOrTerm<T>>, Box<FormulaOrTerm<T>>),
+    Implies(Box<FormulaOrTerm<T>>, Box<FormulaOrTerm<T>>),
+    Not(Box<FormulaOrTerm<T>>),
+    Literal(bool),
+}
+
+impl<T> FormulaOrTerm<T> {
+    /// The formula form. It recurses once per `&&`, `||`, `==>` and `!`, and `a && b && c`
+    /// nests to the left, so a chain of n operands is n - 1 frames deep, and each frame is
+    /// large in a debug build. It grows the stack on demand, as `to_formula_or_term` and
+    /// `Analyzer::predicate_with_args` do, so that a long chain in a specification does not
+    /// overflow the space those checks leave.
+    fn into_formula(self) -> Option<chc::Formula<T>> {
+        rustc_data_structures::stack::ensure_sufficient_stack(|| self.into_formula_inner())
+    }
+
+    fn into_formula_inner(self) -> Option<chc::Formula<T>> {
+        let fo = match self {
+            FormulaOrTerm::Formula(fo) => fo,
+            FormulaOrTerm::Term(t) => chc::Formula::Atom(t.equal_to(chc::Term::bool(true))),
+            FormulaOrTerm::BinOp(lhs, binop, rhs) => {
+                let pred = match binop {
+                    AmbiguousBinOp::Eq => chc::KnownPred::EQUAL,
+                    AmbiguousBinOp::Ne => chc::KnownPred::NOT_EQUAL,
+                    AmbiguousBinOp::Ge => chc::KnownPred::GREATER_THAN_OR_EQUAL,
+                    AmbiguousBinOp::Le => chc::KnownPred::LESS_THAN_OR_EQUAL,
+                    AmbiguousBinOp::Gt => chc::KnownPred::GREATER_THAN,
+                    AmbiguousBinOp::Lt => chc::KnownPred::LESS_THAN,
+                };
+                chc::Formula::Atom(chc::Atom::new(pred.into(), vec![lhs, rhs]))
+            }
+            FormulaOrTerm::And(lhs, rhs) => lhs.into_formula()?.and(rhs.into_formula()?),
+            FormulaOrTerm::Or(lhs, rhs) => lhs.into_formula()?.or(rhs.into_formula()?),
+            FormulaOrTerm::Implies(lhs, rhs) => lhs.into_formula()?.implies(rhs.into_formula()?),
+            FormulaOrTerm::Not(formula_or_term) => formula_or_term.into_formula()?.not(),
+            FormulaOrTerm::Literal(b) => {
+                if b {
+                    chc::Formula::top()
+                } else {
+                    chc::Formula::bottom()
+                }
+            }
+        };
+        Some(fo)
+    }
+
+    /// The term form, which recurses as `into_formula` does.
+    fn into_term(self) -> Option<chc::Term<T>> {
+        rustc_data_structures::stack::ensure_sufficient_stack(|| self.into_term_inner())
+    }
+
+    fn into_term_inner(self) -> Option<chc::Term<T>> {
+        let t = match self {
+            FormulaOrTerm::Formula { .. } => return None,
+            FormulaOrTerm::Term(t) => t,
+            FormulaOrTerm::BinOp(lhs, AmbiguousBinOp::Eq, rhs) => lhs.eq(rhs),
+            FormulaOrTerm::BinOp(lhs, AmbiguousBinOp::Ne, rhs) => lhs.ne(rhs),
+            FormulaOrTerm::BinOp(lhs, AmbiguousBinOp::Ge, rhs) => lhs.ge(rhs),
+            FormulaOrTerm::BinOp(lhs, AmbiguousBinOp::Le, rhs) => lhs.le(rhs),
+            FormulaOrTerm::BinOp(lhs, AmbiguousBinOp::Gt, rhs) => lhs.gt(rhs),
+            FormulaOrTerm::BinOp(lhs, AmbiguousBinOp::Lt, rhs) => lhs.lt(rhs),
+            FormulaOrTerm::And(lhs, rhs) => lhs.into_term()?.and(rhs.into_term()?),
+            FormulaOrTerm::Or(lhs, rhs) => lhs.into_term()?.or(rhs.into_term()?),
+            FormulaOrTerm::Implies(lhs, rhs) => lhs.into_term()?.not().or(rhs.into_term()?),
+            FormulaOrTerm::Not(formula_or_term) => formula_or_term.into_term()?.not(),
+            FormulaOrTerm::Literal(b) => chc::Term::bool(b),
+        };
+        Some(t)
+    }
+}
+
+impl<T: Clone> FormulaOrTerm<T> {
+    /// `lhs == rhs` (`eq`) or `lhs != rhs` of two Booleans as formulas: the biconditional or its
+    /// negation, for operands without a term form.
+    fn formula_equality(lhs: Self, eq: bool, rhs: Self) -> chc::Formula<T> {
+        let lhs = lhs.into_formula().expect("a Boolean has a formula form");
+        let rhs = rhs.into_formula().expect("a Boolean has a formula form");
+        let iff = lhs.clone().implies(rhs.clone()).and(rhs.implies(lhs));
+        if eq {
+            iff
+        } else {
+            iff.not()
+        }
+    }
+
+    /// `if cond { then } else { els }` of Boolean branches as a formula, for parts without a term
+    /// form: `(cond ∧ then) ∨ (¬cond ∧ els)`.
+    fn formula_ite(cond: Self, then: Self, els: Self) -> chc::Formula<T> {
+        let [cond, then, els] = [cond, then, els]
+            .map(|part| part.into_formula().expect("a Boolean has a formula form"));
+        cond.clone().and(then).or(cond.not().and(els))
+    }
+}
+
+/// What a pattern requires of the value it matches: the testers of the variants it names,
+/// combined as its nesting (`All`) and its or-patterns (`Any`) combine them.
+enum PatCond<T> {
+    Variant {
+        datatype: chc::DatatypeSymbol,
+        ctor: chc::DatatypeSymbol,
+        discr: num_bigint::BigInt,
+        term: Box<chc::Term<T>>,
+    },
+    All(Vec<PatCond<T>>),
+    Any(Vec<PatCond<T>>),
+}
+
+impl<T> PatCond<T> {
+    /// The condition as a formula, with a variant tested by the datatype tester.
+    fn into_formula(self) -> chc::Formula<T> {
+        let mut formula = match self {
+            PatCond::Variant { ctor, term, .. } => {
+                return chc::Formula::Atom(chc::Atom::new(chc::Pred::Tester(ctor), vec![*term]))
+            }
+            PatCond::All(conds) => {
+                chc::Formula::And(conds.into_iter().map(Self::into_formula).collect())
+            }
+            PatCond::Any(conds) => {
+                chc::Formula::Or(conds.into_iter().map(Self::into_formula).collect())
+            }
+        };
+        formula.simplify();
+        formula
+    }
+
+    /// The condition as a Boolean term, the condition of an `ite`, with a variant tested by
+    /// the discriminant, which is defined by the testers.
+    fn into_term(self) -> chc::Term<T> {
+        match self {
+            PatCond::Variant {
+                datatype,
+                discr,
+                term,
+                ..
+            } => chc::Term::datatype_discr(datatype, *term).eq(chc::Term::int(discr)),
+            PatCond::All(conds) => conds
+                .into_iter()
+                .map(Self::into_term)
+                .filter(|t| !matches!(t, chc::Term::Bool(true)))
+                .reduce(chc::Term::and)
+                .unwrap_or(chc::Term::bool(true)),
+            PatCond::Any(conds) => conds
+                .into_iter()
+                .map(Self::into_term)
+                .reduce(chc::Term::or)
+                .unwrap_or(chc::Term::bool(false)),
+        }
+    }
+}
+
+/// The quantified variables of an `exists` / `forall` closure, the range they range over, and
+/// the body.
+type QuantifiedBody = (
+    Vec<(chc::UserQuantifiedVarId, chc::Sort)>,
+    Option<chc::Formula<rty::FunctionParamIdx>>,
+    chc::Formula<rty::FunctionParamIdx>,
+);
+
+#[derive(Clone)]
+pub struct AnnotFnTranslator<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    local_def_id: LocalDefId,
+    analyzer: &'a analyze::Analyzer<'tcx>,
+
+    typeck: &'tcx mir_ty::TypeckResults<'tcx>,
+    body: &'tcx rustc_hir::Body<'tcx>,
+    generic_args: mir_ty::GenericArgsRef<'tcx>,
+
+    def_ids: DefIdCache<'tcx>,
+    type_builder: TypeBuilder<'tcx>,
+    env: HashMap<HirId, chc::Term<rty::FunctionParamIdx>>,
+    /// [`FormulaFn::pre_receivers`], shared with the translators of quantifier bodies.
+    pre_receivers: Rc<RefCell<Vec<mir_ty::Ty<'tcx>>>>,
+}
+
+impl<'a, 'tcx> AnnotFnTranslator<'a, 'tcx> {
+    pub fn new(
+        analyzer: &'a analyze::Analyzer<'tcx>,
+        local_def_id: LocalDefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+        owner_fn_id: DefId,
+    ) -> Self {
+        let tcx = analyzer.tcx();
+        let body = tcx.hir_body_owned_by(local_def_id);
+        let typeck = tcx.typeck(local_def_id);
+        let def_ids = analyzer.def_ids();
+        let type_builder = TypeBuilder::new(
+            tcx,
+            def_ids.clone(),
+            owner_fn_id,
+            analyzer.type_params.clone(),
+            analyzer.closure_type_params.clone(),
+            analyzer.system.clone(),
+            analyzer.enum_defs.clone(),
+        );
+        let mut translator = Self {
+            tcx,
+            local_def_id,
+            analyzer,
+            typeck,
+            body,
+            generic_args,
+            def_ids,
+            type_builder,
+            env: HashMap::default(),
+            pre_receivers: Rc::default(),
+        };
+        translator.build_env_from_params();
+        translator
+    }
+
+    pub fn with_def_id_cache(mut self, def_ids: DefIdCache<'tcx>) -> Self {
+        self.def_ids = def_ids;
+        self
+    }
+
+    fn build_env_from_params(&mut self) {
+        for (idx, param) in self.body.params.iter().enumerate() {
+            let param_idx = rty::FunctionParamIdx::from(idx);
+            if self.is_closure_upvars_param(param) {
+                self.build_env_from_captures(chc::Term::var(param_idx), param.pat);
+                continue;
+            }
+            let mir_ty = self.scrutinee_ty(param.pat);
+            // `at_entry()` yields the `Inner` of a `FnParam<Inner>`; classify by it so
+            // a singleton wrapped argument collapses like any other singleton below.
+            let repr_ty = self.fn_param_wrapper_inner_ty(mir_ty).unwrap_or(mir_ty);
+            let ty = self.type_builder.build(repr_ty);
+            let term = if ty.to_sort().is_singleton() {
+                // the analyzer don't expect params with singleton sorts to be used in formula...
+                // FIXME: fix the analyzer side to uniformly accept all params
+                Self::singleton_term_for_ty(&ty.ty).unwrap()
+            } else {
+                chc::Term::var(param_idx)
+            };
+            self.build_env_from_pat(term, param.pat);
+        }
+    }
+
+    /// Whether the parameter holds the closure's upvars, as marked by
+    /// `#[thrust::closure_upvars]` on a `closure!` specification.
+    fn is_closure_upvars_param(&self, param: &rustc_hir::Param<'tcx>) -> bool {
+        let attr_path = analyze::annot::closure_upvars_path();
+        self.tcx
+            .hir_attrs(param.hir_id)
+            .iter()
+            .any(|attr| attr.path_matches(&attr_path))
+    }
+
+    /// Binds the names of a closure specification's upvars pattern to the closure's
+    /// captured variables.
+    ///
+    /// The pattern lists the captures a clause names, in the order it wrote them,
+    /// while the upvars hold every capture in the order rustc chose. The two are
+    /// therefore matched up by name.
+    fn build_env_from_captures(
+        &mut self,
+        upvars_term: chc::Term<rty::FunctionParamIdx>,
+        pat: &'tcx rustc_hir::Pat<'tcx>,
+    ) {
+        let rustc_hir::PatKind::Tuple(subpats, _) = pat.kind else {
+            panic!(
+                "closure upvars are expected to be a tuple pattern: {:?}",
+                pat
+            );
+        };
+        let closure_def_id = self.tcx.local_parent(self.local_def_id);
+        let captures = self.tcx.closure_captures(closure_def_id);
+        let closure_ty = self.tcx.type_of(closure_def_id).instantiate_identity();
+        let mir_ty::TyKind::Closure(_, closure_args) = closure_ty.kind() else {
+            panic!("closure specification is expected to sit inside a closure");
+        };
+        let mut upvar_terms = Vec::new();
+        for i in 0..captures.len() {
+            let upvar_term = match closure_args.as_closure().kind() {
+                mir_ty::ClosureKind::Fn => upvars_term.clone().box_current().tuple_proj(i),
+                mir_ty::ClosureKind::FnMut => chc::Term::mut_(
+                    upvars_term.clone().mut_current().tuple_proj(i),
+                    upvars_term.clone().mut_final().tuple_proj(i),
+                ),
+                mir_ty::ClosureKind::FnOnce => upvars_term.clone().tuple_proj(i),
+            };
+            upvar_terms.push(upvar_term);
+        }
+        for subpat in subpats {
+            let rustc_hir::PatKind::Binding(_, hir_id, ident, None) = subpat.kind else {
+                panic!("closure capture is expected to be a binding: {:?}", subpat);
+            };
+            let Some(idx) = captures.iter().position(|capture| {
+                capture.var_ident.name == ident.name
+                    && (capture.place.projections.is_empty()
+                        || Self::is_shared_ref_reborrow(capture))
+            }) else {
+                self.tcx.dcx().span_fatal(
+                    subpat.span,
+                    format!("`{}` is not captured by this closure", ident),
+                );
+            };
+            self.check_capture_type(subpat, ident, closure_args.as_closure(), idx);
+            self.env.insert(hir_id, upvar_terms[idx].clone());
+        }
+    }
+
+    /// Rejects a `captures` entry whose type does not match the one the closure holds the
+    /// capture at: the capture's own type in an `Fn` or `FnOnce` closure, a `&mut` of it in an
+    /// `FnMut` closure. rustc takes the kind from the bound the closure is passed to when there
+    /// is one, so the same closure can need either. Shared references and boxes are erased from
+    /// the emitted sorts, so they need not match.
+    fn check_capture_type(
+        &self,
+        subpat: &'tcx rustc_hir::Pat<'tcx>,
+        ident: rustc_span::Ident,
+        closure_args: mir_ty::ClosureArgs<TyCtxt<'tcx>>,
+        idx: usize,
+    ) {
+        let capture_ty = closure_args.upvar_tys()[idx];
+        let held_ty = match closure_args.kind() {
+            mir_ty::ClosureKind::FnMut => {
+                mir_ty::Ty::new_mut_ref(self.tcx, self.tcx.lifetimes.re_erased, capture_ty)
+            }
+            mir_ty::ClosureKind::Fn | mir_ty::ClosureKind::FnOnce => capture_ty,
+        };
+        if self.same_emitted_shape(self.model_of(held_ty), self.written_ty(subpat)) {
+            return;
+        }
+        self.tcx.dcx().span_fatal(
+            subpat.span,
+            format!(
+                "this `{}` closure holds `{}` at type `{}`, which `captures` restates at another type (only shared references and boxes may differ)",
+                closure_args.kind().as_str(),
+                ident,
+                self.tcx.erase_regions(held_ty),
+            ),
+        );
+    }
+
+    /// Whether a value of model type `held` can be read at the model type `written` in a
+    /// clause: their sorts agree with `Box` erased, as the query is emitted. `held` is in the
+    /// generics of the function around the closure and `written` in those of the clause, which
+    /// copies them under the same names, so where either names a type parameter the two are
+    /// walked side by side instead: the `&mut`s must pair up, tuples and the arguments of one
+    /// ADT are compared part by part, a parameter (or its model `<T as Model>::Ty`, or
+    /// `Closure<F>`) matches only the same parameter, and any other projection left
+    /// unnormalized matches anything. Any other two different shapes do not match.
+    fn same_emitted_shape(&self, held: mir_ty::Ty<'tcx>, written: mir_ty::Ty<'tcx>) -> bool {
+        use rustc_middle::ty::TypeVisitableExt as _;
+        if !held.has_param() && !written.has_param() {
+            let emitted_sort = |ty| chc::unbox_sort(self.type_builder.build(ty).ty.to_sort());
+            return emitted_sort(self.normalized_ty(held)) == emitted_sort(written);
+        }
+        let (held, written) = (self.skip_shared(held), self.skip_shared(written));
+        match (self.mut_pointee(held), self.mut_pointee(written)) {
+            (Some(held), Some(written)) => return self.same_emitted_shape(held, written),
+            (None, None) => {}
+            _ => return false,
+        }
+        let is_alias = |ty: mir_ty::Ty<'tcx>| matches!(ty.kind(), mir_ty::TyKind::Alias(..));
+        match (self.model_param(held), self.model_param(written)) {
+            (Some(h), Some(w)) => return Self::param_name(h) == Self::param_name(w),
+            (Some(_), None) => return is_alias(written),
+            (None, Some(_)) => return is_alias(held),
+            (None, None) => {}
+        }
+        if is_alias(held) || is_alias(written) {
+            return true;
+        }
+        match (held.kind(), written.kind()) {
+            (mir_ty::TyKind::Tuple(hs), mir_ty::TyKind::Tuple(ws)) => {
+                hs.len() == ws.len()
+                    && hs
+                        .iter()
+                        .zip(ws.iter())
+                        .all(|(h, w)| self.same_emitted_shape(h, w))
+            }
+            (mir_ty::TyKind::Adt(ha, hargs), mir_ty::TyKind::Adt(wa, wargs)) if ha == wa => hargs
+                .types()
+                .zip(wargs.types())
+                .all(|(h, w)| self.same_emitted_shape(h, w)),
+            _ => false,
+        }
+    }
+
+    /// The model type of the closure's type `ty`: `&mut` as `Mut`, `Box` as the model `Box`,
+    /// shared references and tuples part by part, a type parameter `T` as `<T as Model>::Ty`,
+    /// and any other type by its `Model` impl, normalized where the closure is defined.
+    fn model_of(&self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        let tcx = self.tcx;
+        let model_adt = |did: Option<DefId>, inner: mir_ty::Ty<'tcx>| {
+            let did = did.expect("thrust_models defines the model type");
+            mir_ty::Ty::new_adt(tcx, tcx.adt_def(did), tcx.mk_args(&[inner.into()]))
+        };
+        match ty.kind() {
+            mir_ty::TyKind::Ref(region, inner, rustc_hir::Mutability::Not) => {
+                mir_ty::Ty::new_imm_ref(tcx, *region, self.model_of(*inner))
+            }
+            mir_ty::TyKind::Ref(_, inner, rustc_hir::Mutability::Mut) => {
+                model_adt(self.def_ids.mut_model(), self.model_of(*inner))
+            }
+            mir_ty::TyKind::Adt(_, args) if ty.is_box() => {
+                model_adt(self.def_ids.box_model(), self.model_of(args.type_at(0)))
+            }
+            mir_ty::TyKind::Tuple(tys) => {
+                mir_ty::Ty::new_tup_from_iter(tcx, tys.iter().map(|ty| self.model_of(ty)))
+            }
+            _ => {
+                let Some(model_ty) = self.def_ids.model_ty() else {
+                    return ty;
+                };
+                let projection = mir_ty::Ty::new_projection(tcx, model_ty, [ty]);
+                if matches!(ty.kind(), mir_ty::TyKind::Param(_)) {
+                    return projection;
+                }
+                let closure_def_id = tcx.local_parent(self.local_def_id);
+                let typing_env = mir_ty::TypingEnv::post_analysis(
+                    tcx,
+                    tcx.typeck_root_def_id(closure_def_id.to_def_id()),
+                );
+                tcx.try_normalize_erasing_regions(typing_env, projection)
+                    .unwrap_or(projection)
+            }
+        }
+    }
+
+    /// The type a clause's pattern is written at, in the clause's own generics: normalized but
+    /// not instantiated, so that it is compared with the closure's types the same way whether
+    /// the clause is translated over its type parameters or at an instance.
+    fn written_ty(&self, pat: &'tcx rustc_hir::Pat<'tcx>) -> mir_ty::Ty<'tcx> {
+        let ty = self.typeck.pat_ty(pat);
+        self.tcx
+            .try_normalize_erasing_regions(mir_ty::TypingEnv::fully_monomorphized(), ty)
+            .unwrap_or(ty)
+    }
+
+    /// The name a clause's type parameter has in the function around it: the macro renames
+    /// `Self` to `__ThrustSelf` where it lifts a clause out of a trait.
+    fn param_name(param: mir_ty::ParamTy) -> rustc_span::Symbol {
+        if param.name.as_str() == "__ThrustSelf" {
+            return rustc_span::Symbol::intern("Self");
+        }
+        param.name
+    }
+
+    /// The type parameter a model type stands for: the parameter itself, `<T as Model>::Ty`,
+    /// or the model `Closure<F>` of a closure-typed parameter.
+    fn model_param(&self, ty: mir_ty::Ty<'tcx>) -> Option<mir_ty::ParamTy> {
+        let inner = match ty.kind() {
+            mir_ty::TyKind::Adt(adt, args) if Some(adt.did()) == self.def_ids.closure_model() => {
+                args.type_at(0)
+            }
+            mir_ty::TyKind::Alias(mir_ty::AliasTyKind::Projection, alias)
+                if Some(alias.def_id) == self.def_ids.model_ty() =>
+            {
+                alias.args.type_at(0)
+            }
+            _ => ty,
+        };
+        match inner.kind() {
+            mir_ty::TyKind::Param(param) => Some(*param),
+            _ => None,
+        }
+    }
+
+    /// `ty` past the shared references and boxes around it, which the query erases.
+    fn skip_shared(&self, mut ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        loop {
+            ty = match ty.kind() {
+                mir_ty::TyKind::Ref(_, inner, rustc_hir::Mutability::Not) => *inner,
+                mir_ty::TyKind::Adt(adt, args)
+                    if ty.is_box() || Some(adt.did()) == self.def_ids.box_model() =>
+                {
+                    args.type_at(0)
+                }
+                _ => return ty,
+            };
+        }
+    }
+
+    /// The pointee of a `&mut` or of its model `Mut`.
+    fn mut_pointee(&self, ty: mir_ty::Ty<'tcx>) -> Option<mir_ty::Ty<'tcx>> {
+        match ty.kind() {
+            mir_ty::TyKind::Ref(_, inner, rustc_hir::Mutability::Mut) => Some(*inner),
+            mir_ty::TyKind::Adt(adt, args) if Some(adt.did()) == self.def_ids.mut_model() => {
+                Some(args.type_at(0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the capture is `*x` borrowed immutably, `x` a shared reference: rustc captures a
+    /// use of `x[i]` or `x.f()` that way, through a deref of `x`. The capture `&*x` is then `x`
+    /// itself, so a clause names it as `x`, of `x`'s type.
+    fn is_shared_ref_reborrow(capture: &mir_ty::CapturedPlace<'tcx>) -> bool {
+        matches!(
+            capture.place.projections.as_slice(),
+            [proj] if proj.kind == rustc_middle::hir::place::ProjectionKind::Deref
+        ) && matches!(
+            capture.place.base_ty.kind(),
+            mir_ty::TyKind::Ref(_, _, rustc_hir::Mutability::Not)
+        ) && matches!(
+            capture.info.capture_kind,
+            mir_ty::UpvarCapture::ByRef(mir_ty::BorrowKind::Immutable)
+        )
+    }
+
+    fn singleton_term_for_ty(
+        ty: &rty::Type<rty::Closed>,
+    ) -> Option<chc::Term<rty::FunctionParamIdx>> {
+        match ty {
+            rty::Type::String | rty::Type::Opaque | rty::Type::Never | rty::Type::Function(_) => {
+                Some(chc::Term::null())
+            }
+            rty::Type::Tuple(ty) => ty
+                .elems
+                .iter()
+                .map(|elem| Self::singleton_term_for_ty(&elem.ty))
+                .collect::<Option<Vec<_>>>()
+                .map(chc::Term::tuple),
+            rty::Type::Pointer(ty) => {
+                let elem = Self::singleton_term_for_ty(&ty.elem.ty)?;
+                match ty.kind {
+                    rty::PointerKind::Own | rty::PointerKind::Ref(rty::RefKind::Immut) => {
+                        Some(chc::Term::box_(elem))
+                    }
+                    rty::PointerKind::Ref(rty::RefKind::Mut) => {
+                        Some(chc::Term::mut_(elem.clone(), elem))
+                    }
+                }
+            }
+            rty::Type::Array(ty) => {
+                if Self::singleton_term_for_ty(&ty.elem.ty).is_some() {
+                    panic!("singleton array type is not supported in formula: {:?}", ty);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// The `Inner` of a `thrust_models::FnParam<Inner>` wrapper type, if `ty` is one.
+    fn fn_param_wrapper_inner_ty(&self, ty: mir_ty::Ty<'tcx>) -> Option<mir_ty::Ty<'tcx>> {
+        match ty.kind() {
+            mir_ty::TyKind::Adt(def, args)
+                if Some(def.did()) == self.def_ids.fn_param_wrapper() =>
+            {
+                Some(args.type_at(0))
+            }
+            _ => None,
+        }
+    }
+
+    /// The type a field access or an index on `ty` resolves in: a `Ghost<T>` autoderefs to
+    /// `<T as Model>::Ty`, the identity in the logic, and any other type is taken as is.
+    fn ghost_deref_target_ty(&self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        match ty.kind() {
+            mir_ty::TyKind::Adt(def, args) if Some(def.did()) == self.def_ids.ghost_model() => {
+                self.type_builder.resolve_model_ty(args.type_at(0))
+            }
+            _ => ty,
+        }
+    }
+
+    /// Binds the variables of `pat`, a parameter's pattern, to the parts of `param` they name.
+    /// A parameter's pattern is irrefutable, so the condition [`Self::pat_cond`] also gives
+    /// holds of every value of its type and is dropped.
+    fn build_env_from_pat(
+        &mut self,
+        param: chc::Term<rty::FunctionParamIdx>,
+        pat: &'tcx rustc_hir::Pat<'tcx>,
+    ) {
+        let mut bindings = Vec::new();
+        self.pat_cond(param, pat, &mut bindings);
+        self.env.extend(bindings);
+    }
+
+    fn instantiate_generics<T>(
+        &self,
+        ty: T,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> Option<T>
+    where
+        T: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        if !self.generic_args.is_empty() {
+            Some(mir_ty::EarlyBinder::bind(ty).instantiate(self.tcx, generic_args))
+        } else {
+            None
+        }
+    }
+
+    /// Whether `ty`'s model is `model::Seq`, the sequence that `Vec<T>`, `[T]`
+    /// and `[T; N]` all lower to, as well as `Seq` itself. A formula that
+    /// reaches such a value through a field of an ADT sees the real Rust type
+    /// rather than the model type, so only `.len()` and indexing are spellable
+    /// there.
+    fn is_seq_modeled(&self, ty: mir_ty::Ty<'tcx>) -> bool {
+        match ty.kind() {
+            mir_ty::TyKind::Slice(_) | mir_ty::TyKind::Array(_, _) => true,
+            mir_ty::TyKind::Adt(adt, _) => {
+                Some(adt.did()) == self.def_ids.seq_model()
+                    || self.tcx.is_diagnostic_item(rustc_span::sym::Vec, adt.did())
+            }
+            _ => false,
+        }
+    }
+
+    /// `ty` with any outer references and `Ghost`/`Box` wrappers removed, the
+    /// type whose model an index or a length applies to. A sequence reached
+    /// through a field is a reference (`&[T]` models as `&Seq`), so the index
+    /// path has to see through it to pick `seq.nth` over `select`.
+    fn seq_target_ty(&self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        let mut ty = self.ghost_deref_target_ty(ty);
+        while let mir_ty::TyKind::Ref(_, inner, _) = ty.kind() {
+            ty = *inner;
+        }
+        ty
+    }
+
+    /// The dereferences of a `Mut<T>` that rustc's adjustments of `expr` insert where it
+    /// autoderefs a field's base, an index's base or a method's receiver, and the type of `expr`
+    /// after them: `s[i]`, `s.f` and `s.len()` of an `s: &mut T` read the current value `*s`, as
+    /// in Creusot. The other dereferences rustc inserts, of a shared reference or a `Box`, are
+    /// the identity in a query, which removes boxes.
+    fn mut_derefs(&self, expr: &'tcx rustc_hir::Expr<'tcx>) -> (usize, mir_ty::Ty<'tcx>) {
+        let mut count = 0;
+        let mut ty = self.expr_ty(expr);
+        for adjustment in self.typeck.expr_adjustments(expr) {
+            let mir_ty::adjustment::Adjust::Deref(_) = adjustment.kind else {
+                break;
+            };
+            if let mir_ty::TyKind::Adt(adt, _) = ty.kind() {
+                if Some(adt.did()) == self.def_ids.mut_model() {
+                    count += 1;
+                }
+            }
+            ty = self.instantiated(adjustment.target);
+        }
+        (count, ty)
+    }
+
+    /// The type of `expr` where rustc autoderefs it, after its dereferences ([`Self::mut_derefs`]).
+    fn adjusted_expr_ty(&self, expr: &'tcx rustc_hir::Expr<'tcx>) -> mir_ty::Ty<'tcx> {
+        self.mut_derefs(expr).1
+    }
+
+    fn expr_ty(&self, expr: &'tcx rustc_hir::Expr<'tcx>) -> mir_ty::Ty<'tcx> {
+        self.instantiated(self.typeck.expr_ty(expr))
+    }
+
+    /// `ty`, a type of the formula function's typeck results, at its generic arguments.
+    fn instantiated(&self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        let instantiated = self
+            .instantiate_generics(ty, self.generic_args)
+            .unwrap_or(ty);
+        let typing_env = mir_ty::TypingEnv::fully_monomorphized();
+        self.tcx
+            .try_normalize_erasing_regions(typing_env, instantiated)
+            .unwrap_or(instantiated)
+    }
+
+    fn bit_vec_ty(&self, expr: &'tcx rustc_hir::Expr<'tcx>) -> Option<rty::BitVecType> {
+        match self.type_builder.build(self.expr_ty(expr)).ty {
+            rty::Type::BitVec(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    fn bit_vec_binary_op(
+        &self,
+        op: rustc_hir::BinOpKind,
+        ty: rty::BitVecType,
+        lhs: &'tcx rustc_hir::Expr<'tcx>,
+        rhs: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> FormulaOrTerm<rty::FunctionParamIdx> {
+        use rustc_hir::BinOpKind;
+
+        match op {
+            BinOpKind::Eq | BinOpKind::Ne => {
+                let binop = if op == BinOpKind::Eq {
+                    AmbiguousBinOp::Eq
+                } else {
+                    AmbiguousBinOp::Ne
+                };
+                let span = lhs.span.to(rhs.span);
+                return self.equality(
+                    span,
+                    self.plain_operand(lhs),
+                    binop,
+                    self.plain_operand(rhs),
+                );
+            }
+            _ => {}
+        }
+        let lhs = self.to_term(lhs);
+        let rhs = self.to_term(rhs);
+        let fun = match (op, ty.signed) {
+            (BinOpKind::Add, _) => chc::Function::BVADD,
+            (BinOpKind::Sub, _) => chc::Function::BVSUB,
+            (BinOpKind::Mul, _) => chc::Function::BVMUL,
+            (BinOpKind::BitAnd, _) => chc::Function::BVAND,
+            (BinOpKind::BitOr, _) => chc::Function::BVOR,
+            (BinOpKind::BitXor, _) => chc::Function::BVXOR,
+            (BinOpKind::Shl, _) => chc::Function::BVSHL,
+            (BinOpKind::Shr, true) => chc::Function::BVASHR,
+            (BinOpKind::Shr, false) => chc::Function::BVLSHR,
+            (BinOpKind::Lt, true) => chc::Function::BVSLT,
+            (BinOpKind::Lt, false) => chc::Function::BVULT,
+            (BinOpKind::Le, true) => chc::Function::BVSLE,
+            (BinOpKind::Le, false) => chc::Function::BVULE,
+            (BinOpKind::Gt, true) => chc::Function::BVSGT,
+            (BinOpKind::Gt, false) => chc::Function::BVUGT,
+            (BinOpKind::Ge, true) => chc::Function::BVSGE,
+            (BinOpKind::Ge, false) => chc::Function::BVUGE,
+            _ => unimplemented!("unsupported BitVec operator in formula: {:?}", op),
+        };
+        FormulaOrTerm::Term(chc::Term::App(fun, vec![lhs, rhs]))
+    }
+
+    fn pat_ty(&self, pat: &'tcx rustc_hir::Pat<'tcx>) -> mir_ty::Ty<'tcx> {
+        self.normalized_ty(self.typeck.pat_ty(pat))
+    }
+
+    /// The type of the value `pat` matches, before match ergonomics sees through its references:
+    /// `pat_ty` is the type after.
+    fn scrutinee_ty(&self, pat: &'tcx rustc_hir::Pat<'tcx>) -> mir_ty::Ty<'tcx> {
+        match self.typeck.pat_adjustments().get(pat.hir_id) {
+            Some(adjustments) => self.normalized_ty(adjustments[0].source),
+            None => self.pat_ty(pat),
+        }
+    }
+
+    /// The binding mode rustc chose for a binding, `ref` where match ergonomics sees through a
+    /// reference to it.
+    fn binding_mode(
+        &self,
+        hir_id: rustc_hir::HirId,
+        span: rustc_span::Span,
+    ) -> rustc_hir::BindingMode {
+        self.typeck
+            .extract_binding_mode(self.tcx.sess, hir_id, span)
+    }
+
+    fn normalized_ty(&self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        let instantiated = self
+            .instantiate_generics(ty, self.generic_args)
+            .unwrap_or(ty);
+        let typing_env = mir_ty::TypingEnv::fully_monomorphized();
+        self.tcx
+            .try_normalize_erasing_regions(typing_env, instantiated)
+            .unwrap_or(instantiated)
+    }
+
+    /// The translation, with the `pre!` receivers it recorded, its quantifier bodies' included.
+    pub fn into_formula_fn(self) -> FormulaFn<'tcx> {
+        let (body, witnessed, exists) = if self.is_logic(self.local_def_id.to_def_id()) {
+            (
+                FormulaFnBody::Term(self.to_term(self.logic_body_expr().0)),
+                None,
+                None,
+            )
+        } else {
+            (
+                FormulaFnBody::Formula(self.to_formula(self.body.value)),
+                self.witnessed_formula(self.body.value),
+                self.exists_call_parts(self.body.value),
+            )
+        };
+        let fn_sig = self.tcx.fn_sig(self.local_def_id.to_def_id());
+        let binder = if self.generic_args.is_empty() {
+            fn_sig.skip_binder()
+        } else {
+            fn_sig.instantiate(self.tcx, self.generic_args)
+        };
+        let ret = binder.skip_binder().output();
+        let params = binder.skip_binder().inputs().to_vec();
+        let param_idents = self
+            .tcx
+            .fn_arg_idents(self.local_def_id.to_def_id())
+            .iter()
+            .copied()
+            .collect();
+        FormulaFn {
+            params: IndexVec::from_raw(params),
+            param_idents,
+            ret,
+            body,
+            witnessed,
+            exists,
+            pre_receivers: self.pre_receivers.borrow().clone(),
+        }
+    }
+
+    /// [`FormulaFn::witnessed_formula`] of the formula `hir`, or `None` when no conjunct of it is
+    /// a `witness`.
+    fn witnessed_formula(
+        &self,
+        hir: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> Option<chc::Formula<rty::FunctionParamIdx>> {
+        let hir = peel_wrappers(hir);
+        if let Some((formula, witness)) = self.witness_args(hir) {
+            return Some(self.witness_instance(formula, witness));
+        }
+        let rustc_hir::ExprKind::Binary(op, lhs, rhs) = hir.kind else {
+            return None;
+        };
+        if op.node != rustc_hir::BinOpKind::And {
+            return None;
+        }
+        let (lhs_witnessed, rhs_witnessed) =
+            (self.witnessed_formula(lhs), self.witnessed_formula(rhs));
+        if lhs_witnessed.is_none() && rhs_witnessed.is_none() {
+            return None;
+        }
+        let lhs = lhs_witnessed.unwrap_or_else(|| self.to_formula(lhs));
+        let rhs = rhs_witnessed.unwrap_or_else(|| self.to_formula(rhs));
+        Some(lhs.and(rhs))
+    }
+
+    /// The formula and the witness of `expr` when it is a call of `thrust_models::witness`.
+    fn witness_args(
+        &self,
+        expr: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> Option<(&'tcx rustc_hir::Expr<'tcx>, &'tcx rustc_hir::Expr<'tcx>)> {
+        let rustc_hir::ExprKind::Call(func_expr, [formula, witness]) = expr.kind else {
+            return None;
+        };
+        let rustc_hir::ExprKind::Path(qpath) = &func_expr.kind else {
+            return None;
+        };
+        let def_id = self
+            .typeck
+            .qpath_res(qpath, func_expr.hir_id)
+            .opt_def_id()?;
+        (Some(def_id) == self.def_ids.witness()).then_some((formula, witness))
+    }
+
+    /// The body of the `exists` `formula` is, or that defines the predicate `formula` calls, at
+    /// `witness`: its bound variable replaced by `witness`, or its bound variables by the
+    /// components of the tuple `witness` is, as Why3's `exists` transformation instantiates a
+    /// goal.
+    fn witness_instance(
+        &self,
+        formula: &'tcx rustc_hir::Expr<'tcx>,
+        witness: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> chc::Formula<rty::FunctionParamIdx> {
+        let (vars, body) = self.witnessed_exists(formula);
+        let terms: HashMap<_, _> = vars
+            .iter()
+            .map(|(var, _)| *var)
+            .zip(self.witness_terms(&vars, witness))
+            .collect();
+        body.subst_quantified(&terms)
+    }
+
+    /// The terms `witness` gives the variables `vars` an `exists` binds: the witness itself for one
+    /// variable, the elements of a tuple expression, or the projections of a tuple-typed term
+    /// (a `choose!`'s value of a tuple type); each of the variable's sort.
+    fn witness_terms(
+        &self,
+        vars: &[(chc::UserQuantifiedVarId, chc::Sort)],
+        witness: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> Vec<chc::Term<rty::FunctionParamIdx>> {
+        let sort_of = |e: &'tcx rustc_hir::Expr<'tcx>| {
+            let ty = self.normalized_ty(self.typeck.expr_ty(e));
+            self.type_builder.build(ty).to_sort()
+        };
+        let mismatch = |span| -> ! {
+            self.tcx.dcx().span_fatal(
+                span,
+                "this witness does not have the type of the variable the `exists` binds",
+            )
+        };
+        if vars.len() == 1 {
+            if sort_of(witness) != vars[0].1 {
+                mismatch(witness.span);
+            }
+            return vec![self.to_term(witness)];
+        }
+        if let rustc_hir::ExprKind::Tup(elems) = witness.kind {
+            if elems.len() != vars.len() {
+                self.several_binders(witness.span, vars.len());
+            }
+            return elems
+                .iter()
+                .zip(vars)
+                .map(|(elem, (_, sort))| {
+                    if sort_of(elem) != *sort {
+                        mismatch(elem.span);
+                    }
+                    self.to_term(elem)
+                })
+                .collect();
+        }
+        // A tuple value holds each element in a box (`Sort::Box`), which its projection opens.
+        let chc::Sort::Tuple(elems) = sort_of(witness) else {
+            self.several_binders(witness.span, vars.len())
+        };
+        if elems.len() != vars.len() {
+            self.several_binders(witness.span, vars.len());
+        }
+        let tuple = self.to_term(witness);
+        elems
+            .into_iter()
+            .zip(vars)
+            .enumerate()
+            .map(|(i, (elem, (_, sort)))| match elem {
+                elem if elem == *sort => tuple.clone().tuple_proj(i),
+                chc::Sort::Box(inner) if *inner == *sort => {
+                    tuple.clone().tuple_proj(i).box_current()
+                }
+                _ => mismatch(witness.span),
+            })
+            .collect()
+    }
+
+    fn several_binders(&self, span: rustc_span::Span, n: usize) -> ! {
+        self.tcx.dcx().span_fatal(
+            span,
+            format!("the `exists` binds {n} variables, so its witness is a tuple of {n} terms"),
+        )
+    }
+
+    /// The function `hir` calls by path, with the callee expression and the arguments.
+    fn path_call(
+        &self,
+        hir: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> Option<(
+        DefId,
+        &'tcx rustc_hir::Expr<'tcx>,
+        &'tcx [rustc_hir::Expr<'tcx>],
+    )> {
+        let rustc_hir::ExprKind::Call(func_expr, args) = peel_wrappers(hir).kind else {
+            return None;
+        };
+        let rustc_hir::ExprKind::Path(qpath) = &func_expr.kind else {
+            return None;
+        };
+        let def_id = self
+            .typeck
+            .qpath_res(qpath, func_expr.hir_id)
+            .opt_def_id()?;
+        Some((def_id, func_expr, args))
+    }
+
+    /// [`Self::exists_binders_and_body`] of `hir` when it is a call of `thrust_models::exists`.
+    fn exists_call_parts(&self, hir: &'tcx rustc_hir::Expr<'tcx>) -> Option<ExistsParts> {
+        let (def_id, _, args) = self.path_call(hir)?;
+        (Some(def_id) == self.def_ids.exists()).then(|| self.exists_binders_and_body(args))
+    }
+
+    /// The binders of a call of `thrust_models::exists` with arguments `args` and its body, the
+    /// binders' ranges included.
+    fn exists_binders_and_body(
+        &self,
+        args: &'tcx [rustc_hir::Expr<'tcx>],
+    ) -> (
+        Vec<(chc::UserQuantifiedVarId, chc::Sort)>,
+        chc::Formula<rty::FunctionParamIdx>,
+    ) {
+        let [closure] = args else {
+            panic!("exists takes exactly 1 argument");
+        };
+        let rustc_hir::ExprKind::Closure(closure) = closure.kind else {
+            panic!("exists argument must be a closure");
+        };
+        let (vars, range, body) =
+            self.to_formula_with_quantified_vars(self.tcx.hir_body(closure.body));
+        let body = match range {
+            Some(range) => range.and(body),
+            None => body,
+        };
+        (vars, body)
+    }
+
+    /// The bound variables and the body of `formula`, the formula of a `witness`: an `exists`,
+    /// or a call of a predicate whose body is one, unfolded at the call's arguments.
+    fn witnessed_exists(
+        &self,
+        formula: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> (
+        Vec<(chc::UserQuantifiedVarId, chc::Sort)>,
+        chc::Formula<rty::FunctionParamIdx>,
+    ) {
+        let formula = peel_wrappers(formula);
+        let Some((def_id, func_expr, args)) = self.path_call(formula) else {
+            self.not_an_exists(formula.span)
+        };
+        if Some(def_id) == self.def_ids.exists() {
+            return self.exists_binders_and_body(args);
+        }
+        let is_predicate = self
+            .tcx
+            .get_attrs_by_path(def_id, &analyze::annot::predicate_path())
+            .next()
+            .is_some();
+        if !is_predicate {
+            self.not_an_exists(formula.span);
+        }
+        let (_, instance) = self.resolve_spec_fn_call(def_id, func_expr);
+        let Some((local, instance_args)) =
+            instance.and_then(|instance| Some((instance.def_id().as_local()?, instance.args)))
+        else {
+            self.tcx.dcx().span_fatal(
+                formula.span,
+                "a `witness` unfolds a predicate of this crate whose definition the call resolves to",
+            )
+        };
+        let definition = self
+            .analyzer
+            .formula_fn_with_args(local, instance_args, self.type_builder.owner_fn_id())
+            .expect("predicate formula function is not registered");
+        let Some((vars, body)) = definition.exists_parts().cloned() else {
+            self.not_an_exists(formula.span)
+        };
+        let arg_terms: Vec<_> = args.iter().map(|e| self.to_term(e)).collect();
+        (
+            vars,
+            body.subst_var(|idx| arg_terms[idx.as_usize()].clone()),
+        )
+    }
+
+    fn not_an_exists(&self, span: rustc_span::Span) -> ! {
+        self.tcx.dcx().span_fatal(
+            span,
+            "the formula of a `witness` is an `exists` or a call of a predicate whose body is one",
+        )
+    }
+
+    /// The body of a logic function past the `#[thrust::variant_path]` statement naming its
+    /// variant, and whether there is one.
+    fn logic_body_expr(&self) -> (&'tcx rustc_hir::Expr<'tcx>, bool) {
+        let rustc_hir::ExprKind::Block(block, _) = self.body.value.kind else {
+            return (self.body.value, false);
+        };
+        let is_variant_path = |stmt: &rustc_hir::Stmt<'_>| {
+            self.tcx
+                .hir_attrs(stmt.hir_id)
+                .iter()
+                .any(|attr| attr.path_matches(&analyze::annot::variant_path_path()))
+        };
+        match (block.stmts, block.expr) {
+            ([stmt], Some(expr)) if is_variant_path(stmt) => (expr, true),
+            _ => (self.body.value, false),
+        }
+    }
+
+    /// The generic arguments of the call `func_expr` to a predicate or logic function `def_id`
+    /// in the owner's terms, and the instance they resolve to.
+    ///
+    /// `self.generic_args` is empty only when the owner has no generics, so the callee's own
+    /// args are already concrete and there is nothing to instantiate. In both cases
+    /// `Instance::try_resolve` decides the routing: it resolves a call on a concrete type to the
+    /// impl's function, and returns `None` for a call that still depends on the owner's type
+    /// parameters (an `ImplSource::Param`).
+    fn resolve_spec_fn_call(
+        &self,
+        def_id: DefId,
+        func_expr: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> (mir_ty::GenericArgsRef<'tcx>, Option<mir_ty::Instance<'tcx>>) {
+        let typing_env = analyze::predicate_typing_env(
+            self.tcx,
+            self.type_builder.owner_fn_id(),
+            self.def_ids.model_ty(),
+        );
+        let generic_args = self.spec_fn_call_args(func_expr);
+        tracing::debug!(
+            lhs = ?def_id,
+            lhs_generic_args = ?generic_args,
+            outer = ?self.local_def_id,
+            outer_generic_args = ?self.generic_args,
+            "resolving spec function call in formula"
+        );
+        let instance =
+            mir_ty::Instance::try_resolve(self.tcx, typing_env, def_id, generic_args).unwrap();
+        (generic_args, instance)
+    }
+
+    /// The generic arguments of the call `func_expr` in the owner's terms.
+    fn spec_fn_call_args(
+        &self,
+        func_expr: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> mir_ty::GenericArgsRef<'tcx> {
+        let generic_args = self.typeck.node_args(func_expr.hir_id);
+        self.instantiate_generics(generic_args, self.generic_args)
+            .unwrap_or(generic_args)
+    }
+
+    /// `ty::compares(..)` for a type whose `PartialOrdSpec` relation is generated from its
+    /// derived `PartialOrd`.
+    fn generated_compares_call(
+        &self,
+        def_id: DefId,
+        func_expr: &'tcx rustc_hir::Expr<'tcx>,
+        args: &'tcx [rustc_hir::Expr<'tcx>],
+    ) -> Option<chc::Formula<rty::FunctionParamIdx>> {
+        let spec_trait = self.def_ids.partial_ord_spec()?;
+        if self.tcx.trait_of_assoc(def_id) != Some(spec_trait) {
+            return None;
+        }
+        let self_ty = self.spec_fn_call_args(func_expr).type_at(0);
+        if !analyze::derive::has_generated_compares(
+            self.tcx,
+            &self.def_ids,
+            &self.type_builder,
+            self_ty,
+        ) {
+            return None;
+        }
+        let [x, y, ord] = args else {
+            panic!("`compares` takes three arguments");
+        };
+        let compares = analyze::derive::Compares::new(self.analyzer, &self.type_builder, def_id);
+        Some(compares.formula(self_ty, self.to_term(x), self.to_term(y), self.to_term(ord)))
+    }
+
+    fn to_formula(&self, hir: &'tcx rustc_hir::Expr<'tcx>) -> chc::Formula<rty::FunctionParamIdx> {
+        self.to_formula_or_term(hir)
+            .into_formula()
+            .expect("expected a formula")
+    }
+
+    /// The two arguments of `expr` when it is a call of `thrust_models::log_eq_args`.
+    fn log_eq_args(
+        &self,
+        expr: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> Option<(&'tcx rustc_hir::Expr<'tcx>, &'tcx rustc_hir::Expr<'tcx>)> {
+        let rustc_hir::ExprKind::Call(func_expr, [lhs, rhs]) = expr.kind else {
+            return None;
+        };
+        let rustc_hir::ExprKind::Path(qpath) = &func_expr.kind else {
+            return None;
+        };
+        let def_id = self
+            .typeck
+            .qpath_res(qpath, func_expr.hir_id)
+            .opt_def_id()?;
+        (Some(def_id) == self.def_ids.log_eq_args()).then_some((lhs, rhs))
+    }
+
+    /// The type and translation of the value an argument of `log_eq_args` refers to: `a` of the
+    /// `&a` that `==` is rewritten to, or the referent of any other reference.
+    fn log_eq_operand(
+        &self,
+        arg: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> (mir_ty::Ty<'tcx>, FormulaOrTerm<rty::FunctionParamIdx>) {
+        match arg.kind {
+            rustc_hir::ExprKind::AddrOf(
+                rustc_hir::BorrowKind::Ref,
+                rustc_hir::Mutability::Not,
+                operand,
+            ) => (self.expr_ty(operand), self.to_formula_or_term(operand)),
+            _ => (
+                self.expr_ty(arg).peel_refs(),
+                FormulaOrTerm::Term(self.to_term(arg).box_current()),
+            ),
+        }
+    }
+
+    /// The type and term of a plain operand of `==` or `!=`.
+    fn plain_operand(
+        &self,
+        expr: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> (mir_ty::Ty<'tcx>, chc::Term<rty::FunctionParamIdx>) {
+        (self.expr_ty(expr), self.to_term(expr))
+    }
+
+    /// A specification's `lhs == rhs` or `lhs != rhs` (`op`), the only place these atoms are
+    /// built, from the operands' types (at the instance the formula is translated for, so a
+    /// generic contract is checked at each type it is used at) and terms. It stops at an operand holding a value without
+    /// a model (`model_eq::modelless_part`: a `str`, a raw or function pointer, a trait object,
+    /// also in a field of a local type): its model is the null sort, so `==` would hold of any two
+    /// values and `!=` of none, and a contract stating either would not describe the function (a
+    /// `!=` in a trusted `ensures` makes the code after the call vacuous).
+    fn equality(
+        &self,
+        span: rustc_span::Span,
+        (lhs_ty, lhs): (mir_ty::Ty<'tcx>, chc::Term<rty::FunctionParamIdx>),
+        op: AmbiguousBinOp,
+        (rhs_ty, rhs): (mir_ty::Ty<'tcx>, chc::Term<rty::FunctionParamIdx>),
+    ) -> FormulaOrTerm<rty::FunctionParamIdx> {
+        for ty in [lhs_ty, rhs_ty] {
+            let modelless = self.def_ids.model_ty().and_then(|model_ty| {
+                analyze::model_eq::modelless_part(self.tcx, self.tcx.parent(model_ty), ty)
+            });
+            if let Some(part) = modelless {
+                self.tcx.dcx().span_fatal(
+                    span,
+                    format!(
+                        "thrust: a specification cannot compare values of `{ty}`: its `{part}` \
+                         has no model, so `==` would hold of any two values and `!=` of none"
+                    ),
+                );
+            }
+        }
+        FormulaOrTerm::BinOp(lhs, op, rhs)
+    }
+
+    fn to_term(&self, hir: &'tcx rustc_hir::Expr<'tcx>) -> chc::Term<rty::FunctionParamIdx> {
+        let Some(term) = self.to_formula_or_term(hir).into_term() else {
+            self.tcx.dcx().span_fatal(
+                hir.span,
+                "thrust: a predicate call, `pre!`, `post!`, quantifier or Boolean `match` in a \
+                 specification is a formula, not a value: in a `requires`, `ensures`, predicate or \
+                 quantifier body it can be an operand of `&&`, `||`, `!`, `==` or `!=`, or the \
+                 condition of an `if` whose branches are Boolean; it cannot be the value of a \
+                 `#[logic]` function, an argument of a call or the operand of a cast",
+            );
+        };
+        let (mut_derefs, _) = self.mut_derefs(hir);
+        (0..mut_derefs).fold(term, |term, _| term.mut_current())
+    }
+
+    fn receiver_closure_ty(&self, ty: mir_ty::Ty<'tcx>) -> Option<mir_ty::Ty<'tcx>> {
+        let inner = match ty.kind() {
+            mir_ty::TyKind::Adt(adt, args) if Some(adt.did()) == self.def_ids.mut_model() => {
+                args.type_at(0)
+            }
+            mir_ty::TyKind::Ref(_, inner_ty, mir_ty::Mutability::Not) => *inner_ty,
+            _ => ty,
+        };
+        match inner.kind() {
+            mir_ty::TyKind::Adt(adt, args) if Some(adt.did()) == self.def_ids.closure_model() => {
+                Some(args.type_at(0))
+            }
+            _ => None,
+        }
+    }
+
+    /// The closure a receiver of type `ty` calls, and the number of shared references around it
+    /// in the instantiation of the receiver's closure type parameter: `&F` calls `F`
+    /// (`impl Fn for &F`), so its `pre!` and `post!` are those of `F` at `*self`, as in Creusot.
+    fn receiver_closure_behind_refs(
+        &self,
+        ty: mir_ty::Ty<'tcx>,
+    ) -> Option<(mir_ty::Ty<'tcx>, usize)> {
+        let mut closure_ty = self.receiver_closure_ty(ty)?;
+        let mut refs = 0;
+        while let mir_ty::TyKind::Ref(_, inner_ty, mir_ty::Mutability::Not) = closure_ty.kind() {
+            closure_ty = *inner_ty;
+            refs += 1;
+        }
+        Some((closure_ty, refs))
+    }
+
+    /// The precondition of `fn_ty` at `args`, as a `pre!` names it.
+    fn precondition_at(
+        &self,
+        fn_ty: &rty::FunctionType,
+        args: &[chc::Term<rty::FunctionParamIdx>],
+    ) -> chc::Formula<rty::FunctionParamIdx> {
+        let mut fresh = || {
+            self.analyzer
+                .generate_user_quantified_var("a part of an argument in pre!".to_owned())
+        };
+        let mut parts = rty::PartVars {
+            defs: &self.analyzer.enum_defs,
+            fresh: &mut fresh,
+        };
+        fn_ty.precondition_formula(args, &mut parts)
+    }
+
+    /// The receiver term as the closure's own body takes it, and the final state it leaves free.
+    ///
+    /// That body takes the upvars by `&`, by `&mut`, or by value, following the kind inferred
+    /// for the closure, while `pre!`/`post!` reach the closure through the parameter the
+    /// annotated function declares. A call bridges the two by borrowing the closure into the
+    /// receiver the body takes; the same borrow is taken here on the term.
+    ///
+    /// An `FnMut` closure held as a value is called through a `&mut` to it whose final state
+    /// the call does not fix, so the pair's final half is a fresh variable, returned with its
+    /// sort for the caller to quantify.
+    fn closure_receiver_term(
+        &self,
+        receiver: &'tcx rustc_hir::Expr<'tcx>,
+        fn_ty: &rty::FunctionType,
+        in_spec: &str,
+    ) -> (
+        chc::Term<rty::FunctionParamIdx>,
+        Option<(chc::UserQuantifiedVarId, chc::Sort)>,
+    ) {
+        let receiver_ty = self.expr_ty(receiver);
+        let mut held_as = match receiver_ty.kind() {
+            mir_ty::TyKind::Adt(adt, _) if Some(adt.did()) == self.def_ids.mut_model() => {
+                Some(rty::RefKind::Mut)
+            }
+            mir_ty::TyKind::Ref(_, _, mir_ty::Mutability::Not) => Some(rty::RefKind::Immut),
+            _ => None,
+        };
+        let upvars_ty = &fn_ty.params[rty::FunctionParamIdx::from(0usize)].ty;
+        let received_as = match upvars_ty.as_pointer().map(|ty| ty.kind) {
+            Some(rty::PointerKind::Ref(kind)) => Some(kind),
+            _ => None,
+        };
+
+        let mut term = self.to_term(receiver);
+        let refs = self
+            .receiver_closure_behind_refs(receiver_ty)
+            .map_or(0, |(_, refs)| refs);
+        if refs > 0 {
+            term = match held_as {
+                Some(rty::RefKind::Mut) => term.mut_current(),
+                Some(rty::RefKind::Immut) => term.box_current(),
+                None => term,
+            };
+            for _ in 1..refs {
+                term = term.box_current();
+            }
+            held_as = Some(rty::RefKind::Immut);
+        }
+        match (held_as, received_as) {
+            (None, Some(rty::RefKind::Immut)) => (chc::Term::box_(term), None),
+            (None, Some(rty::RefKind::Mut)) => {
+                let sort = upvars_ty.to_sort().deref();
+                let final_ = self
+                    .analyzer
+                    .generate_user_quantified_var(format!("final state of a closure in {in_spec}"));
+                let final_term = chc::Term::UserQuantifiedVar(sort.clone(), final_);
+                (chc::Term::mut_(term, final_term), Some((final_, sort)))
+            }
+            (Some(rty::RefKind::Mut), Some(rty::RefKind::Immut)) => {
+                (chc::Term::box_(term.mut_current()), None)
+            }
+            _ => (term, None),
+        }
+    }
+
+    /// Where the `Fn` bound of a receiver's closure type parameter is stated, `refs` shared
+    /// references in: behind a reference, the parameter is the analyzed function's (`G = &H`),
+    /// whose own predicates state `H: Fn(..)`; otherwise it is the annotated function's.
+    fn closure_bound_owner(&self, refs: usize) -> (LocalDefId, mir_ty::GenericArgsRef<'tcx>) {
+        match self.type_builder.owner_fn_id().as_local() {
+            Some(owner) if refs > 0 => (owner, mir_ty::GenericArgs::empty()),
+            _ => (self.local_def_id, self.generic_args),
+        }
+    }
+
+    /// Resolves the [`rty::FunctionType`] of the closure contract referred to by the receiver.
+    ///
+    /// The receiver type is instantiated to the actual closure type in the formula function; its
+    /// `DefId` is used to look up the contract collected by the analyzer.
+    fn receiver_closure_fn_type(&self, receiver_ty: mir_ty::Ty<'tcx>) -> Option<rty::FunctionType> {
+        let (closure_ty, refs) = self.receiver_closure_behind_refs(receiver_ty)?;
+        let mir_ty::TyKind::Closure(def_id, args) = closure_ty.kind() else {
+            if let mir_ty::TyKind::Param(ty) = closure_ty.kind() {
+                tracing::debug!("ParamTy is found: {ty:?}");
+                let (bound_owner, bound_args) = self.closure_bound_owner(refs);
+                let closure_fun_ty =
+                    self.type_builder
+                        .build_closure_type_for_param(*ty, bound_owner, bound_args);
+                tracing::debug!(
+                    "the obtained FunctionType for the closure {ty:?}: {closure_fun_ty:#?}"
+                );
+                if let Some(closure_fun_ty) = closure_fun_ty.clone() {
+                    self.type_builder.register_closure_type_param(
+                        analyze::TypeParam::GenericType {
+                            param_def_id: self.type_builder.param_def_id(ty),
+                            local_idx: self.type_builder.param_local_idx(ty),
+                        },
+                        closure_fun_ty,
+                    );
+                };
+                return closure_fun_ty;
+            }
+            return None;
+        };
+        self.analyzer.known_function_ty_with_args(
+            *def_id,
+            self.tcx.mk_args(args.as_closure().parent_args()),
+            self.type_builder.owner_fn_id(),
+        )
+    }
+
+    fn is_logic(&self, def_id: DefId) -> bool {
+        self.tcx
+            .get_attrs_by_path(def_id, &analyze::annot::logic_path())
+            .next()
+            .is_some()
+    }
+
+    /// The sorts of the parameters and of the result of the function `def_id` at `generic_args`,
+    /// read from its signature, so that every call of a universally quantified function declares
+    /// it with the same sorts whatever coercions its arguments went through.
+    fn signature_sorts(
+        &self,
+        def_id: DefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> (Vec<chc::Sort>, chc::Sort) {
+        let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, generic_args);
+        let sig = self.tcx.instantiate_bound_regions_with_erased(sig);
+        let typing_env = mir_ty::TypingEnv::fully_monomorphized();
+        let sort = |ty: mir_ty::Ty<'tcx>| {
+            let ty = self
+                .tcx
+                .try_normalize_erasing_regions(typing_env, ty)
+                .unwrap_or(ty);
+            self.type_builder.build(ty).to_sort()
+        };
+        (
+            sig.inputs().iter().map(|ty| sort(*ty)).collect(),
+            sort(sig.output()),
+        )
+    }
+
+    /// A trait's logic function called at a type parameter, which stands for every
+    /// implementation: a universally quantified function, as a trait predicate is.
+    fn trait_logic_fn_term(
+        &self,
+        def_id: DefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+        args: &'tcx [rustc_hir::Expr<'tcx>],
+    ) -> chc::Term<rty::FunctionParamIdx> {
+        let type_params = generic_args
+            .types()
+            .map(|ty| self.type_builder.build(ty).to_sort())
+            .collect();
+        let (params, result) = self.signature_sorts(def_id, generic_args);
+        let type_args = self.type_builder.generic_args_symbol(generic_args);
+        let pred =
+            refine::trait_forall_fn(self.tcx, def_id, type_args, type_params, params, result);
+        self.register_forall_pred(pred.clone());
+        self.analyzer.register_forall_pred_origin(
+            pred.clone(),
+            def_id,
+            generic_args,
+            self.type_builder.owner_fn_id(),
+        );
+        let arg_terms = args.iter().map(|e| self.to_term(e)).collect();
+        chc::Term::ForallFn(pred, arg_terms)
+    }
+
+    fn register_forall_pred(&self, forall_pred: chc::ForallPred) {
+        self.analyzer
+            .system
+            .borrow_mut()
+            .register_forall_pred(forall_pred.clone());
+    }
+
+    /// The logical argument terms passed to `closure_precondition`/`closure_postcondition` as a
+    /// single tuple (e.g. `(x,)` or `()`), for a callee of the signature `sig`.
+    ///
+    /// `closure_precondition` takes the tuple at any type, so this stops unless there is one
+    /// argument per parameter and each has its parameter's model type ([`Self::spec_value_agrees`]),
+    /// the comparison rustc makes of Creusot's `precondition` and Verus's `requires`, whose tuple is
+    /// the closure's `Args`, made here on the models a specification computes with.
+    fn spec_args(
+        &self,
+        spec: &str,
+        args: &'tcx rustc_hir::Expr<'tcx>,
+        sig: &CalleeSig<'tcx>,
+    ) -> Vec<chc::Term<rty::FunctionParamIdx>> {
+        let exprs = match args.kind {
+            rustc_hir::ExprKind::Tup(elems) => elems.iter().collect(),
+            _ => vec![args],
+        };
+        if exprs.len() != sig.inputs.len() {
+            self.tcx.dcx().span_fatal(
+                args.span,
+                format!(
+                    "`{spec}` arity mismatch: the callee takes {} argument(s), given {}",
+                    sig.inputs.len(),
+                    exprs.len()
+                ),
+            );
+        }
+        for (expr, input) in exprs.iter().zip(&sig.inputs) {
+            self.check_spec_value_type(spec, expr, *input, "the callee takes");
+        }
+        exprs.into_iter().map(|e| self.to_term(e)).collect()
+    }
+
+    /// The result term of a `post!`, which stops unless it has the model type of what the callee of
+    /// the signature `sig` returns.
+    fn post_result(
+        &self,
+        result: &'tcx rustc_hir::Expr<'tcx>,
+        sig: &CalleeSig<'tcx>,
+    ) -> chc::Term<rty::FunctionParamIdx> {
+        self.check_spec_value_type("post!", result, sig.output, "the callee returns");
+        self.to_term(result)
+    }
+
+    /// Stops unless `expr`, a value a `pre!`/`post!` passes, has the model type of `expected`, a
+    /// type of the callee's Rust signature.
+    fn check_spec_value_type(
+        &self,
+        spec: &str,
+        expr: &'tcx rustc_hir::Expr<'tcx>,
+        expected: mir_ty::Ty<'tcx>,
+        expected_as: &str,
+    ) {
+        let ty = self.expr_ty(expr);
+        let expected_model = self.type_builder.resolve_model_ty(expected);
+        if !self.spec_value_agrees(ty, expected_model) {
+            self.tcx.dcx().span_fatal(
+                expr.span,
+                format!("`{spec}` passes a value of type `{ty}` where {expected_as} `{expected}`"),
+            );
+        }
+    }
+
+    /// Whether a specification value of type `value` can stand for one of the model type
+    /// `expected`: the same type, const arguments included, where a shared reference or a box is
+    /// its referent (the query removes them), the integer models and the Rust integers are one
+    /// type (a formula's integers are unbounded, and a literal is typed `i32`), and a projection
+    /// that neither side's model resolves agrees only with the same projection at the same Rust
+    /// arguments, as in rustc and as the type builder gives each its own sort.
+    /// Both types are stated in the specification's
+    /// generics at the arguments it is translated at, the callee's signature through the
+    /// receiver's type, so a type parameter is itself.
+    fn spec_value_agrees(&self, value: mir_ty::Ty<'tcx>, expected: mir_ty::Ty<'tcx>) -> bool {
+        use mir_ty::TyKind;
+        let value = self.spec_value_view(value);
+        let expected = self.spec_value_view(expected);
+        let agree = |a: mir_ty::Ty<'tcx>, b: mir_ty::Ty<'tcx>| self.spec_value_agrees(a, b);
+        let args_agree = |a: mir_ty::GenericArgsRef<'tcx>, b: mir_ty::GenericArgsRef<'tcx>| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| match (a.kind(), b.kind()) {
+                        (mir_ty::GenericArgKind::Type(a), mir_ty::GenericArgKind::Type(b)) => {
+                            agree(a, b)
+                        }
+                        (mir_ty::GenericArgKind::Lifetime(_), _) => true,
+                        _ => a == b,
+                    })
+        };
+        match (value.kind(), expected.kind()) {
+            (TyKind::Alias(a_kind, a), TyKind::Alias(b_kind, b)) => {
+                a_kind == b_kind && a.def_id == b.def_id && a.args == b.args
+            }
+            _ if self.is_integer_model(value) && self.is_integer_model(expected) => true,
+            (TyKind::Adt(a, a_args), TyKind::Adt(b, b_args)) => {
+                a.did() == b.did() && args_agree(a_args, b_args)
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| agree(a, b))
+            }
+            (TyKind::Array(a, a_len), TyKind::Array(b, b_len)) => a_len == b_len && agree(*a, *b),
+            (TyKind::Slice(a), TyKind::Slice(b)) => agree(*a, *b),
+            (TyKind::Ref(_, a, a_mut), TyKind::Ref(_, b, b_mut)) => a_mut == b_mut && agree(*a, *b),
+            _ => value == expected,
+        }
+    }
+
+    /// `ty` as [`Self::spec_value_agrees`] compares it: without lifetimes, shared references,
+    /// boxes and `Ghost`, with `Closure<F>` as `F` and a model `<X as Model>::Ty` that `expr_ty`
+    /// left as a projection resolved as the expected side is (`resolve_model_ty`), as
+    /// [`TypeBuilder`] builds them.
+    fn spec_value_view(&self, ty: mir_ty::Ty<'tcx>) -> mir_ty::Ty<'tcx> {
+        use mir_ty::TyKind;
+        let mut ty = self.tcx.erase_regions(ty);
+        loop {
+            ty = match ty.kind() {
+                TyKind::Ref(_, inner, mir_ty::Mutability::Not) => *inner,
+                _ if ty.is_box() => ty.expect_boxed_ty(),
+                TyKind::Adt(adt, args)
+                    if Some(adt.did()) == self.def_ids.box_model()
+                        || Some(adt.did()) == self.def_ids.closure_model() =>
+                {
+                    args.type_at(0)
+                }
+                TyKind::Adt(adt, args) if Some(adt.did()) == self.def_ids.ghost_model() => {
+                    self.type_builder.resolve_model_ty(args.type_at(0))
+                }
+                TyKind::Alias(mir_ty::AliasTyKind::Projection, alias)
+                    if Some(alias.def_id) == self.def_ids.model_ty() =>
+                {
+                    let resolved = self
+                        .tcx
+                        .erase_regions(self.type_builder.resolve_model_ty(alias.args.type_at(0)));
+                    if resolved == ty {
+                        return ty;
+                    }
+                    resolved
+                }
+                _ => return ty,
+            };
+        }
+    }
+
+    /// Whether `ty` is a Rust integer type or an integer model (`Int`, `UInt`, `IntN`, `UIntN`),
+    /// all of which a query reads as one integer sort.
+    fn is_integer_model(&self, ty: mir_ty::Ty<'tcx>) -> bool {
+        match ty.kind() {
+            mir_ty::TyKind::Int(_) | mir_ty::TyKind::Uint(_) => true,
+            mir_ty::TyKind::Adt(adt, _) => [
+                self.def_ids.int_model(),
+                self.def_ids.uint_model(),
+                self.def_ids.int_n_model(),
+                self.def_ids.uint_n_model(),
+            ]
+            .contains(&Some(adt.did())),
+            _ => false,
+        }
+    }
+
+    /// The Rust signature of the function a receiver names by its path.
+    fn receiver_fn_def_sig(&self, receiver: &'tcx rustc_hir::Expr<'tcx>) -> CalleeSig<'tcx> {
+        let mir_ty::TyKind::FnDef(def_id, generic_args) = *self.expr_ty(receiver).kind() else {
+            panic!("a receiver named by its path is a function item");
+        };
+        self.fn_def_sig(def_id, generic_args)
+    }
+
+    /// The Rust signature of the function item `def_id` at `generic_args`, which are stated in the
+    /// specification's generics.
+    fn fn_def_sig(
+        &self,
+        def_id: DefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+    ) -> CalleeSig<'tcx> {
+        let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, generic_args);
+        let sig = self.tcx.instantiate_bound_regions_with_erased(sig);
+        CalleeSig {
+            inputs: sig.inputs().to_vec(),
+            output: sig.output(),
+        }
+    }
+
+    /// The Rust signature of the closure a closure-typed receiver of type `receiver_ty` calls: a
+    /// closure's own, or the `Fn` bound of a closure type parameter, found where
+    /// [`Self::receiver_closure_fn_type`] finds it. It is read after that function has found the
+    /// closure's contract, so the receiver is a closure and a type parameter has its bound.
+    fn closure_sig(&self, receiver_ty: mir_ty::Ty<'tcx>) -> CalleeSig<'tcx> {
+        let (closure_ty, refs) = self
+            .receiver_closure_behind_refs(receiver_ty)
+            .expect("the receiver of a closure contract is a closure");
+        match *closure_ty.kind() {
+            mir_ty::TyKind::Closure(_, args) => {
+                let sig = self
+                    .tcx
+                    .instantiate_bound_regions_with_erased(args.as_closure().sig());
+                CalleeSig {
+                    inputs: sig.inputs()[0].tuple_fields().to_vec(),
+                    output: sig.output(),
+                }
+            }
+            mir_ty::TyKind::Param(param) => {
+                let (bound_owner, bound_args) = self.closure_bound_owner(refs);
+                let (call, output) = self
+                    .type_builder
+                    .closure_param_bound(param, bound_owner, bound_args)
+                    .expect("a closure type parameter has an `Fn` bound");
+                let call = self.tcx.instantiate_bound_regions_with_erased(call);
+                let output = self.tcx.instantiate_bound_regions_with_erased(output);
+                CalleeSig {
+                    inputs: call.trait_ref.args.type_at(1).tuple_fields().to_vec(),
+                    output: output.term.expect_type(),
+                }
+            }
+            _ => panic!("the receiver of a closure contract is a closure: {closure_ty:?}"),
+        }
+    }
+
+    /// The contract of the function a `pre!`/`post!` receiver names by its path, such as
+    /// `<F as Deref>::deref`. At type arguments that still name type parameters it is the
+    /// contract a call there is given: the trait-level spec when there is one, and otherwise one
+    /// whose precondition is `true`, which holds at an instance only if the impl reached accepts
+    /// any arguments, so `pre!` records it to be checked there as a call does. At other type
+    /// arguments it is the contract of the function the path resolves to.
+    fn fn_item_contract(
+        &self,
+        receiver: &'tcx rustc_hir::Expr<'tcx>,
+        names_precondition: bool,
+    ) -> Option<rty::FunctionType> {
+        let mir_ty::TyKind::FnDef(def_id, generic_args) = *self.expr_ty(receiver).kind() else {
+            return None;
+        };
+        Some(self.fn_def_contract(receiver.span, def_id, generic_args, names_precondition))
+    }
+
+    /// The function item a closure-typed receiver is: `G` instantiated with a function item,
+    /// which is a closure without captures (`Closure<fn item>`), possibly behind shared
+    /// references. Its `pre!` and `post!` are the contract of the function.
+    fn receiver_fn_item(
+        &self,
+        receiver_ty: mir_ty::Ty<'tcx>,
+    ) -> Option<(mir_ty::Ty<'tcx>, DefId, mir_ty::GenericArgsRef<'tcx>)> {
+        let (inner, _) = self.receiver_closure_behind_refs(receiver_ty)?;
+        match *inner.kind() {
+            mir_ty::TyKind::FnDef(def_id, args) => Some((inner, def_id, args)),
+            _ => None,
+        }
+    }
+
+    fn fn_def_contract(
+        &self,
+        span: rustc_span::Span,
+        def_id: DefId,
+        generic_args: mir_ty::GenericArgsRef<'tcx>,
+        names_precondition: bool,
+    ) -> rty::FunctionType {
+        let owner_fn_id = self.type_builder.owner_fn_id();
+        let typing_env =
+            analyze::predicate_typing_env(self.tcx, owner_fn_id, self.def_ids.model_ty());
+        let instance =
+            mir_ty::Instance::try_resolve(self.tcx, typing_env, def_id, generic_args).unwrap();
+        let Some(instance) = instance else {
+            let known = self
+                .analyzer
+                .trait_method_contract_written(def_id)
+                .then(|| {
+                    self.analyzer
+                        .known_function_ty_with_args(def_id, generic_args, owner_fn_id)
+                })
+                .flatten();
+            if let Some(fn_ty) = known {
+                return fn_ty;
+            }
+            if names_precondition {
+                self.analyzer
+                    .record_assumed_total_method(owner_fn_id, def_id, generic_args);
+            }
+            return self
+                .type_builder
+                .build_unspecified_method_type(def_id, generic_args);
+        };
+        let fn_ty = self.analyzer.known_function_ty_with_args(
+            instance.def_id(),
+            instance.args,
+            owner_fn_id,
+        );
+        fn_ty.unwrap_or_else(|| {
+            self.tcx.dcx().span_fatal(
+                span,
+                format!("`pre!`/`post!` names `{instance}`, which has no contract here"),
+            )
+        })
+    }
+
+    /// Records that the formula reads the precondition of `ty` ([`FormulaFn::pre_receivers`]).
+    fn record_pre_receiver(&self, ty: mir_ty::Ty<'tcx>) {
+        let ty = self.tcx.erase_regions(ty);
+        let mut receivers = self.pre_receivers.borrow_mut();
+        if !receivers.contains(&ty) {
+            receivers.push(ty);
+        }
+    }
+
+    /// The values of a closure's parameters: the closure's first (RustCall) parameter is its
+    /// upvars, which are the closure value itself, followed by the logical arguments.
+    fn translate_closure_precondition(
+        &self,
+        receiver: &'tcx rustc_hir::Expr<'tcx>,
+        args: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> FormulaOrTerm<rty::FunctionParamIdx> {
+        if let Some(fn_ty) = self.fn_item_contract(receiver, true) {
+            self.record_pre_receiver(self.expr_ty(receiver));
+            let args = self.spec_args("pre!", args, &self.receiver_fn_def_sig(receiver));
+            return FormulaOrTerm::Formula(self.precondition_at(&fn_ty, &args));
+        }
+        let receiver_ty = self.expr_ty(receiver);
+        if let Some(closure_ty) = self.receiver_closure_ty(receiver_ty) {
+            self.record_pre_receiver(closure_ty);
+        }
+        if let Some((fn_item_ty, def_id, generic_args)) = self.receiver_fn_item(receiver_ty) {
+            // The function item itself, behind the references `G` is instantiated with, is what
+            // the `pre!` names: a hand-over states its precondition as it does a path's.
+            self.record_pre_receiver(fn_item_ty);
+            let fn_ty = self.fn_def_contract(receiver.span, def_id, generic_args, true);
+            let args = self.spec_args("pre!", args, &self.fn_def_sig(def_id, generic_args));
+            return FormulaOrTerm::Formula(self.precondition_at(&fn_ty, &args));
+        }
+        let fn_ty = self
+            .receiver_closure_fn_type(receiver_ty)
+            .unwrap_or_else(|| {
+                self.tcx.dcx().span_fatal(
+                    receiver.span,
+                    format!(
+                        "thrust: `pre!` of a value of `{}` is not supported: it \
+                         takes a closure, a closure type parameter, or a shared reference to \
+                         one",
+                        self.receiver_closure_ty(receiver_ty).unwrap_or(receiver_ty)
+                    ),
+                )
+            });
+        // `fn_ty` is a closure (RustCall ABI), so its parameters are `[upvars, args..]`, where
+        // the upvars are the closure value itself.
+        let logical_args = self.spec_args("pre!", args, &self.closure_sig(receiver_ty));
+        let (receiver_term, final_state) = self.closure_receiver_term(receiver, &fn_ty, "pre!");
+        let param_args: Vec<_> = std::iter::once(receiver_term).chain(logical_args).collect();
+        let pre = self.precondition_at(&fn_ty, &param_args);
+        // The precondition of an `FnMut` closure held as a value is a property of its current
+        // state, as Creusot's `FnMut` precondition takes `self` by value, so it must hold
+        // whatever the final state is.
+        FormulaOrTerm::Formula(match final_state {
+            Some(var) => chc::Formula::forall(vec![var], pre),
+            None => pre,
+        })
+    }
+
+    fn translate_closure_postcondition(
+        &self,
+        receiver: &'tcx rustc_hir::Expr<'tcx>,
+        args: &'tcx rustc_hir::Expr<'tcx>,
+        result: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> FormulaOrTerm<rty::FunctionParamIdx> {
+        if let Some(fn_ty) = self.fn_item_contract(receiver, false) {
+            let sig = self.receiver_fn_def_sig(receiver);
+            let args = self.spec_args("post!", args, &sig);
+            let result = self.post_result(result, &sig);
+            return FormulaOrTerm::Formula(fn_ty.postcondition_formula(&args, result));
+        }
+        let receiver_ty = self.expr_ty(receiver);
+        if let Some((_, def_id, generic_args)) = self.receiver_fn_item(receiver_ty) {
+            let fn_ty = self.fn_def_contract(receiver.span, def_id, generic_args, false);
+            let sig = self.fn_def_sig(def_id, generic_args);
+            let args = self.spec_args("post!", args, &sig);
+            let result = self.post_result(result, &sig);
+            return FormulaOrTerm::Formula(fn_ty.postcondition_formula(&args, result));
+        }
+        let fn_ty = self
+            .receiver_closure_fn_type(receiver_ty)
+            .unwrap_or_else(|| {
+                self.tcx.dcx().span_fatal(
+                    receiver.span,
+                    format!(
+                        "thrust: `post!` of a value of `{}` is not supported: it \
+                         takes a closure, a closure type parameter, or a shared reference to \
+                         one",
+                        self.receiver_closure_ty(receiver_ty).unwrap_or(receiver_ty)
+                    ),
+                )
+            });
+        // `fn_ty` is a closure (RustCall ABI), so its parameters are `[upvars, args..]`, where
+        // the upvars are the closure value itself.
+        let sig = self.closure_sig(receiver_ty);
+        let logical_args = self.spec_args("post!", args, &sig);
+        let (receiver_term, final_state) = self.closure_receiver_term(receiver, &fn_ty, "post!");
+        if final_state.is_some() {
+            if let Some((closure_ty, _)) = self.receiver_closure_behind_refs(receiver_ty) {
+                if let mir_ty::TyKind::Param(param) = closure_ty.kind() {
+                    self.analyzer
+                        .record_once_post_param(self.type_builder.param_def_id(param));
+                }
+            }
+        }
+        let param_args: Vec<_> = std::iter::once(receiver_term).chain(logical_args).collect();
+        let result = self.post_result(result, &sig);
+        let mut fresh = || {
+            self.analyzer.generate_user_quantified_var(
+                "a part of a closure's final state in post!".to_owned(),
+            )
+        };
+        let mut parts = rty::PartVars {
+            defs: &self.analyzer.enum_defs,
+            fresh: &mut fresh,
+        };
+        let post = fn_ty.once_postcondition_formula(&param_args, result, final_state, &mut parts);
+        FormulaOrTerm::Formula(post)
+    }
+
+    fn translate_closure_hist_inv(
+        &self,
+        from: &'tcx rustc_hir::Expr<'tcx>,
+        to: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> FormulaOrTerm<rty::FunctionParamIdx> {
+        let model_ty = self.expr_ty(from);
+        let closure_ty = match model_ty.kind() {
+            mir_ty::TyKind::Adt(adt, args) if Some(adt.did()) == self.def_ids.closure_model() => {
+                args.type_at(0)
+            }
+            _ => panic!(
+                "hist_inv! takes two closure states (`Closure<F>`): {:?}",
+                from
+            ),
+        };
+        let from_span = from.span;
+        let from = self.to_term(from);
+        let to = self.to_term(to);
+        let formula = match closure_ty.kind() {
+            mir_ty::TyKind::Closure(..) => {
+                let upvars_sort = self.type_builder.build(model_ty).to_sort();
+                self.analyzer
+                    .closure_hist_inv_definition(closure_ty, &upvars_sort, from, to)
+            }
+            mir_ty::TyKind::Param(param_ty) => {
+                let pred = self.closure_hist_inv_pred(*param_ty, model_ty);
+                chc::Atom::new(pred.into(), vec![from, to]).into()
+            }
+            _ => self.tcx.dcx().span_fatal(
+                from_span,
+                format!(
+                    "thrust: `hist_inv!` is not supported at `{closure_ty}`: it takes a closure \
+                     or a closure type parameter"
+                ),
+            ),
+        };
+        FormulaOrTerm::Formula(formula)
+    }
+
+    /// The relation of the closure type parameter `param_ty`, one symbol per parameter as its
+    /// contract is, with its laws.
+    fn closure_hist_inv_pred(
+        &self,
+        param_ty: mir_ty::ParamTy,
+        model_ty: mir_ty::Ty<'tcx>,
+    ) -> chc::ForallPred {
+        let contract = self
+            .receiver_closure_fn_type(model_ty)
+            .unwrap_or_else(|| panic!("hist_inv! at {param_ty:?}, which has no closure bound"));
+        let param = param_ty.to_ty(self.tcx);
+        let sort = self.type_builder.build(param).to_sort();
+        let pred = refine::closure_hist_inv_forall_pred(
+            self.tcx,
+            self.type_builder.param_def_id(&param_ty),
+            self.type_builder
+                .generic_args_symbol(self.tcx.mk_args(&[param.into()])),
+            vec![sort.clone()],
+            vec![sort.clone(), sort],
+        );
+        self.register_forall_pred(pred.clone());
+        let mut system = self.analyzer.system.borrow_mut();
+        if system.laws_of(&pred).is_empty() {
+            for law in analyze::closure_hist_inv::laws(
+                &mut system,
+                &pred,
+                &contract,
+                &self.analyzer.enum_defs,
+            ) {
+                system.add_law(pred.clone(), law);
+            }
+        }
+        pred
+    }
+
+    fn node_arg_type_at(&self, hir_id: HirId, idx: usize) -> rty::Type<rty::Closed> {
+        let mut generic_args = self.typeck.node_args(hir_id);
+        if !self.generic_args.is_empty() {
+            generic_args =
+                mir_ty::EarlyBinder::bind(generic_args).instantiate(self.tcx, self.generic_args);
+        }
+        let elem_ty = generic_args.type_at(idx);
+        // Normalize before the type builder swaps a closure for its model: once that has
+        // happened an `Fn`-bounded impl no longer applies and a projection through it
+        // cannot be resolved any more.
+        let typing_env = mir_ty::TypingEnv::fully_monomorphized();
+        let elem_ty = self
+            .tcx
+            .try_normalize_erasing_regions(typing_env, elem_ty)
+            .unwrap_or(elem_ty);
+        self.type_builder.build(elem_ty).ty
+    }
+
+    fn variant_ctor_term(
+        &self,
+        variant_did: rustc_span::def_id::DefId,
+        result_ty: mir_ty::Ty<'tcx>,
+        field_terms: Vec<chc::Term<rty::FunctionParamIdx>>,
+    ) -> chc::Term<rty::FunctionParamIdx> {
+        let adt_did = self.tcx.parent(variant_did);
+        let d_sym = crate::refine::datatype_symbol(self.tcx, adt_did);
+        let variant_name = self.tcx.item_name(variant_did);
+        let v_sym = crate::refine::variant_symbol(&d_sym, variant_name);
+        let sort_args = if let mir_ty::TyKind::Adt(_, generic_args) = result_ty.kind() {
+            generic_args
+                .types()
+                .map(|ty| self.type_builder.build(ty).to_sort())
+                .collect()
+        } else {
+            panic!("expected an ADT type for variant constructor")
+        };
+        chc::Term::datatype_ctor(d_sym, sort_args, v_sym, field_terms)
+    }
+
+    fn const_term(
+        &self,
+        const_did: rustc_span::def_id::DefId,
+        hir: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> chc::Term<rty::FunctionParamIdx> {
+        let ty = self.expr_ty(hir);
+        let generic_args = mir_ty::EarlyBinder::bind(self.typeck.node_args(hir.hir_id))
+            .instantiate(self.tcx, self.generic_args);
+        let typing_env = mir_ty::TypingEnv::fully_monomorphized();
+        let unevaluated = mir::UnevaluatedConst::new(const_did, generic_args);
+        let val = self
+            .tcx
+            .const_eval_resolve(typing_env, unevaluated, hir.span)
+            .unwrap_or_else(|e| {
+                let hint = if matches!(e, rustc_middle::mir::interpret::ErrorHandled::TooGeneric(_))
+                {
+                    "its value depends on a type parameter, which is not supported in a contract"
+                } else {
+                    "its evaluation failed"
+                };
+                self.tcx.dcx().span_fatal(
+                    hir.span,
+                    format!(
+                        "the constant `{}` cannot be evaluated in a formula: {hint}",
+                        self.tcx.def_path_str(const_did)
+                    ),
+                )
+            });
+        let (_, term) = analyze::scalar_const_term(ty, &val)
+            .unwrap_or_else(|| unimplemented!("unsupported constant type in formula: {:?}", ty));
+        term
+    }
+
+    /// The parameters of an `exists` / `forall` closure as quantified variables, the range of
+    /// those of an integer type whose range is in use ([`rty::int_range`]), over which they range,
+    /// and the body.
+    fn to_formula_with_quantified_vars(&self, closure: &rustc_hir::Body<'tcx>) -> QuantifiedBody {
+        let mut inner_translator = self.clone();
+        let mut vars = Vec::new();
+        let mut range: Option<chc::Formula<rty::FunctionParamIdx>> = None;
+        for param in closure.params {
+            let rustc_hir::PatKind::Binding(_, hir_id, ident, None) = param.pat.kind else {
+                panic!(
+                    "exists/forall closure parameter must be a simple binding: {:?}",
+                    param.pat
+                );
+            };
+            let param_ty = self.pat_ty(param.pat);
+            let param_rty = self.type_builder.build(param_ty);
+            let sort = param_rty.to_sort();
+            let var = self
+                .analyzer
+                .generate_user_quantified_var(format!("{ident} at {:?}", param.pat.span));
+            let term = chc::Term::UserQuantifiedVar(sort.clone(), var);
+            if let Some(fact) = rty::int_range_formula(&param_rty.ty, term.clone()) {
+                range = Some(match range {
+                    Some(range) => range.and(fact),
+                    None => fact,
+                });
+            }
+            inner_translator.env.insert(hir_id, term);
+            vars.push((var, sort));
+        }
+        let body_formula = inner_translator.to_formula(closure.value);
+        (vars, range, body_formula)
+    }
+
+    /// The body of a one-parameter closure as a term, with the parameter bound to a fresh
+    /// quantified variable (the bound variable of `Array::from_fn`'s `lambda`).
+    fn to_term_with_quantified_var(
+        &self,
+        closure: &rustc_hir::Body<'tcx>,
+    ) -> (
+        chc::UserQuantifiedVarId,
+        chc::Sort,
+        chc::Term<rty::FunctionParamIdx>,
+    ) {
+        let [param] = closure.params else {
+            panic!("Array::from_fn closure must take exactly 1 parameter");
+        };
+        let rustc_hir::PatKind::Binding(_, hir_id, ident, None) = param.pat.kind else {
+            panic!(
+                "Array::from_fn closure parameter must be a simple binding: {:?}",
+                param.pat
+            );
+        };
+        let param_ty = self.pat_ty(param.pat);
+        let sort = self.type_builder.build(param_ty).to_sort();
+        let var = self
+            .analyzer
+            .generate_user_quantified_var(format!("{ident} at {:?}", param.pat.span));
+        let mut inner_translator = self.clone();
+        inner_translator
+            .env
+            .insert(hir_id, chc::Term::UserQuantifiedVar(sort.clone(), var));
+        let body = inner_translator.to_term(closure.value);
+        (var, sort, body)
+    }
+
+    /// A `match` whose arm bodies are formulas, `matches!` among them: the disjunction, over
+    /// the arms, of an arm's body under the condition that it is the first arm to match. An
+    /// arm's body and guard read its bindings ([`Self::arm_pattern`]) only under its
+    /// condition, which holds the tester of each variant whose fields they read.
+    fn match_formula(
+        &self,
+        scrutinee: &'tcx rustc_hir::Expr<'tcx>,
+        arms: &'tcx [rustc_hir::Arm<'tcx>],
+    ) -> chc::Formula<rty::FunctionParamIdx> {
+        let scrutinee = self.to_term(scrutinee);
+        let mut earlier_misses = Vec::new();
+        let mut disjuncts = Vec::new();
+        for arm in arms {
+            let (cond, arm_translator) = self.arm_pattern(scrutinee.clone(), arm.pat);
+            let mut hit = cond.into_formula();
+            if let Some(guard) = arm.guard {
+                hit = hit.and(arm_translator.to_formula(guard));
+            }
+            let body = arm_translator.to_formula(arm.body);
+            if !body.is_bottom() {
+                let mut conjuncts = earlier_misses.clone();
+                conjuncts.extend([hit.clone(), body]);
+                disjuncts.push(chc::Formula::And(conjuncts));
+            }
+            earlier_misses.push(hit.not());
+        }
+        let mut formula = chc::Formula::Or(disjuncts);
+        formula.simplify();
+        formula
+    }
+
+    /// A `match` whose arm bodies are values of a type other than `bool`: the `ite` over the
+    /// arms in order, each condition testing the variants by the discriminant. The last arm is
+    /// the value where no earlier arm matches, as Verus and Why3 translate a `match`: rustc has
+    /// checked that the arms are exhaustive, so its pattern holds of every Rust value there and
+    /// its selectors are read under their testers. A value of the datatype that no Rust value
+    /// is (a variant whose payload is uninhabited, which rustc lets a `match` omit) also takes
+    /// the last arm, with its fields at unspecified values of their sorts. A guard on the last
+    /// arm is rejected, as Verus rejects one: the arm would then be the fallback of values its
+    /// guard does not hold of.
+    fn match_term(
+        &self,
+        scrutinee: &'tcx rustc_hir::Expr<'tcx>,
+        arms: &'tcx [rustc_hir::Arm<'tcx>],
+    ) -> chc::Term<rty::FunctionParamIdx> {
+        let scrutinee = self.to_term(scrutinee);
+        let (last, earlier) = arms
+            .split_last()
+            .expect("a `match` on an inhabited type has an arm");
+        if let Some(guard) = last.guard {
+            self.tcx.dcx().span_fatal(
+                guard.span,
+                "a guard on the last arm of a `match` of a non-Boolean type is not supported in \
+                 formulas; add an arm after it",
+            );
+        }
+        let (_, last_translator) = self.arm_pattern(scrutinee.clone(), last.pat);
+        let mut term = last_translator.to_term(last.body);
+        for arm in earlier.iter().rev() {
+            let (cond, arm_translator) = self.arm_pattern(scrutinee.clone(), arm.pat);
+            let mut hit = cond.into_term();
+            if let Some(guard) = arm.guard {
+                hit = hit.and(arm_translator.to_term(guard));
+            }
+            term = chc::Term::ite(hit, arm_translator.to_term(arm.body), term);
+        }
+        term
+    }
+
+    /// The condition under which `scrutinee` matches `pat`, and the translator for the arm,
+    /// in which each binding of `pat` names the part of `scrutinee` it binds.
+    fn arm_pattern(
+        &self,
+        scrutinee: chc::Term<rty::FunctionParamIdx>,
+        pat: &'tcx rustc_hir::Pat<'tcx>,
+    ) -> (PatCond<rty::FunctionParamIdx>, Self) {
+        let mut bindings = Vec::new();
+        let cond = self.pat_cond(scrutinee, pat, &mut bindings);
+        let mut arm_translator = self.clone();
+        arm_translator.env.extend(bindings);
+        (cond, arm_translator)
+    }
+
+    /// The condition under which `term` matches `pat`, with the term each binding of `pat`
+    /// stands for pushed onto `bindings`.
+    ///
+    /// Every enum is encoded as a datatype with one constructor per variant, so a variant
+    /// pattern is the datatype tester of that variant's constructor, and a variant's field is
+    /// the constructor's selector, which the condition reads only after the tester: a selector
+    /// applied to a value of another constructor is unspecified in SMT-LIB.
+    fn pat_cond(
+        &self,
+        term: chc::Term<rty::FunctionParamIdx>,
+        pat: &'tcx rustc_hir::Pat<'tcx>,
+        bindings: &mut Vec<(HirId, chc::Term<rty::FunctionParamIdx>)>,
+    ) -> PatCond<rty::FunctionParamIdx> {
+        use rustc_hir::PatKind;
+
+        let term = self.apply_pat_adjustments(term, pat);
+        match pat.kind {
+            PatKind::Wild => PatCond::All(Vec::new()),
+            PatKind::Binding(_, hir_id, _, subpat) => {
+                bindings.push((hir_id, self.bound_term(hir_id, pat.span, term.clone())));
+                match subpat {
+                    Some(subpat) => self.pat_cond(term, subpat, bindings),
+                    None => PatCond::All(Vec::new()),
+                }
+            }
+            // `&T` models as `&<T as Model>::Ty`, a box in the logic, as a deref in a formula
+            // reads it; `&mut T` models as `model::Mut`, which no `&mut` pattern matches.
+            PatKind::Ref(subpat, rustc_hir::Mutability::Not) => {
+                self.pat_cond(term.box_current(), subpat, bindings)
+            }
+            PatKind::Or(pats) => {
+                let bound = bindings.len();
+                let alternatives = pats
+                    .iter()
+                    .map(|p| self.pat_cond(term.clone(), p, bindings))
+                    .collect();
+                if bindings.len() != bound {
+                    self.tcx.dcx().span_fatal(
+                        pat.span,
+                        "a binding inside an or-pattern is not supported in formulas",
+                    );
+                }
+                PatCond::Any(alternatives)
+            }
+            PatKind::Expr(rustc_hir::PatExpr {
+                hir_id,
+                kind: rustc_hir::PatExprKind::Path(qpath),
+                ..
+            }) => {
+                let res = self.typeck.qpath_res(qpath, *hir_id);
+                self.adt_pat_cond(term, pat, res, Vec::new(), bindings)
+            }
+            PatKind::TupleStruct(qpath, subpats, dotdot) => {
+                let res = self.typeck.qpath_res(&qpath, pat.hir_id);
+                let arity = self.pat_adt(pat).variant_of_res(res).fields.len();
+                let fields = positional_subpats(subpats, dotdot, arity);
+                self.adt_pat_cond(term, pat, res, fields, bindings)
+            }
+            PatKind::Struct(qpath, pat_fields, _) => {
+                let res = self.typeck.qpath_res(&qpath, pat.hir_id);
+                let variant = self.pat_adt(pat).variant_of_res(res);
+                let fields = pat_fields
+                    .iter()
+                    .map(|f| {
+                        let idx = variant
+                            .fields
+                            .iter()
+                            .position(|vf| vf.name == f.ident.name)
+                            .expect("unknown field in struct pattern");
+                        (idx, f.pat)
+                    })
+                    .collect();
+                self.adt_pat_cond(term, pat, res, fields, bindings)
+            }
+            PatKind::Tuple(subpats, dotdot) => {
+                let mir_ty::TyKind::Tuple(tys) = self.pat_ty(pat).kind() else {
+                    panic!("tuple pattern on a non-tuple type: {:?}", pat);
+                };
+                let fields = positional_subpats(subpats, dotdot, tys.len());
+                let fields = fields
+                    .into_iter()
+                    .map(|(idx, p)| (term.clone().tuple_proj(idx), p))
+                    .collect();
+                self.fields_cond(fields, bindings)
+            }
+            _ => self.tcx.dcx().span_fatal(
+                pat.span,
+                "unsupported pattern in formula; only `_`, `..`, bindings and variant, tuple, \
+                 struct, `&` and or-patterns are supported",
+            ),
+        }
+    }
+
+    /// The term a binding of `term` stands for: `term`, or a shared reference to it where
+    /// rustc binds by reference.
+    fn bound_term(
+        &self,
+        hir_id: HirId,
+        span: rustc_span::Span,
+        term: chc::Term<rty::FunctionParamIdx>,
+    ) -> chc::Term<rty::FunctionParamIdx> {
+        match self.binding_mode(hir_id, span).0 {
+            rustc_hir::ByRef::No => term,
+            rustc_hir::ByRef::Yes(rustc_hir::Mutability::Not) => chc::Term::box_(term),
+            rustc_hir::ByRef::Yes(rustc_hir::Mutability::Mut) => self.tcx.dcx().span_fatal(
+                span,
+                "a pattern in a formula cannot bind by mutable reference",
+            ),
+        }
+    }
+
+    /// A variant pattern on an enum is its tester, conjoined with the patterns of its fields
+    /// at the constructor's selectors. A struct pattern matches its fields.
+    fn adt_pat_cond(
+        &self,
+        term: chc::Term<rty::FunctionParamIdx>,
+        pat: &'tcx rustc_hir::Pat<'tcx>,
+        res: rustc_hir::def::Res,
+        fields: Vec<(usize, &'tcx rustc_hir::Pat<'tcx>)>,
+        bindings: &mut Vec<(HirId, chc::Term<rty::FunctionParamIdx>)>,
+    ) -> PatCond<rty::FunctionParamIdx> {
+        let adt = self.pat_adt(pat);
+        if !adt.is_enum() {
+            let fields = fields
+                .into_iter()
+                .map(|(idx, p)| (term.clone().tuple_proj(idx), p))
+                .collect();
+            return self.fields_cond(fields, bindings);
+        }
+        let mir_ty::TyKind::Adt(_, generic_args) = self.pat_ty(pat).kind() else {
+            panic!("enum pattern on a non-ADT type: {:?}", pat);
+        };
+        let variant = adt.variant_of_res(res);
+        let variant_idx = adt.variant_index_with_id(variant.def_id);
+        let enum_def = self.analyzer.get_or_register_enum_def(adt.did());
+        let variant_def = &enum_def.variants[variant_idx];
+        let sort = chc::DatatypeSort::new(
+            enum_def.name.clone(),
+            generic_args
+                .types()
+                .map(|ty| self.type_builder.build(ty).to_sort())
+                .collect(),
+        );
+        // A `_` field reads nothing, so it gets no selector.
+        let fields = fields
+            .into_iter()
+            .filter(|(_, p)| !matches!(p.kind, rustc_hir::PatKind::Wild))
+            .map(|(idx, p)| {
+                let field_ty = variant
+                    .fields
+                    .iter()
+                    .nth(idx)
+                    .expect("field of the variant");
+                let field_ty = self.normalized_ty(field_ty.ty(self.tcx, generic_args));
+                let field = chc::Term::datatype_selector(
+                    sort.clone(),
+                    variant_def.name.clone(),
+                    idx,
+                    self.type_builder.build(field_ty).to_sort(),
+                    term.clone(),
+                );
+                (field, p)
+            })
+            .collect();
+        let tester = PatCond::Variant {
+            datatype: enum_def.name.clone(),
+            ctor: variant_def.name.clone(),
+            discr: variant_def.discr.clone(),
+            term: Box::new(term),
+        };
+        PatCond::All(vec![tester, self.fields_cond(fields, bindings)])
+    }
+
+    fn fields_cond(
+        &self,
+        fields: Vec<(chc::Term<rty::FunctionParamIdx>, &'tcx rustc_hir::Pat<'tcx>)>,
+        bindings: &mut Vec<(HirId, chc::Term<rty::FunctionParamIdx>)>,
+    ) -> PatCond<rty::FunctionParamIdx> {
+        PatCond::All(
+            fields
+                .into_iter()
+                .map(|(field, p)| self.pat_cond(field, p, bindings))
+                .collect(),
+        )
+    }
+
+    fn pat_adt(&self, pat: &'tcx rustc_hir::Pat<'tcx>) -> mir_ty::AdtDef<'tcx> {
+        self.pat_ty(pat)
+            .ty_adt_def()
+            .unwrap_or_else(|| panic!("ADT pattern on a non-ADT type: {:?}", pat))
+    }
+
+    /// `term` dereferenced through the shared references that match ergonomics sees through
+    /// before matching `pat`.
+    fn apply_pat_adjustments(
+        &self,
+        term: chc::Term<rty::FunctionParamIdx>,
+        pat: &'tcx rustc_hir::Pat<'tcx>,
+    ) -> chc::Term<rty::FunctionParamIdx> {
+        let Some(adjustments) = self.typeck.pat_adjustments().get(pat.hir_id) else {
+            return term;
+        };
+        adjustments.iter().fold(term, |term, adjustment| {
+            match (adjustment.kind, adjustment.source.kind()) {
+                (
+                    mir_ty::adjustment::PatAdjust::BuiltinDeref,
+                    mir_ty::TyKind::Ref(_, _, mir_ty::Mutability::Not),
+                ) => term.box_current(),
+                _ => self.tcx.dcx().span_fatal(
+                    pat.span,
+                    "a pattern in a formula can only see through shared references",
+                ),
+            }
+        })
+    }
+
+    /// The translation of a specification expression. It recurses with the expression's depth
+    /// and, through the predicates it defines on the way (`Take<I>::inv` calls `I::inv`), with
+    /// the nesting of the types they are instantiated at, so it grows the stack on demand as
+    /// rustc's own expression lowering does.
+    fn to_formula_or_term(
+        &self,
+        hir: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> FormulaOrTerm<rty::FunctionParamIdx> {
+        rustc_data_structures::stack::ensure_sufficient_stack(|| self.to_formula_or_term_inner(hir))
+    }
+
+    fn to_formula_or_term_inner(
+        &self,
+        hir: &'tcx rustc_hir::Expr<'tcx>,
+    ) -> FormulaOrTerm<rty::FunctionParamIdx> {
+        use rustc_hir::ExprKind;
+
+        match hir.kind {
+            ExprKind::Binary(op, lhs, rhs) => {
+                if let Some(ty) = self.bit_vec_ty(lhs) {
+                    return self.bit_vec_binary_op(op.node, ty, lhs, rhs);
+                }
+                match op.node {
+                    rustc_hir::BinOpKind::Or => {
+                        let lhs = self.to_formula_or_term(lhs);
+                        let rhs = self.to_formula_or_term(rhs);
+                        return FormulaOrTerm::Or(lhs.into(), rhs.into());
+                    }
+                    rustc_hir::BinOpKind::And => {
+                        let lhs = self.to_formula_or_term(lhs);
+                        let rhs = self.to_formula_or_term(rhs);
+                        return FormulaOrTerm::And(lhs.into(), rhs.into());
+                    }
+                    rustc_hir::BinOpKind::Add => {
+                        let lhs = self.to_term(lhs);
+                        let rhs = self.to_term(rhs);
+                        return FormulaOrTerm::Term(lhs.add(rhs));
+                    }
+                    rustc_hir::BinOpKind::Sub => {
+                        let lhs = self.to_term(lhs);
+                        let rhs = self.to_term(rhs);
+                        return FormulaOrTerm::Term(lhs.sub(rhs));
+                    }
+                    rustc_hir::BinOpKind::Mul => {
+                        let lhs = self.to_term(lhs);
+                        let rhs = self.to_term(rhs);
+                        return FormulaOrTerm::Term(lhs.mul(rhs));
+                    }
+                    rustc_hir::BinOpKind::Div => {
+                        let lhs = self.to_term(lhs);
+                        let rhs = self.to_term(rhs);
+                        return FormulaOrTerm::Term(lhs.div_trunc(rhs));
+                    }
+                    rustc_hir::BinOpKind::Rem => {
+                        let lhs = self.to_term(lhs);
+                        let rhs = self.to_term(rhs);
+                        return FormulaOrTerm::Term(lhs.rem_trunc(rhs));
+                    }
+                    _ => {}
+                }
+
+                let binop = match op.node {
+                    rustc_hir::BinOpKind::Eq | rustc_hir::BinOpKind::Ne => {
+                        let binop = if op.node == rustc_hir::BinOpKind::Eq {
+                            AmbiguousBinOp::Eq
+                        } else {
+                            AmbiguousBinOp::Ne
+                        };
+                        return self.equality(
+                            hir.span,
+                            self.plain_operand(lhs),
+                            binop,
+                            self.plain_operand(rhs),
+                        );
+                    }
+                    rustc_hir::BinOpKind::Ge => AmbiguousBinOp::Ge,
+                    rustc_hir::BinOpKind::Le => AmbiguousBinOp::Le,
+                    rustc_hir::BinOpKind::Gt => AmbiguousBinOp::Gt,
+                    rustc_hir::BinOpKind::Lt => AmbiguousBinOp::Lt,
+                    _ => unimplemented!("unsupported binary operator in formula: {:?}", op),
+                };
+                FormulaOrTerm::BinOp(self.to_term(lhs), binop, self.to_term(rhs))
+            }
+            ExprKind::If(cond, then_expr, Some(else_expr)) => {
+                // `ite` of the condition as a Boolean term; a Boolean conditional with a formula
+                // among its parts is a formula instead.
+                let cond = match cond.kind {
+                    ExprKind::DropTemps(inner) => inner,
+                    _ => cond,
+                };
+                if !self.expr_ty(hir).is_bool() {
+                    let cond_term = self.to_term(cond);
+                    let then_term = self.to_term(then_expr);
+                    let else_term = self.to_term(else_expr);
+                    return FormulaOrTerm::Term(chc::Term::ite(cond_term, then_term, else_term));
+                }
+                let [cond, then, els] =
+                    [cond, then_expr, else_expr].map(|part| self.to_formula_or_term(part));
+                match (
+                    cond.clone().into_term(),
+                    then.clone().into_term(),
+                    els.clone().into_term(),
+                ) {
+                    (Some(cond), Some(then), Some(els)) => {
+                        FormulaOrTerm::Term(chc::Term::ite(cond, then, els))
+                    }
+                    _ => FormulaOrTerm::Formula(FormulaOrTerm::formula_ite(cond, then, els)),
+                }
+            }
+            ExprKind::Unary(op, operand) => match op {
+                rustc_hir::UnOp::Neg => {
+                    let is_bit_vec = self.bit_vec_ty(operand).is_some();
+                    let operand = self.to_term(operand);
+                    if is_bit_vec {
+                        FormulaOrTerm::Term(chc::Term::App(chc::Function::BVNEG, vec![operand]))
+                    } else {
+                        FormulaOrTerm::Term(operand.neg())
+                    }
+                }
+                rustc_hir::UnOp::Not => {
+                    let operand_ty = self.expr_ty(operand);
+                    match operand_ty.ty_adt_def() {
+                        Some(adt) if Some(adt.did()) == self.def_ids.mut_model() => {
+                            let operand = self.to_term(operand);
+                            FormulaOrTerm::Term(operand.mut_final())
+                        }
+                        Some(adt) if Some(adt.did()) == self.def_ids.bit_vec_model() => {
+                            let operand = self.to_term(operand);
+                            FormulaOrTerm::Term(chc::Term::App(chc::Function::BVNOT, vec![operand]))
+                        }
+                        _ => {
+                            let operand = self.to_formula_or_term(operand);
+                            FormulaOrTerm::Not(Box::new(operand))
+                        }
+                    }
+                }
+                rustc_hir::UnOp::Deref => {
+                    let operand_ty = self.expr_ty(operand);
+                    let term = self.to_term(operand);
+                    if matches!(
+                        operand_ty.kind(),
+                        mir_ty::TyKind::Ref(_, _, mir_ty::Mutability::Not)
+                    ) {
+                        return FormulaOrTerm::Term(term.box_current());
+                    }
+                    let adt = operand_ty
+                        .ty_adt_def()
+                        .expect("deref operand must be a model type");
+                    if Some(adt.did()) == self.def_ids.mut_model() {
+                        FormulaOrTerm::Term(term.mut_current())
+                    } else if Some(adt.did()) == self.def_ids.box_model() {
+                        FormulaOrTerm::Term(term.box_current())
+                    } else if Some(adt.did()) == self.def_ids.ghost_model() {
+                        FormulaOrTerm::Term(term)
+                    } else {
+                        unimplemented!(
+                            "unsupported deref operand type in formula: {:?}",
+                            operand_ty
+                        )
+                    }
+                }
+            },
+            ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, rustc_hir::Mutability::Not, operand) => {
+                let operand = self.to_term(operand);
+                FormulaOrTerm::Term(operand.boxed())
+            }
+            ExprKind::Lit(lit) => match lit.node {
+                rustc_ast::LitKind::Int(i, _) => FormulaOrTerm::Term(chc::Term::int(i.get())),
+                rustc_ast::LitKind::Bool(b) => FormulaOrTerm::Literal(b),
+                _ => unimplemented!("unsupported literal in formula: {:?}", lit),
+            },
+            ExprKind::Path(qpath) => match self.typeck.qpath_res(&qpath, hir.hir_id) {
+                rustc_hir::def::Res::Local(hir_id) => FormulaOrTerm::Term(
+                    self.env
+                        .get(&hir_id)
+                        .expect("unbound variable in formula")
+                        .clone(),
+                ),
+                rustc_hir::def::Res::Def(
+                    rustc_hir::def::DefKind::Ctor(rustc_hir::def::CtorOf::Variant, _),
+                    ctor_did,
+                ) => FormulaOrTerm::Term(self.variant_ctor_term(
+                    self.tcx.parent(ctor_did),
+                    self.expr_ty(hir),
+                    vec![],
+                )),
+                rustc_hir::def::Res::Def(
+                    rustc_hir::def::DefKind::Const | rustc_hir::def::DefKind::AssocConst,
+                    const_did,
+                ) => FormulaOrTerm::Term(self.const_term(const_did, hir)),
+                _ => unimplemented!("unsupported path in formula: {:?}", qpath),
+            },
+            ExprKind::Tup(exprs) => {
+                let terms = exprs.iter().map(|e| self.to_term(e)).collect();
+                FormulaOrTerm::Term(chc::Term::tuple(terms))
+            }
+            ExprKind::Struct(qpath, fields, tail) => {
+                if !matches!(tail, rustc_hir::StructTailExpr::None) {
+                    unimplemented!("struct update syntax is not supported in formulas");
+                }
+                let ty = self.expr_ty(hir);
+                let adt = ty.ty_adt_def().expect("struct literal on a non-ADT type");
+                let variant = match self.typeck.qpath_res(qpath, hir.hir_id) {
+                    rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Variant, variant_did) => {
+                        adt.variant_with_id(variant_did)
+                    }
+                    _ => adt.non_enum_variant(),
+                };
+                let mut terms = Vec::new();
+                for variant_field in &variant.fields {
+                    let Some(field) = fields.iter().find(|f| f.ident.name == variant_field.name)
+                    else {
+                        self.tcx.dcx().span_fatal(
+                            hir.span,
+                            format!("missing field `{}` in struct literal", variant_field.name),
+                        );
+                    };
+                    terms.push(self.to_term(field.expr));
+                }
+                if adt.is_enum() {
+                    return FormulaOrTerm::Term(self.variant_ctor_term(variant.def_id, ty, terms));
+                }
+                FormulaOrTerm::Term(chc::Term::tuple(terms))
+            }
+            ExprKind::Field(expr, field) => {
+                // Tuples use numeric field names (`.0`); structs (represented as
+                // tuples in the logic) use named fields resolved to their position.
+                let index = match field.name.as_str().parse::<usize>() {
+                    Ok(index) => index,
+                    Err(_) => {
+                        let adt = self
+                            .ghost_deref_target_ty(self.adjusted_expr_ty(expr))
+                            .ty_adt_def()
+                            .expect("named field access on a non-ADT type");
+                        adt.non_enum_variant()
+                            .fields
+                            .iter()
+                            .position(|f| f.name == field.name)
+                            .expect("unknown named field in formula")
+                    }
+                };
+                let term = self.to_term(expr);
+                FormulaOrTerm::Term(term.tuple_proj(index))
+            }
+            ExprKind::Index(array, index, _) => {
+                let index_term = self.to_term(index);
+                let array_term = self.to_term(array);
+                let is_seq = self.is_seq_modeled(self.seq_target_ty(self.adjusted_expr_ty(array)));
+                let term = if is_seq {
+                    array_term.seq_nth(index_term)
+                } else {
+                    array_term.select(index_term)
+                };
+                FormulaOrTerm::Term(term)
+            }
+            ExprKind::MethodCall(method, receiver, args, _) => {
+                if let Some((lhs, rhs)) = self.log_eq_args(receiver) {
+                    let binop = match method.ident.as_str() {
+                        "log_eq" => AmbiguousBinOp::Eq,
+                        "log_ne" => AmbiguousBinOp::Ne,
+                        name => panic!("unknown method of log_eq_args: {name}"),
+                    };
+                    let (lhs_ty, lhs) = self.log_eq_operand(lhs);
+                    let (rhs_ty, rhs) = self.log_eq_operand(rhs);
+                    let (Some(lhs_term), Some(rhs_term)) =
+                        (lhs.clone().into_term(), rhs.clone().into_term())
+                    else {
+                        let eq = matches!(binop, AmbiguousBinOp::Eq);
+                        return FormulaOrTerm::Formula(FormulaOrTerm::formula_equality(
+                            lhs, eq, rhs,
+                        ));
+                    };
+                    return self.equality(hir.span, (lhs_ty, lhs_term), binop, (rhs_ty, rhs_term));
+                }
+                if let Some(def_id) = self.typeck.type_dependent_def_id(hir.hir_id) {
+                    if Some(def_id) == self.def_ids.array_model_store() {
+                        assert_eq!(args.len(), 2, "array_store takes exactly 2 arguments");
+                        let array_term = self.to_term(receiver);
+                        let index_term = self.to_term(&args[0]);
+                        let value_term = self.to_term(&args[1]);
+                        return FormulaOrTerm::Term(array_term.store(index_term, value_term));
+                    }
+                    if Some(def_id) == self.def_ids.fn_param_at_entry() {
+                        assert!(
+                            args.is_empty(),
+                            "FnParam::at_entry does not take any arguments"
+                        );
+                        let t = self.to_term(receiver);
+                        return FormulaOrTerm::Term(t);
+                    }
+                    if Some(def_id) == self.def_ids.bit_vec_to_int() {
+                        assert!(
+                            args.is_empty(),
+                            "BitVec::to_int does not take any arguments"
+                        );
+                        let ty = self.bit_vec_ty(receiver).unwrap();
+                        let fun = if ty.signed {
+                            chc::Function::SBV_TO_INT
+                        } else {
+                            chc::Function::UBV_TO_INT
+                        };
+                        let t = self.to_term(receiver);
+                        return FormulaOrTerm::Term(chc::Term::App(fun, vec![t]));
+                    }
+                    // The same integer under another model type: a term is not assumed in the
+                    // range of its type, so the conversion is the identity.
+                    if Some(def_id) == self.def_ids.uint_to_uint_n()
+                        || Some(def_id) == self.def_ids.uint_n_to_uint()
+                        || Some(def_id) == self.def_ids.int_to_int_n()
+                        || Some(def_id) == self.def_ids.int_n_to_int()
+                    {
+                        assert!(
+                            args.is_empty(),
+                            "the conversion does not take any arguments"
+                        );
+                        return FormulaOrTerm::Term(self.to_term(receiver));
+                    }
+                    if Some(def_id) == self.def_ids.seq_len() {
+                        assert!(args.is_empty(), "Seq::len does not take any arguments");
+                        let t = self.to_term(receiver);
+                        return FormulaOrTerm::Term(t.seq_len());
+                    }
+                    if Some(def_id) == self.def_ids.seq_push() {
+                        assert_eq!(args.len(), 1, "Seq::push takes exactly 1 argument");
+                        let t = self.to_term(receiver);
+                        let v = self.to_term(&args[0]);
+                        return FormulaOrTerm::Term(t.seq_concat(v.seq_unit()));
+                    }
+                    if Some(def_id) == self.def_ids.seq_store() {
+                        assert_eq!(args.len(), 2, "Seq::store takes exactly 2 arguments");
+                        let seq = self.to_term(receiver);
+                        let index = self.to_term(&args[0]);
+                        let value = self.to_term(&args[1]);
+                        return FormulaOrTerm::Term(seq.seq_store(index, value));
+                    }
+                    if Some(def_id) == self.def_ids.seq_subsequence() {
+                        assert_eq!(args.len(), 2, "Seq::subsequence takes exactly 2 arguments");
+                        let seq = self.to_term(receiver);
+                        let start = self.to_term(&args[0]);
+                        let end = self.to_term(&args[1]);
+                        let length = end.sub(start.clone());
+                        return FormulaOrTerm::Term(seq.seq_extract(start, length));
+                    }
+                    if Some(def_id) == self.def_ids.seq_concat() {
+                        assert_eq!(args.len(), 1, "Seq::concat takes exactly 1 argument");
+                        let seq = self.to_term(receiver);
+                        let other = self.to_term(&args[0]);
+                        return FormulaOrTerm::Term(seq.seq_concat(other));
+                    }
+                }
+                if method.ident.name == rustc_span::sym::len
+                    && args.is_empty()
+                    && self.is_seq_modeled(self.adjusted_expr_ty(receiver))
+                {
+                    let t = self.to_term(receiver);
+                    return FormulaOrTerm::Term(t.seq_len());
+                }
+                unimplemented!("unsupported method call in formula: {:?}", method)
+            }
+            ExprKind::Call(func_expr, args) => {
+                if let ExprKind::Path(qpath) = &func_expr.kind {
+                    let res = self.typeck.qpath_res(qpath, func_expr.hir_id);
+                    if let rustc_hir::def::Res::Def(def_kind, def_id) = res {
+                        if Some(def_id) == self.def_ids.closure_precondition() {
+                            let [receiver, args] = args else {
+                                panic!(
+                                    "closure_precondition takes a closure and a tuple of arguments"
+                                );
+                            };
+                            return self.translate_closure_precondition(receiver, args);
+                        }
+                        if Some(def_id) == self.def_ids.closure_postcondition() {
+                            let [receiver, args, result] = args else {
+                                panic!(
+                                    "closure_postcondition takes a closure, a tuple of arguments, and a result"
+                                );
+                            };
+                            return self.translate_closure_postcondition(receiver, args, result);
+                        }
+                        if Some(def_id) == self.def_ids.closure_hist_inv() {
+                            let [from, to] = args else {
+                                panic!("closure_hist_inv takes two closure states");
+                            };
+                            return self.translate_closure_hist_inv(from, to);
+                        }
+                        if Some(def_id) == self.def_ids.witness() {
+                            let [formula, _] = args else {
+                                panic!("witness takes a formula and its witness");
+                            };
+                            return self.to_formula_or_term(formula);
+                        }
+                        if Some(def_id) == self.def_ids.exists() {
+                            let (vars, body) = self.exists_binders_and_body(args);
+                            return FormulaOrTerm::Formula(chc::Formula::exists_over_payload(
+                                vars, body,
+                            ));
+                        }
+                        if Some(def_id) == self.def_ids.forall() {
+                            assert_eq!(args.len(), 1, "forall takes exactly 1 argument");
+                            let ExprKind::Closure(closure) = args[0].kind else {
+                                panic!("forall argument must be a closure");
+                            };
+                            let closure_body = self.tcx.hir_body(closure.body);
+
+                            let (vars, range, body_formula) =
+                                self.to_formula_with_quantified_vars(closure_body);
+                            let body_formula = match range {
+                                Some(range) => range.implies(body_formula),
+                                None => body_formula,
+                            };
+                            return FormulaOrTerm::Formula(chc::Formula::forall(
+                                vars,
+                                body_formula,
+                            ));
+                        }
+                        if Some(def_id) == self.def_ids.array_model_from_fn() {
+                            assert_eq!(args.len(), 1, "Array::from_fn takes exactly 1 argument");
+                            let ExprKind::Closure(closure) = args[0].kind else {
+                                panic!("Array::from_fn argument must be a closure");
+                            };
+                            let closure_body = self.tcx.hir_body(closure.body);
+                            let (var, index_sort, body) =
+                                self.to_term_with_quantified_var(closure_body);
+                            return FormulaOrTerm::Term(chc::Term::ArrayLambda(
+                                var,
+                                index_sort,
+                                Box::new(body),
+                            ));
+                        }
+                        if Some(def_id) == self.def_ids.int_lit() {
+                            assert_eq!(args.len(), 1, "int_lit takes exactly 1 argument");
+                            return FormulaOrTerm::Term(self.to_term(&args[0]));
+                        }
+                        if Some(def_id) == self.def_ids.fn_param_at_entry() {
+                            assert_eq!(args.len(), 1, "FnParam::at_entry takes exactly 1 argument");
+                            let t = self.to_term(&args[0]);
+                            return FormulaOrTerm::Term(t);
+                        }
+                        if Some(def_id) == self.def_ids.implies() {
+                            let [lhs, rhs] = args else {
+                                panic!("implies takes exactly 2 arguments");
+                            };
+                            let lhs = self.to_formula_or_term(lhs);
+                            let rhs = self.to_formula_or_term(rhs);
+                            return FormulaOrTerm::Implies(lhs.into(), rhs.into());
+                        }
+                        if Some(def_id) == self.def_ids.mut_model_new() {
+                            assert_eq!(args.len(), 2, "Mut::new takes exactly 2 arguments");
+                            let t1 = self.to_term(&args[0]);
+                            let t2 = self.to_term(&args[1]);
+                            return FormulaOrTerm::Term(chc::Term::mut_(t1, t2));
+                        }
+                        if Some(def_id) == self.def_ids.box_model_new() {
+                            assert_eq!(args.len(), 1, "Box::new takes exactly 1 argument");
+                            let t = self.to_term(&args[0]);
+                            return FormulaOrTerm::Term(chc::Term::box_(t));
+                        }
+                        if Some(def_id) == self.def_ids.bit_vec_from_int() {
+                            assert_eq!(args.len(), 1, "BitVec::from_int takes exactly 1 argument");
+                            let width = self.bit_vec_ty(hir).unwrap().width;
+                            let t = self.to_term(&args[0]);
+                            return FormulaOrTerm::Term(t.int_to_bit_vec(width));
+                        }
+                        if Some(def_id) == self.def_ids.seq_empty() {
+                            assert!(args.is_empty(), "Seq::empty does not take any arguments");
+                            let elem_sort = self.node_arg_type_at(func_expr.hir_id, 0).to_sort();
+                            return FormulaOrTerm::Term(chc::Term::seq_empty(elem_sort));
+                        }
+                        if Some(def_id) == self.def_ids.seq_singleton() {
+                            assert_eq!(args.len(), 1, "Seq::singleton takes exactly 1 argument");
+                            let v = self.to_term(&args[0]);
+                            return FormulaOrTerm::Term(v.seq_unit());
+                        }
+                        if let rustc_hir::def::DefKind::Ctor(ctor_of, _) = def_kind {
+                            let terms = args.iter().map(|e| self.to_term(e)).collect();
+                            match ctor_of {
+                                rustc_hir::def::CtorOf::Variant => {
+                                    return FormulaOrTerm::Term(self.variant_ctor_term(
+                                        self.tcx.parent(def_id),
+                                        self.expr_ty(hir),
+                                        terms,
+                                    ));
+                                }
+                                rustc_hir::def::CtorOf::Struct => {
+                                    return FormulaOrTerm::Term(chc::Term::tuple(terms));
+                                }
+                            }
+                        }
+                        if self.is_logic(def_id) {
+                            let (generic_args, instance) =
+                                self.resolve_spec_fn_call(def_id, func_expr);
+                            let Some(instance) = instance else {
+                                return FormulaOrTerm::Term(self.trait_logic_fn_term(
+                                    def_id,
+                                    generic_args,
+                                    args,
+                                ));
+                            };
+                            if !self.is_logic(instance.def_id()) {
+                                self.tcx.dcx().span_fatal(
+                                    hir.span,
+                                    "the implementation of a logic function is a #[thrust_macros::logic] function",
+                                );
+                            }
+                            if instance.def_id() == self.local_def_id.to_def_id() {
+                                if !self.logic_body_expr().1 {
+                                    self.tcx.dcx().span_fatal(
+                                        hir.span,
+                                        "a recursive logic function needs #[thrust_macros::variant(..)]",
+                                    );
+                                }
+                                if instance.args != self.generic_args {
+                                    self.tcx.dcx().span_fatal(
+                                        hir.span,
+                                        "a logic function can call itself only at its own type arguments",
+                                    );
+                                }
+                            }
+                            let (symbol, sort) = self.analyzer.logic_fn_with_args(
+                                instance.def_id(),
+                                instance.args,
+                                self.type_builder.owner_fn_id(),
+                            );
+                            let arg_terms = args.iter().map(|e| self.to_term(e)).collect();
+                            return FormulaOrTerm::Term(chc::Term::user_defined_fn(
+                                symbol, sort, arg_terms,
+                            ));
+                        }
+                        if self
+                            .tcx
+                            .get_attrs_by_path(def_id, &analyze::annot::predicate_path())
+                            .next()
+                            .is_some()
+                        {
+                            if let Some(formula) =
+                                self.generated_compares_call(def_id, func_expr, args)
+                            {
+                                return FormulaOrTerm::Formula(formula);
+                            }
+                            let (generic_args, instance) =
+                                self.resolve_spec_fn_call(def_id, func_expr);
+                            let pred: chc::Pred = match instance {
+                                None => {
+                                    tracing::debug!(?self.local_def_id, ?generic_args, "owner_fn_id={:?}", self.type_builder.owner_fn_id());
+                                    let type_params = generic_args
+                                        .types()
+                                        .map(|ty| self.type_builder.build(ty).to_sort())
+                                        .collect();
+
+                                    let (params, _) = self.signature_sorts(def_id, generic_args);
+
+                                    let pred = refine::trait_forall_pred(
+                                        self.tcx,
+                                        def_id,
+                                        self.type_builder.generic_args_symbol(generic_args),
+                                        type_params,
+                                        params,
+                                    );
+                                    self.register_forall_pred(pred.clone());
+                                    // Recorded so that an instantiation of the owner can
+                                    // resolve this reference to the impl's own predicate.
+                                    self.analyzer.register_forall_pred_origin(
+                                        pred.clone(),
+                                        def_id,
+                                        generic_args,
+                                        self.type_builder.owner_fn_id(),
+                                    );
+                                    pred.into()
+                                }
+                                Some(instance) => {
+                                    // A call at other type arguments, such as an adapter's
+                                    // predicate calling the same impl's at the adapted
+                                    // iterator, defines another predicate.
+                                    if instance.def_id() == self.local_def_id.to_def_id()
+                                        && instance.args == self.generic_args
+                                    {
+                                        self.tcx.dcx().span_fatal(
+                                            hir.span,
+                                            "a predicate cannot call itself; a recursive one is a #[thrust_macros::logic] function with #[thrust_macros::variant(..)]",
+                                        );
+                                    }
+                                    let owner_fn_id = self.type_builder.owner_fn_id();
+                                    let pred = self.analyzer.predicate_with_args(
+                                        instance.def_id(),
+                                        instance.args,
+                                        owner_fn_id,
+                                    );
+                                    // The `pre!`s its body reads are read here too.
+                                    // `formula_fn_with_args` returns the translation the
+                                    // definition just made, or makes one for this owner.
+                                    let body = instance.def_id().as_local().and_then(|local| {
+                                        self.analyzer.formula_fn_with_args(
+                                            local,
+                                            instance.args,
+                                            owner_fn_id,
+                                        )
+                                    });
+                                    for ty in body.iter().flat_map(|body| body.pre_receivers()) {
+                                        self.record_pre_receiver(*ty);
+                                    }
+                                    pred.into()
+                                }
+                            };
+                            tracing::debug!("resolved predicate call in formula: {:?}", pred);
+                            let arg_terms = args.iter().map(|e| self.to_term(e)).collect();
+                            let atom = chc::Atom::new(pred, arg_terms);
+                            return FormulaOrTerm::Formula(chc::Formula::Atom(atom));
+                        }
+                    }
+                }
+                unimplemented!("unsupported call in formula: {:?}", func_expr)
+            }
+            ExprKind::Match(scrutinee, arms, _) => {
+                if self.expr_ty(hir).is_bool() {
+                    FormulaOrTerm::Formula(self.match_formula(scrutinee, arms))
+                } else {
+                    FormulaOrTerm::Term(self.match_term(scrutinee, arms))
+                }
+            }
+            ExprKind::Block(block, _) => {
+                if block.stmts.is_empty() {
+                    self.to_formula_or_term(block.expr.expect("expected an expression in block"))
+                } else {
+                    unimplemented!("unsupported block in formula: {:?}", block);
+                }
+            }
+            ExprKind::Cast(operand, _) => {
+                // A cast has no translation; its operand is checked first so that a formula
+                // (`(p(x) == q(x)) as i32`) gets the error that says it is not a value.
+                self.to_term(operand);
+                self.tcx.dcx().span_fatal(
+                    hir.span,
+                    "thrust: an `as` cast is not supported in a specification",
+                );
+            }
+            _ => self.tcx.dcx().span_fatal(
+                hir.span,
+                "thrust: this expression is not supported in a specification",
+            ),
+        }
+    }
+}
+
+/// The subpatterns of a positional pattern of `arity` fields, each with its field index,
+/// seeing through a `..`.
+fn positional_subpats<'tcx>(
+    subpats: &'tcx [rustc_hir::Pat<'tcx>],
+    dotdot: rustc_hir::DotDotPos,
+    arity: usize,
+) -> Vec<(usize, &'tcx rustc_hir::Pat<'tcx>)> {
+    let split = dotdot.as_opt_usize().unwrap_or(subpats.len());
+    let skipped = arity - subpats.len();
+    subpats
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (if i < split { i } else { i + skipped }, p))
+        .collect()
+}

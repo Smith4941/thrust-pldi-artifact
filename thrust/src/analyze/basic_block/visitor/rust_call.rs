@@ -1,0 +1,247 @@
+use crate::analyze::basic_block::peel_shared_refs;
+use rustc_abi::FieldIdx;
+use rustc_middle::mir::{self, Local};
+use rustc_middle::ty::{self as mir_ty, TyCtxt};
+
+pub struct RustCallVisitor<'a, 'tcx, 'ctx> {
+    tcx: TyCtxt<'tcx>,
+    analyzer: &'a mut crate::analyze::basic_block::Analyzer<'tcx, 'ctx>,
+}
+
+// TODO: consolidate logic with ReborrowVisitor
+impl<'tcx> RustCallVisitor<'_, 'tcx, '_> {
+    fn insert_mut_borrow(&mut self, place: mir::Place<'tcx>, inner_ty: mir_ty::Ty<'tcx>) -> Local {
+        let r = mir_ty::Region::new_from_kind(self.tcx, mir_ty::RegionKind::ReErased);
+        let ty = mir_ty::Ty::new_mut_ref(self.tcx, r, inner_ty);
+        let decl = mir::LocalDecl::new(ty, Default::default()).immutable();
+        let new_local = self.analyzer.local_decls.push(decl);
+        let new_local_ty = self.analyzer.borrow_place_(place, inner_ty);
+        self.analyzer.bind_local(new_local, new_local_ty);
+        tracing::info!(old_place = ?place, ?new_local, "implicitly (mut-)borrowed");
+        new_local
+    }
+
+    fn insert_immut_borrow(
+        &mut self,
+        place: mir::Place<'tcx>,
+        inner_ty: mir_ty::Ty<'tcx>,
+    ) -> Local {
+        let r = mir_ty::Region::new_from_kind(self.tcx, mir_ty::RegionKind::ReErased);
+        let ty = mir_ty::Ty::new_imm_ref(self.tcx, r, inner_ty);
+        let decl = mir::LocalDecl::new(ty, Default::default()).immutable();
+        let new_local = self.analyzer.local_decls.push(decl);
+        let new_local_ty = self.analyzer.immut_borrow_place(place);
+        self.analyzer.bind_local(new_local, new_local_ty);
+        tracing::info!(old_place = ?place, ?new_local, "implicitly (imm-)borrowed");
+        new_local
+    }
+
+    fn insert_immut_reborrow(
+        &mut self,
+        place: mir::Place<'tcx>,
+        inner_ty: mir_ty::Ty<'tcx>,
+    ) -> Local {
+        let r = mir_ty::Region::new_from_kind(self.tcx, mir_ty::RegionKind::ReErased);
+        let ty = mir_ty::Ty::new_imm_ref(self.tcx, r, inner_ty);
+        let decl = mir::LocalDecl::new(ty, Default::default()).immutable();
+        let new_local = self.analyzer.local_decls.push(decl);
+        let new_local_ty = self.analyzer.immut_borrow_place(place);
+        self.analyzer.bind_local(new_local, new_local_ty);
+        tracing::info!(old_place = ?place, ?new_local, "implicitly (imm-)reborrowed");
+        new_local
+    }
+}
+
+impl<'tcx> RustCallVisitor<'_, 'tcx, '_> {
+    /// Passes the callee of a call through shared references (`&F: Fn` calls `F`) the `&F` it
+    /// takes: the receiver is dereferenced down to the `&F` it holds, which is reborrowed.
+    fn pass_shared_receiver(
+        &mut self,
+        args: &mut [rustc_span::source_map::Spanned<mir::Operand<'tcx>>],
+        callee_ty: mir_ty::Ty<'tcx>,
+    ) {
+        let receiver = args.first().unwrap();
+        let mut ty = receiver.node.ty(&self.analyzer.local_decls, self.tcx);
+        let mut place = receiver.node.place().unwrap();
+        let mut derefs = 0;
+        while !matches!(
+            ty.kind(),
+            mir_ty::TyKind::Ref(_, inner, mir::Mutability::Not) if *inner == callee_ty
+        ) {
+            let Some(inner) = ty.builtin_deref(true) else {
+                unreachable!("`{ty}` does not lead to the callee `{callee_ty}` through references");
+            };
+            place = self.tcx.mk_place_deref(place);
+            ty = inner;
+            derefs += 1;
+        }
+        if derefs == 0 {
+            return;
+        }
+        let reborrowed = self.insert_immut_reborrow(self.tcx.mk_place_deref(place), callee_ty);
+        args[0].node = mir::Operand::Copy(reborrowed.into());
+    }
+
+    /// Passes a function item the call's arguments one by one, in place of the receiver and the
+    /// tuple of arguments that `Fn::call` takes.
+    fn untuple_args(
+        &mut self,
+        args: &mut Box<[rustc_span::source_map::Spanned<mir::Operand<'tcx>>]>,
+    ) {
+        let tuple = args.get(1).unwrap();
+        let mir_ty::TyKind::Tuple(tys) = tuple.node.ty(&self.analyzer.local_decls, self.tcx).kind()
+        else {
+            unreachable!("the arguments of an `Fn` call form a tuple");
+        };
+        let span = tuple.span;
+        let mut untupled = Vec::new();
+        if !tys.is_empty() {
+            let place = tuple.node.place().expect("a tuple of arguments is a place");
+            for (i, ty) in tys.iter().enumerate() {
+                let field = self.tcx.mk_place_field(place, FieldIdx::from_usize(i), ty);
+                let operand = if self
+                    .tcx
+                    .type_is_copy_modulo_regions(self.analyzer.typing_env, ty)
+                {
+                    mir::Operand::Copy(field)
+                } else if ty.is_mutable_ptr() {
+                    // A `&mut` argument is reborrowed by `ReborrowVisitor`, which reads a local
+                    // as it does the argument of any other call. The local is dropped after the
+                    // call, resolving the prophecy of what is left of the reference.
+                    let decl = mir::LocalDecl::new(ty, Default::default()).immutable();
+                    let new_local = self.analyzer.local_decls.push(decl);
+                    let new_local_ty = self.analyzer.place_type(&field);
+                    self.analyzer.bind_local(new_local, new_local_ty.into());
+                    self.analyzer.drop_after_terminator(new_local);
+                    mir::Operand::Move(new_local.into())
+                } else {
+                    mir::Operand::Move(field)
+                };
+                untupled.push(rustc_span::source_map::Spanned {
+                    node: operand,
+                    span,
+                });
+            }
+        }
+        *args = untupled.into_boxed_slice();
+    }
+}
+
+impl<'a, 'tcx, 'ctx> mir::visit::MutVisitor<'tcx> for RustCallVisitor<'a, 'tcx, 'ctx> {
+    fn tcx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn visit_terminator(
+        &mut self,
+        terminator: &mut mir::Terminator<'tcx>,
+        location: mir::Location,
+    ) {
+        if let mir::TerminatorKind::Call { func, args, .. } = &mut terminator.kind {
+            if let Some((def_id, generic_args)) = func.const_fn_def() {
+                if !self.analyzer.ctx().is_fn_trait_method(def_id) {
+                    self.super_terminator(terminator, location);
+                    return;
+                }
+
+                // RustCallVisitor expects all generic args to be already instantiated
+                let self_ty = generic_args.type_at(0);
+                let callee_ty = peel_shared_refs(self_ty);
+                if self_ty != callee_ty {
+                    self.pass_shared_receiver(args, callee_ty);
+                }
+                if let mir_ty::TyKind::FnDef(..) = callee_ty.kind() {
+                    self.untuple_args(args);
+                    return;
+                }
+                let mir_ty::TyKind::Closure(resolved_def_id, _) = callee_ty.kind() else {
+                    return;
+                };
+                let fn_sig = self.analyzer.ctx().fn_sig(*resolved_def_id);
+                if !matches!(fn_sig.abi, rustc_abi::ExternAbi::RustCall) {
+                    self.super_terminator(terminator, location);
+                    return;
+                }
+                tracing::info!(?def_id, ?resolved_def_id, "handling RustCall function call");
+
+                // three cases to consider:
+                // 1. function of resolved_def_id takes &{closure} but def_id is FnMut::call_mut
+                // 2. function of resolved_def_id takes &{closure} but def_id is FnOnce::call_once
+                // 3. function of resolved_def_id takes &mut {closure} but def_id is FnOnce::call_once
+                let resolved_closure_ty = fn_sig.inputs().first().unwrap();
+                let arg_closure_ty = args
+                    .first()
+                    .unwrap()
+                    .node
+                    .ty(&self.analyzer.local_decls, self.tcx);
+                let arg_closure_place = args.first().unwrap().node.place().unwrap();
+                if matches!(
+                    resolved_closure_ty.ref_mutability(),
+                    Some(mir_ty::Mutability::Not)
+                ) {
+                    if let mir_ty::TyKind::Ref(_, closure_ty, mir_ty::Mutability::Mut) =
+                        arg_closure_ty.kind()
+                    {
+                        // case 1: &mut {closure} -> &{closure}
+                        let borrow_target_place = self.tcx.mk_place_deref(arg_closure_place);
+                        let borrowed_closure_local =
+                            self.insert_immut_reborrow(borrow_target_place, *closure_ty);
+                        args[0].node = mir::Operand::Copy(borrowed_closure_local.into());
+                        tracing::debug!("applied immut-reborrow for closure argument");
+                    } else if arg_closure_ty.ref_mutability().is_none() {
+                        // case 2: {closure} -> &{closure}
+                        let borrowed_closure_local =
+                            self.insert_immut_borrow(arg_closure_place, arg_closure_ty);
+                        args[0].node = mir::Operand::Copy(borrowed_closure_local.into());
+                        // As in case 3, the call no longer consumes the closure, but the drop
+                        // points resolve nothing of it here (`moved_out_parts`), since the
+                        // original MIR moves it into the call: drop it whole after the call
+                        // instead (`DropPoints::after_terminator`).
+                        if arg_closure_place.projection.is_empty() {
+                            self.analyzer.drop_after_terminator(arg_closure_place.local);
+                        }
+                        tracing::debug!("applied immut-borrow for closure argument");
+                    }
+                } else if matches!(
+                    resolved_closure_ty.ref_mutability(),
+                    Some(mir_ty::Mutability::Mut)
+                    if arg_closure_ty.ref_mutability().is_none()
+                ) {
+                    // case 3: {closure} -> &mut {closure}
+                    let borrowed_closure_local =
+                        self.insert_mut_borrow(arg_closure_place, arg_closure_ty);
+                    args[0].node = mir::Operand::Move(borrowed_closure_local.into());
+                    // FnOnce::call_once consumes the closure, but the resolved function
+                    // only borrows it: drop the borrow and the environment after the
+                    // call to resolve the prophecies of the captured mutable borrows.
+                    self.analyzer.drop_after_terminator(borrowed_closure_local);
+                    // The original MIR moves the closure into the call, so the drop points
+                    // resolve nothing of it there (`moved_out_parts`), expecting the callee to
+                    // consume it; the closure is dropped here instead, whole, and in place of
+                    // its entry in the liveness drops (`DropPoints::after_terminator`). A move
+                    // through a projection moves only a part, which the normal drop machinery
+                    // still handles. In practice a non-`Copy` closure (the only kind reaching
+                    // this case) is always moved through a projection-less temporary.
+                    if arg_closure_place.projection.is_empty() {
+                        self.analyzer.drop_after_terminator(arg_closure_place.local);
+                    }
+                    tracing::debug!("applied mut-borrow for closure argument");
+                }
+            }
+        }
+
+        self.super_terminator(terminator, location);
+    }
+}
+
+impl<'a, 'tcx, 'ctx> RustCallVisitor<'a, 'tcx, 'ctx> {
+    pub fn new(analyzer: &'a mut crate::analyze::basic_block::Analyzer<'tcx, 'ctx>) -> Self {
+        let tcx = analyzer.tcx;
+        Self { analyzer, tcx }
+    }
+
+    pub fn visit_terminator(&mut self, term: &mut mir::Terminator<'tcx>) {
+        // dummy location
+        mir::visit::MutVisitor::visit_terminator(self, term, mir::Location::START);
+    }
+}

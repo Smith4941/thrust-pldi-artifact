@@ -1,0 +1,157 @@
+//! Core logic of refinement typing.
+//!
+//! This module includes the definition of the refinement typing environment and the template
+//! type generation from MIR types.
+//!
+//! This module is used by the [`crate::analyze`] module. There is currently no clear boundary between
+//! the `analyze` and `refine` modules, so it is a TODO to integrate this into the `analyze`
+//! module and remove this one.
+
+mod template;
+pub use template::{TemplateRegistry, TemplateScope, TypeBuilder};
+
+mod basic_block;
+pub use basic_block::{BasicBlockType, BasicBlockTypeParamKind};
+
+mod env;
+pub use env::{
+    Assumption, EntryValue, EnumDefProvider, EnumPlacesToExpand, Env, ExistentialNames, PathStep,
+    PlaceType, PlaceTypeBuilder, PlaceTypeVar, ProjStep, TempVarIdx, Var, VarPath,
+};
+
+use crate::chc::{DatatypeSymbol, ForallPred, Sort, UserDefinedPred};
+use rustc_middle::ty as mir_ty;
+use rustc_span::def_id::DefId;
+
+pub fn stable_def_id_symbol(tcx: mir_ty::TyCtxt<'_>, did: DefId, prefix: &str) -> String {
+    let hash = tcx.def_path_hash(did);
+    let path = tcx.def_path(did);
+    if let Some(name) = path.data.last().and_then(|d| d.data.get_opt_name()) {
+        tracing::debug!("stable_def_id_symbol: name={}", name);
+        let name = name
+            .as_str()
+            .replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
+        format!("{}_{}_{}", prefix, name, hash.0.to_hex())
+    } else {
+        hash.0.to_hex()
+    }
+}
+
+pub fn datatype_symbol(tcx: mir_ty::TyCtxt<'_>, did: DefId) -> DatatypeSymbol {
+    DatatypeSymbol::new(stable_def_id_symbol(tcx, did, "d")).named(tcx.def_path_str(did))
+}
+
+/// The symbol of the constructor of `variant` of the datatype `d_sym`.
+pub fn variant_symbol(d_sym: &DatatypeSymbol, variant: impl std::fmt::Display) -> DatatypeSymbol {
+    d_sym.member(variant)
+}
+
+pub fn user_defined_pred(tcx: mir_ty::TyCtxt<'_>, did: DefId) -> UserDefinedPred {
+    UserDefinedPred::new(stable_def_id_symbol(tcx, did, "p")).named(tcx.def_path_str(did))
+}
+
+/// The symbol for the copy of `did`'s predicate emitted at the instantiation
+/// `instance` of the declaring item's type parameters.
+pub fn user_defined_pred_at_instance(
+    tcx: mir_ty::TyCtxt<'_>,
+    did: DefId,
+    instance: Vec<Sort>,
+) -> UserDefinedPred {
+    UserDefinedPred::at_instance(stable_def_id_symbol(tcx, did, "p"), instance)
+        .named(tcx.def_path_str(did))
+}
+
+pub fn trait_forall_pred(
+    tcx: mir_ty::TyCtxt<'_>,
+    did: DefId,
+    type_arguments: String,
+    type_parameters: Vec<Sort>,
+    params: Vec<Sort>,
+) -> ForallPred {
+    ForallPred::new(
+        stable_def_id_symbol(tcx, did, "q"),
+        type_arguments,
+        type_parameters,
+        params,
+    )
+}
+
+pub fn trait_forall_fn(
+    tcx: mir_ty::TyCtxt<'_>,
+    did: DefId,
+    type_arguments: String,
+    type_parameters: Vec<Sort>,
+    params: Vec<Sort>,
+    result: Sort,
+) -> ForallPred {
+    ForallPred::function(
+        stable_def_id_symbol(tcx, did, "q"),
+        type_arguments,
+        type_parameters,
+        params,
+        result,
+    )
+}
+
+pub fn closure_pre_forall_pred(
+    tcx: mir_ty::TyCtxt<'_>,
+    did: DefId,
+    type_arguments: String,
+    type_parameters: Vec<Sort>,
+    params: Vec<Sort>,
+) -> ForallPred {
+    ForallPred::new(
+        stable_def_id_symbol(tcx, did, "q_pre"),
+        type_arguments,
+        type_parameters,
+        params,
+    )
+}
+
+pub fn closure_post_forall_pred(
+    tcx: mir_ty::TyCtxt<'_>,
+    did: DefId,
+    type_arguments: String,
+    type_parameters: Vec<Sort>,
+    params: Vec<Sort>,
+) -> ForallPred {
+    ForallPred::new(
+        stable_def_id_symbol(tcx, did, "q_post"),
+        type_arguments,
+        type_parameters,
+        params,
+    )
+}
+
+/// The postcondition of the trait method `did` at type arguments that are still type
+/// parameters, when it has no specification: one symbol per method and type arguments, shared by
+/// its calls and by `post!` in the contracts that name it.
+pub fn method_post_forall_pred(
+    tcx: mir_ty::TyCtxt<'_>,
+    did: DefId,
+    type_arguments: String,
+    type_parameters: Vec<Sort>,
+    params: Vec<Sort>,
+) -> ForallPred {
+    ForallPred::new(
+        stable_def_id_symbol(tcx, did, "q_method_post"),
+        type_arguments,
+        type_parameters,
+        params,
+    )
+}
+
+pub fn closure_hist_inv_forall_pred(
+    tcx: mir_ty::TyCtxt<'_>,
+    did: DefId,
+    type_arguments: String,
+    type_parameters: Vec<Sort>,
+    params: Vec<Sort>,
+) -> ForallPred {
+    ForallPred::new(
+        stable_def_id_symbol(tcx, did, "q_hist_inv"),
+        type_arguments,
+        type_parameters,
+        params,
+    )
+}

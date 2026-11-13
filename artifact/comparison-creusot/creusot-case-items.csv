@@ -1,0 +1,14 @@
+id,file,items
+common,common.rs,Iterator
+range,range.rs,Range
+iter_mut,iter_mut.rs,IterMut iter_mut
+map,map.rs,Map map
+map_ext,map_ext.rs,Map map
+skip,skip.rs,Skip
+take,take.rs,Take
+fuse,fuse.rs,Fuse FusedIterator
+all_zero,all_zero.rs,all_zero
+skip_take,skip_take.rs,skip_take
+counter,counter.rs,counter
+extend,concat_vec.rs,extend_index
+decuple_range,decuple_range.rs,decuple_range

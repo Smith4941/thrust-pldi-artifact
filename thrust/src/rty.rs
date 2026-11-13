@@ -1,0 +1,3383 @@
+//! Data structures for refinement types.
+//!
+//! Thrust is a refinement type system, and so its analysis is about giving refinement types to
+//! variables and terms. This module defines the data structures for representing refinement
+//! types. The central data structure is [`RefinedType`], which is just [`Type`] plus [`Refinement`].
+//!
+//! Note that there are two notions of "variables" in this module. First is a type variable which is
+//! a polymorphic type parameter which is represented by [`TypeParamIdx`], and forms one of valid type as [`ParamType`].
+//! `T` in `struct S<T> { f: T }` is a type variable. See [`params`] module for the handling of type parameters.
+//! Second is a logical variable which is a variable that can appear in logical predicates.
+//! `x` and `y` in `{ x: int | x > y }` are logical variables.
+//! The actual representation of logical variables varies by context and so it is often parameterized
+//! as a type parameter in this module (`T` in `Type<T>`). In [`FunctionType`], logical variables are
+//! function parameters (`Type<FunctionParamIdx`), and during the actual analysis, logical variables are
+//! program variables bound in the environment (`Type<Var>`, see [`crate::refine::Var`]).
+//! We have [`RefinedTypeVar<T>`] to denote logical variables in refinement predicates, which
+//! accepts existential variables and a variable bound in the refinement type (`x` in `{ x: T | phi
+//! }`) in addition to variables `T` from the outer scope. This module also contains [`Closed`] which is
+//! used to denote a closed type, so `Type<Closed>` ensures no logical variables from the outer scope
+//! appear in that type.
+//!
+//! We have distinct types for each variant of [`Type`], such as [`FunctionType`] and
+//! [`PointerType`]. [`Type`], [`RefinedType`] and these variant types share some common operations:
+//!
+//! - `subst_var`: Substitutes logical variables with logical terms.
+//! - `map_var`: Maps logical variables to other logical variables.
+//! - `subst_ty_params`: Substitutes type parameters with other types. Since this replaces
+//!   type parameters with refinement types, [`Type`] does not implement this, and
+//!   [`RefinedType::subst_ty_params`] handles the substitution logic instead.
+//! - `strip_refinement`: Strips the refinements recursively and returns a [`Closed`] type.
+//!
+//! This module also implements several logics for manipulating refinement types and is extensively used in
+//! upstream logic in the [`crate::refine`] and [`crate::analyze`] modules.
+//!
+//! - [`template`]: Generates "template" refinement types with unknown predicates to be inferred.
+//! - [`subtyping`]: Generates CHC constraints [`crate::chc`] from subtyping relations between types.
+//! - [`clause_builder`]: Helper to build [`crate::chc::Clause`] from the refinement types.
+
+use std::collections::HashMap;
+
+use num_bigint::BigInt;
+use pretty::{termcolor, Pretty};
+use rustc_abi::VariantIdx;
+use rustc_index::IndexVec;
+
+use crate::chc::{self, ForallSortIdx};
+
+mod template;
+pub use template::{Template, TemplateBuilder};
+
+mod clause_builder;
+pub use clause_builder::ClauseBuilderExt;
+
+mod subtyping;
+pub use subtyping::{
+    relate_refining_function_type, relate_sub_param_types, ClauseScope, ScopedBuilder, Subtyping,
+};
+
+mod params;
+pub use params::{RefinedTypeArgs, TypeParamIdx, TypeParamSubst};
+
+rustc_index::newtype_index! {
+    /// An index representing function parameter.
+    ///
+    /// We manage function parameters using indices that are unique in a function.
+    /// [`FunctionType`] contains `IndexVec<FunctionParamIdx, RefinedType<FunctionParamIdx>>`
+    /// that manages the indices and types of the function parameters.
+    #[orderable]
+    #[debug_format = "${}"]
+    pub struct FunctionParamIdx { }
+}
+
+impl std::fmt::Display for FunctionParamIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "${}", self.index())
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &FunctionParamIdx
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self)
+    }
+}
+
+/// One step in a [`TypePosition`] path.
+///
+/// A path is a sequence of steps that addresses a sub-type within a
+/// (potentially nested) function signature:
+/// - [`Param`](Self::Param) / [`Return`](Self::Return) navigate into a
+///   function type's parameter or return slot respectively.
+/// - [`TypeArg`](Self::TypeArg) navigates into the `i`-th type argument of a
+///   generic type (enum, `Box`, etc.).
+///
+/// Using distinct variants for function navigation ([`Param`](Self::Param),
+/// [`Return`](Self::Return)) and generic-arg navigation
+/// ([`TypeArg`](Self::TypeArg)) allows the same path representation to address
+/// positions inside higher-order function types. For example, `$0, result`
+/// addresses the return type of a function-typed first parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypePositionStep {
+    /// Navigate to the `i`-th parameter of a function type.
+    Param(FunctionParamIdx),
+    /// Navigate to the return type of a function type.
+    Return,
+    /// Navigate to the `i`-th type argument of a generic type (enum, `Box`, …).
+    TypeArg(usize),
+}
+
+impl std::fmt::Display for TypePositionStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            TypePositionStep::Param(idx) => write!(f, "{}", idx),
+            TypePositionStep::Return => f.write_str("result"),
+            TypePositionStep::TypeArg(i) => write!(f, "{}", i),
+        }
+    }
+}
+
+/// A path of [`TypePositionStep`]s addressing a sub-type within a type, used
+/// to attach a refinement.
+///
+/// An empty path addresses the type itself; a path applied to a function type
+/// is therefore non-empty, beginning with a `Param` or `Return` step.
+///
+/// Examples (function `fn f(x: List<T>) -> Box<T>`):
+/// - `$0` — parameter `x`.
+/// - `result` — the return type.
+/// - `$0, 0` — the first type arg of `x`.
+/// - `result, 0` — the pointee of the `Box` return.
+/// - `$0, result` — the return of a function-typed param `x`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypePosition {
+    steps: Vec<TypePositionStep>,
+}
+
+impl TypePosition {
+    pub fn new(steps: Vec<TypePositionStep>) -> Self {
+        TypePosition { steps }
+    }
+
+    pub fn steps(&self) -> &[TypePositionStep] {
+        &self.steps
+    }
+}
+
+impl std::fmt::Display for TypePosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut iter = self.steps.iter();
+        if let Some(first) = iter.next() {
+            write!(f, "{}", first)?;
+        }
+        for s in iter {
+            write!(f, ", {}", s)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FunctionAbi {
+    #[default]
+    Rust,
+    RustCall,
+}
+
+impl std::fmt::Display for FunctionAbi {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FunctionAbi {
+    pub fn name(&self) -> &'static str {
+        match self {
+            FunctionAbi::Rust => "rust",
+            FunctionAbi::RustCall => "rust-call",
+        }
+    }
+
+    pub fn is_rust(&self) -> bool {
+        matches!(self, FunctionAbi::Rust)
+    }
+
+    pub fn is_rust_call(&self) -> bool {
+        matches!(self, FunctionAbi::RustCall)
+    }
+}
+
+/// A function type.
+///
+/// In Thrust, function types are closed. Because of that, function types, thus its parameters and
+/// return type only refer to the parameters of the function itself using [`FunctionParamIdx`] and
+/// do not accept other type of variables from the environment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FunctionType {
+    pub params: IndexVec<FunctionParamIdx, RefinedType<FunctionParamIdx>>,
+    pub ret: Box<RefinedType<FunctionParamIdx>>,
+    pub abi: FunctionAbi,
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &FunctionType
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let abi = match self.abi {
+            FunctionAbi::Rust => allocator.nil(),
+            abi => allocator
+                .text("extern")
+                .append(allocator.space())
+                .append(allocator.as_string(abi))
+                .append(allocator.space()),
+        };
+        let separator = allocator.text(",").append(allocator.line());
+        abi.append(
+            allocator
+                .intersperse(self.params.iter().map(|ty| ty.pretty(allocator)), separator)
+                .parens(),
+        )
+        .append(allocator.space())
+        .append(allocator.text("→"))
+        .append(allocator.line())
+        .append(self.ret.pretty(allocator))
+        .group()
+    }
+}
+
+impl FunctionType {
+    pub fn new(
+        params: IndexVec<FunctionParamIdx, RefinedType<FunctionParamIdx>>,
+        ret: RefinedType<FunctionParamIdx>,
+    ) -> Self {
+        FunctionType {
+            params,
+            ret: Box::new(ret),
+            abi: FunctionAbi::Rust,
+        }
+    }
+
+    pub fn with_abi(mut self, abi: FunctionAbi) -> Self {
+        self.abi = abi;
+        self
+    }
+
+    pub fn last_param(&self) -> Option<&RefinedType<FunctionParamIdx>> {
+        let last_index = self.params.last_index()?;
+        self.params.get(last_index)
+    }
+
+    /// Because function types are always closed in Thrust, we can convert this into
+    /// [`Type<Closed>`].
+    pub fn into_closed_ty(self) -> Type<Closed> {
+        Type::Function(self)
+    }
+
+    pub fn subst_ty_params(&mut self, subst: &TypeParamSubst<Closed>) {
+        let subst = subst.clone().vacuous();
+        for param in &mut self.params {
+            param.subst_ty_params(&subst);
+        }
+        self.ret.subst_ty_params(&subst);
+    }
+
+    /// Removes the parameter at the given index from this function type.
+    ///
+    /// References to the remaining parameters in other parameters' refinements and the
+    /// return type are shifted down by one. Panics if any reference to the removed
+    /// parameter remains.
+    pub fn remove_param(&mut self, idx: FunctionParamIdx) -> RefinedType<FunctionParamIdx> {
+        let shift = |v: FunctionParamIdx| -> FunctionParamIdx {
+            if v == idx {
+                panic!("variable {v} references the parameter being removed");
+            } else if v > idx {
+                FunctionParamIdx::from_usize(v.index() - 1)
+            } else {
+                v
+            }
+        };
+        let removed = self.params.raw.remove(idx.index());
+        let old_params = std::mem::take(&mut self.params);
+        self.params = old_params.into_iter().map(|p| p.map_var(shift)).collect();
+        let old_ret = std::mem::replace(
+            &mut self.ret,
+            Box::new(RefinedType::unrefined(Type::unit())),
+        );
+        self.ret = Box::new(old_ret.map_var(shift));
+
+        if let Some(last_idx) = self.params.last_index() {
+            let refinement = removed.refinement.clone().map_var(|v| match v {
+                RefinedTypeVar::Value => {
+                    panic!("refinement of the parameter being removed references its own value")
+                }
+                RefinedTypeVar::Free(v) if shift(v) == last_idx => RefinedTypeVar::Value,
+                RefinedTypeVar::Free(v) => RefinedTypeVar::Free(shift(v)),
+                v => v,
+            });
+            self.params[last_idx].refinement.push_conj(refinement);
+        }
+        removed
+    }
+
+    /// Maps each parameter of this function type to the logical term that represents its value,
+    /// given the parameter values `args` supplied at a (spec-level) application site.
+    ///
+    /// The i-th argument is the value of the i-th parameter; there must be exactly one argument per
+    /// parameter. For closures ([`FunctionAbi::RustCall`]), the caller supplies the closure
+    /// environment as the first argument.
+    fn param_terms<W>(&self, args: &[chc::Term<W>]) -> IndexVec<FunctionParamIdx, chc::Term<W>>
+    where
+        W: chc::Var,
+    {
+        assert_eq!(
+            args.len(),
+            self.params.len(),
+            "expected exactly one argument per parameter"
+        );
+        self.params
+            .indices()
+            .map(|idx| args[idx.index()].clone())
+            .collect()
+    }
+
+    /// The precondition of this function instantiated with the parameter values `args`, expressed as
+    /// a [`chc::Formula`] in the caller's variable space `W`.
+    ///
+    /// The precondition is the conjunction of the refinements of all parameters, with each
+    /// parameter's value variable replaced by the corresponding argument term, and of the
+    /// refinements inside their types ([`inner_refinements_formula`]): the body assumes those of
+    /// the values it is given as it assumes the parameters' own, so a call through the
+    /// precondition (a `pre!`) must establish them as a direct call's subtyping does.
+    pub fn precondition_formula<W>(
+        &self,
+        args: &[chc::Term<W>],
+        parts: &mut PartVars<'_>,
+    ) -> chc::Formula<W>
+    where
+        W: chc::Var,
+    {
+        let mut acc = self.param_refinements_formula(args);
+        let param_terms = self.param_terms(args);
+        for (idx, param) in self.params.iter_enumerated() {
+            let value = param_terms[idx].clone();
+            let inner =
+                inner_refinements_formula(&param.ty, value, &param_terms, parts, &mut Vec::new());
+            if !inner.is_top() {
+                acc = acc.and(inner);
+            }
+        }
+        acc
+    }
+
+    /// The part of [`Self::precondition_formula`] that the parameters' own refinements state,
+    /// without the refinements inside their types.
+    pub fn param_refinements_formula<W>(&self, args: &[chc::Term<W>]) -> chc::Formula<W>
+    where
+        W: chc::Var,
+    {
+        let param_terms = self.param_terms(args);
+        let mut acc = chc::Formula::top();
+        for (idx, param) in self.params.iter_enumerated() {
+            let f = refinement_to_chc_formula(
+                &param.refinement,
+                param_terms[idx].clone(),
+                &param_terms,
+            );
+            acc = acc.and(f);
+        }
+        acc
+    }
+
+    /// The postcondition of this function instantiated with the parameter values `args` and return
+    /// value `result`, expressed as a [`chc::Formula`] in the caller's variable space `W`.
+    pub fn postcondition_formula<W>(
+        &self,
+        args: &[chc::Term<W>],
+        result: chc::Term<W>,
+    ) -> chc::Formula<W>
+    where
+        W: chc::Var,
+    {
+        let param_terms = self.param_terms(args);
+        refinement_to_chc_formula(&self.ret.refinement, result, &param_terms)
+    }
+
+    /// The postcondition of a closure call at `args`. `final_state` is the variable `f` of the
+    /// receiver `Mut::new(state, f)` when the closure is `FnMut` and its state is held as a value:
+    /// such a call ends in some final state and drops it, as Creusot's `postcondition_once` of an
+    /// `FnMut` closure is `exists s. postcondition_mut(self, args, s, res) && resolve(s)` (the
+    /// `fn_mut_once` law). The dropped state is resolved ([`Type::resolution`]), the payloads of
+    /// its enums through variables `parts` makes, bound with the final state.
+    pub fn once_postcondition_formula<W>(
+        &self,
+        args: &[chc::Term<W>],
+        result: chc::Term<W>,
+        final_state: Option<(chc::UserQuantifiedVarId, chc::Sort)>,
+        parts: &mut PartVars<'_>,
+    ) -> chc::Formula<W>
+    where
+        W: chc::Var,
+    {
+        let post = self.postcondition_formula(args, result);
+        let Some((final_, sort)) = final_state else {
+            return post;
+        };
+        let state_ty = &self.params[FunctionParamIdx::from_usize(0)]
+            .ty
+            .as_pointer()
+            .unwrap()
+            .elem
+            .ty;
+        let state = chc::Term::UserQuantifiedVar(sort.clone(), final_);
+        let mut vars = vec![(final_, sort)];
+        let dropped = state_ty.resolution(state, parts.defs, &mut |sort| {
+            parts.fresh_term(sort, &mut vars)
+        });
+        let post = dropped
+            .atoms
+            .into_iter()
+            .fold(post, |post, atom| post.and(atom.into()));
+        let post = if dropped.formula.is_top() {
+            post
+        } else {
+            post.and(dropped.formula)
+        };
+        chc::Formula::exists(vars, post)
+    }
+}
+
+/// What a formula about a value needs to talk of its parts: the definitions of the enums it
+/// holds, and a fresh variable for each part the formula binds (a field of an enum's variant, an
+/// index of a sequence).
+pub struct PartVars<'a> {
+    pub defs: &'a dyn EnumDefProvider,
+    pub fresh: &'a mut dyn FnMut() -> chc::UserQuantifiedVarId,
+}
+
+impl PartVars<'_> {
+    /// A fresh variable of `sort`, pushed onto `vars` for the caller to bind.
+    fn fresh_term<W>(&mut self, sort: chc::Sort, vars: &mut QuantifiedVars) -> chc::Term<W> {
+        let var = (self.fresh)();
+        vars.push((var, sort.clone()));
+        chc::Term::UserQuantifiedVar(sort, var)
+    }
+}
+
+/// The refinements inside the type `ty` of a parameter, stated of its value `value` in the
+/// caller's variable space, `param_terms` giving the parameters they may name: those of the
+/// elements of a tuple, of the content of a box or a shared reference, of the current content of
+/// a mutable reference (its final one is the callee's to give), of the elements of a sequence,
+/// and of the fields of an enum's variant at the enum's type arguments. A template gives an
+/// enum's type arguments unknown predicates, which the body assumes of the payloads it is given.
+///
+/// The variant of an enum is stated as `bind_enum` assumes it, for the variant the value is:
+/// `discr(v) = d => exists f. v = C(f) && refinements(f)` of each variant whose fields have
+/// refinements, `f` variables `parts` makes. An enum whose arguments have no refinement has none
+/// in its payload. One met again in its own payload (`enclosing`), or nested past
+/// [`ENUM_NESTING_LIMIT`], is one no finite formula follows through its payloads: the
+/// refinements of each of its type arguments are stated of every value of the argument's type
+/// instead ([`every_value_formula`]), which recurses over the arguments' types and so ends. That
+/// requires more than the body assumes of the payloads: it is sound, and an unknown can still be
+/// taken `true`, but a written refinement there makes the precondition false. The index and the
+/// elements of an array are stated so too.
+///
+/// A function type inside `ty` (a function pointer) is not stated: a value of a function type
+/// has no term to state its template's contract of, which only a direct call's subtyping relates
+/// to the function the value is.
+fn inner_refinements_formula<W>(
+    ty: &Type<FunctionParamIdx>,
+    value: chc::Term<W>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+    parts: &mut PartVars<'_>,
+    enclosing: &mut Vec<EnumType<FunctionParamIdx>>,
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    match ty {
+        Type::Pointer(ty) if ty.is_mut() => {
+            refined_formula(&ty.elem, value.mut_current(), param_terms, parts, enclosing)
+        }
+        Type::Pointer(ty) => refined_formula(
+            &ty.elem,
+            ty.kind.deref_term(value),
+            param_terms,
+            parts,
+            enclosing,
+        ),
+        Type::Tuple(ty) => {
+            let mut acc = chc::Formula::top();
+            for (index, elem) in ty.elems.iter().enumerate() {
+                let elem_value = value.clone().tuple_proj(index);
+                let elem = refined_formula(elem, elem_value, param_terms, parts, enclosing);
+                acc = conj(acc, elem);
+            }
+            acc
+        }
+        Type::Seq(elem) => seq_refinements_formula(elem, value, param_terms, parts, enclosing),
+        Type::Array(array) => {
+            let index = every_value_formula(&array.index, param_terms, parts, enclosing);
+            let elem = every_value_formula(&array.elem, param_terms, parts, enclosing);
+            conj(index, elem)
+        }
+        Type::Enum(ety) => enum_refinements_formula(ety, value, param_terms, parts, enclosing),
+        _ => chc::Formula::top(),
+    }
+}
+
+/// The refinement of `rty` and those inside it ([`inner_refinements_formula`]) of `value`.
+fn refined_formula<W>(
+    rty: &RefinedType<FunctionParamIdx>,
+    value: chc::Term<W>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+    parts: &mut PartVars<'_>,
+    enclosing: &mut Vec<EnumType<FunctionParamIdx>>,
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    let own = inner_refinement_to_chc_formula(&rty.refinement, value.clone(), param_terms, parts);
+    let inner = inner_refinements_formula(&rty.ty, value, param_terms, parts, enclosing);
+    conj(own, inner)
+}
+
+/// `forall i. 0 <= i < len(seq) => refinements(seq[i])` of a sequence `seq` whose elements are
+/// of `elem`; top when they have none.
+fn seq_refinements_formula<W>(
+    elem: &RefinedType<FunctionParamIdx>,
+    seq: chc::Term<W>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+    parts: &mut PartVars<'_>,
+    enclosing: &mut Vec<EnumType<FunctionParamIdx>>,
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    if !elem.has_refinement() {
+        return chc::Formula::top();
+    }
+    let mut vars = Vec::new();
+    let i = parts.fresh_term(chc::Sort::int(), &mut vars);
+    let elem = refined_formula(
+        elem,
+        seq.clone().seq_nth(i.clone()),
+        param_terms,
+        parts,
+        enclosing,
+    );
+    let lower = chc::Atom::new(
+        chc::KnownPred::GREATER_THAN_OR_EQUAL.into(),
+        vec![i.clone(), chc::Term::int(0)],
+    );
+    let upper = chc::Atom::new(chc::KnownPred::LESS_THAN.into(), vec![i, seq.seq_len()]);
+    let in_bounds = chc::Formula::Atom(lower).and(chc::Formula::Atom(upper));
+    chc::Formula::forall(vars, in_bounds.implies(elem))
+}
+
+/// The refinements of the payload of `value`, of the enum type `ety`, for the variant it is
+/// ([`inner_refinements_formula`]).
+fn enum_refinements_formula<W>(
+    ety: &EnumType<FunctionParamIdx>,
+    value: chc::Term<W>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+    parts: &mut PartVars<'_>,
+    enclosing: &mut Vec<EnumType<FunctionParamIdx>>,
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    if !ety.args.iter().any(RefinedType::has_refinement) {
+        return chc::Formula::top();
+    }
+    if enclosing.contains(ety) || enclosing.len() >= ENUM_NESTING_LIMIT {
+        return ety.args.iter().fold(chc::Formula::top(), |acc, arg| {
+            conj(acc, every_value_formula(arg, param_terms, parts, enclosing))
+        });
+    }
+    enclosing.push(ety.clone());
+    let mut acc = chc::Formula::top();
+    for variant in parts.defs.enum_def(&ety.symbol).variants {
+        let field_rtys: Vec<_> = variant
+            .field_tys
+            .into_iter()
+            .map(|field_ty| {
+                let mut field_rty = field_ty.vacuous();
+                field_rty.instantiate_ty_params(ety.args.clone());
+                field_rty
+            })
+            .collect();
+        if !field_rtys.iter().any(RefinedType::has_refinement) {
+            continue;
+        }
+        // `is_C(v) ⇒ refinements(sel_C(v))`: the tester guards the selectors.
+        let sort = chc::DatatypeSort::new(ety.symbol.clone(), ety.arg_sorts());
+        let mut payload = chc::Formula::top();
+        for (index, field_rty) in field_rtys.iter().enumerate() {
+            let field = chc::Term::datatype_selector(
+                sort.clone(),
+                variant.name.clone(),
+                index,
+                field_rty.ty.to_sort(),
+                value.clone(),
+            );
+            let field = refined_formula(field_rty, field, param_terms, parts, enclosing);
+            payload = conj(payload, field);
+        }
+        let is_variant =
+            chc::Atom::new(chc::Pred::Tester(variant.name.clone()), vec![value.clone()]);
+        acc = conj(acc, chc::Formula::Atom(is_variant).implies(payload));
+    }
+    enclosing.pop();
+    acc
+}
+
+/// `forall x. refinements(x)` of the refinement of `rty` and those inside it
+/// ([`refined_formula`]); top when it has none.
+fn every_value_formula<W>(
+    rty: &RefinedType<FunctionParamIdx>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+    parts: &mut PartVars<'_>,
+    enclosing: &mut Vec<EnumType<FunctionParamIdx>>,
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    if !rty.has_refinement() {
+        return chc::Formula::top();
+    }
+    let mut vars = Vec::new();
+    let x = parts.fresh_term(rty.ty.to_sort(), &mut vars);
+    let formula = refined_formula(rty, x, param_terms, parts, enclosing);
+    chc::Formula::forall(vars, formula)
+}
+
+/// The conjunction of `a` and `b`, either of them left out when it is top.
+fn conj<W>(a: chc::Formula<W>, b: chc::Formula<W>) -> chc::Formula<W> {
+    if a.is_top() {
+        b
+    } else if b.is_top() {
+        a
+    } else {
+        a.and(b)
+    }
+}
+
+/// [`refinement_to_chc_formula`] of a refinement inside a parameter's type, whose existentials
+/// are variables `parts` makes, bound around it.
+fn inner_refinement_to_chc_formula<W>(
+    refinement: &Refinement<FunctionParamIdx>,
+    value: chc::Term<W>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+    parts: &mut PartVars<'_>,
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    let mut vars = Vec::new();
+    let existentials: Vec<_> = refinement
+        .existentials()
+        .map(|(_, sort)| parts.fresh_term(sort.clone(), &mut vars))
+        .collect();
+    let formula = refinement_formula_at(refinement, value, param_terms, &existentials);
+    if vars.is_empty() || formula.is_top() {
+        formula
+    } else {
+        chc::Formula::exists(vars, formula)
+    }
+}
+
+/// Lowers a [`Refinement`] (over [`FunctionParamIdx`]) into a [`chc::Formula`] in the caller's
+/// variable space `W`, substituting [`RefinedTypeVar::Value`] with `value` and
+/// [`RefinedTypeVar::Free`] with the corresponding entry of `param_terms`.
+///
+/// Closure parameter/return refinements are predicate-variable templates without existentials, so
+/// [`RefinedTypeVar::Existential`] is not expected here.
+fn refinement_to_chc_formula<W>(
+    refinement: &Refinement<FunctionParamIdx>,
+    value: chc::Term<W>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    assert!(
+        refinement.existentials.is_empty(),
+        "closure refinements with existentials are not supported"
+    );
+    refinement_formula_at(refinement, value, param_terms, &[])
+}
+
+/// The body of `refinement` as a formula, its value variable `value`, its free variables the
+/// entries of `param_terms` and its existentials the terms `existentials`.
+fn refinement_formula_at<W>(
+    refinement: &Refinement<FunctionParamIdx>,
+    value: chc::Term<W>,
+    param_terms: &IndexVec<FunctionParamIdx, chc::Term<W>>,
+    existentials: &[chc::Term<W>],
+) -> chc::Formula<W>
+where
+    W: chc::Var,
+{
+    let body = refinement.body.clone().subst_var(|v| match v {
+        RefinedTypeVar::Value => value.clone(),
+        RefinedTypeVar::Free(j) => param_terms[j].clone(),
+        RefinedTypeVar::Existential(ev) => existentials[ev.index()].clone(),
+    });
+    let mut formula = body.formula;
+    for atom in body.atoms {
+        formula = formula.and(chc::Formula::Atom(atom));
+    }
+    formula
+}
+
+/// The kind of a reference, which is either mutable or immutable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefKind {
+    Mut,
+    Immut,
+}
+
+impl std::fmt::Display for RefKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            RefKind::Mut => f.write_str("mut"),
+            RefKind::Immut => f.write_str("immut"),
+        }
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &RefKind
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self)
+    }
+}
+
+/// The kind of a pointer, which is either a reference or an owned pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerKind {
+    Ref(RefKind),
+    Own,
+}
+
+impl std::fmt::Display for PointerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            PointerKind::Own => f.write_str("own"),
+            PointerKind::Ref(m) => write!(f, "&{}", m),
+        }
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &PointerKind
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self)
+    }
+}
+
+impl From<RefKind> for PointerKind {
+    fn from(kind: RefKind) -> PointerKind {
+        PointerKind::Ref(kind)
+    }
+}
+
+impl PointerKind {
+    pub fn deref_term<V>(self, term: chc::Term<V>) -> chc::Term<V> {
+        match self {
+            PointerKind::Own | PointerKind::Ref(RefKind::Immut) => term.box_current(),
+            PointerKind::Ref(RefKind::Mut) => term.mut_current(),
+        }
+    }
+}
+
+/// A pointer type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PointerType<T> {
+    pub kind: PointerKind,
+    pub elem: Box<RefinedType<T>>,
+}
+
+impl<'a, T, D> Pretty<'a, D, termcolor::ColorSpec> for &PointerType<T>
+where
+    T: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        self.kind
+            .pretty(allocator)
+            .append(allocator.space())
+            .append(self.elem.pretty_atom(allocator))
+    }
+}
+
+impl<T> PointerType<T> {
+    pub fn new(kind: PointerKind, elem: Type<T>) -> Self {
+        PointerType {
+            kind,
+            elem: Box::new(RefinedType::unrefined(elem)),
+        }
+    }
+
+    pub fn mut_to(ty: Type<T>) -> Self {
+        PointerType {
+            kind: PointerKind::Ref(RefKind::Mut),
+            elem: Box::new(RefinedType::unrefined(ty)),
+        }
+    }
+
+    pub fn immut_to(ty: Type<T>) -> Self {
+        PointerType {
+            kind: PointerKind::Ref(RefKind::Immut),
+            elem: Box::new(RefinedType::unrefined(ty)),
+        }
+    }
+
+    pub fn mut_to_refined(ty: RefinedType<T>) -> Self {
+        PointerType {
+            kind: PointerKind::Ref(RefKind::Mut),
+            elem: Box::new(ty),
+        }
+    }
+
+    pub fn immut_to_refined(ty: RefinedType<T>) -> Self {
+        PointerType {
+            kind: PointerKind::Ref(RefKind::Immut),
+            elem: Box::new(ty),
+        }
+    }
+
+    pub fn is_mut(&self) -> bool {
+        matches!(self.kind, PointerKind::Ref(RefKind::Mut))
+    }
+
+    pub fn is_own(&self) -> bool {
+        matches!(self.kind, PointerKind::Own)
+    }
+
+    pub fn own(ty: Type<T>) -> Self {
+        PointerType::own_refined(RefinedType::unrefined(ty))
+    }
+
+    pub fn own_refined(ty: RefinedType<T>) -> Self {
+        PointerType {
+            kind: PointerKind::Own,
+            elem: Box::new(ty),
+        }
+    }
+
+    pub fn subst_var<F, U>(self, f: F) -> PointerType<U>
+    where
+        F: FnMut(T) -> chc::Term<U>,
+    {
+        PointerType {
+            kind: self.kind,
+            elem: Box::new(self.elem.subst_var(f)),
+        }
+    }
+
+    pub fn map_var<F, U>(self, f: F) -> PointerType<U>
+    where
+        F: FnMut(T) -> U,
+    {
+        PointerType {
+            kind: self.kind,
+            elem: Box::new(self.elem.map_var(f)),
+        }
+    }
+
+    pub fn strip_refinement(self) -> PointerType<Closed> {
+        PointerType {
+            kind: self.kind,
+            elem: Box::new(RefinedType::unrefined(self.elem.strip_refinement())),
+        }
+    }
+
+    pub fn subst_ty_params(&mut self, subst: &TypeParamSubst<T>)
+    where
+        T: chc::Var,
+    {
+        self.elem.subst_ty_params(subst)
+    }
+}
+
+/// A tuple type.
+///
+/// Note that the current implementation uses tuples to represent structs. See
+/// implementation in `crate::refine::template` module for details.
+/// It is our TODO to improve the struct representation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TupleType<T> {
+    pub elems: Vec<RefinedType<T>>,
+}
+
+impl<'a, T, D> Pretty<'a, D, termcolor::ColorSpec> for &TupleType<T>
+where
+    T: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        if self.elems.len() == 1 {
+            self.elems[0].pretty(allocator).append(",").parens()
+        } else {
+            let separator = allocator.text(",").append(allocator.line());
+            allocator
+                .intersperse(self.elems.iter().map(|s| s.pretty(allocator)), separator)
+                .parens()
+        }
+    }
+}
+
+impl<T> TupleType<T> {
+    pub fn new(elems: Vec<Type<T>>) -> Self {
+        TupleType {
+            elems: elems.into_iter().map(RefinedType::unrefined).collect(),
+        }
+    }
+
+    pub fn unit() -> Self {
+        TupleType::new(vec![])
+    }
+
+    pub fn is_unit(&self) -> bool {
+        self.elems.is_empty()
+    }
+
+    pub fn subst_var<F, U>(self, mut f: F) -> TupleType<U>
+    where
+        F: FnMut(T) -> chc::Term<U>,
+    {
+        TupleType {
+            elems: self
+                .elems
+                .into_iter()
+                .map(|ty| ty.subst_var(&mut f))
+                .collect(),
+        }
+    }
+
+    pub fn map_var<F, U>(self, mut f: F) -> TupleType<U>
+    where
+        F: FnMut(T) -> U,
+    {
+        TupleType {
+            elems: self
+                .elems
+                .into_iter()
+                .map(|ty| ty.map_var(&mut f))
+                .collect(),
+        }
+    }
+
+    pub fn strip_refinement(self) -> TupleType<Closed> {
+        TupleType {
+            elems: self
+                .elems
+                .into_iter()
+                .map(|ty| RefinedType::unrefined(ty.strip_refinement()))
+                .collect(),
+        }
+    }
+
+    pub fn subst_ty_params(&mut self, subst: &TypeParamSubst<T>)
+    where
+        T: chc::Var,
+    {
+        for elem in &mut self.elems {
+            elem.subst_ty_params(subst);
+        }
+    }
+}
+
+/// A definition of an enum variant, found in [`EnumDatatypeDef`].
+#[derive(Debug, Clone)]
+pub struct EnumVariantDef {
+    pub name: chc::DatatypeSymbol,
+    pub discr: BigInt,
+    pub field_tys: Vec<RefinedType<Closed>>,
+}
+
+/// A definition of an enum datatype.
+#[derive(Debug, Clone)]
+pub struct EnumDatatypeDef {
+    pub name: chc::DatatypeSymbol,
+    pub ty_params: usize,
+    pub variants: IndexVec<VariantIdx, EnumVariantDef>,
+}
+
+impl EnumDatatypeDef {
+    pub fn field_tys(&self) -> impl Iterator<Item = &RefinedType<Closed>> {
+        self.variants.iter().flat_map(|v| &v.field_tys)
+    }
+}
+
+/// The definitions of the enums a crate's types name, by the enum's name. An [`EnumType`] names its
+/// definition without holding it; the facts of its payloads ([`RefinedType::formula_with`],
+/// [`type_fact_checks`]) are read from a provider.
+pub trait EnumDefProvider {
+    fn enum_def(&self, name: &chc::DatatypeSymbol) -> EnumDatatypeDef;
+}
+
+impl<T: EnumDefProvider> EnumDefProvider for &T {
+    fn enum_def(&self, name: &chc::DatatypeSymbol) -> EnumDatatypeDef {
+        <T as EnumDefProvider>::enum_def(self, name)
+    }
+}
+
+/// A variant of an enum type: its constructor, its discriminant and the types of its fields at the
+/// type's arguments.
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub ctor: chc::DatatypeSymbol,
+    pub discr: BigInt,
+    pub field_tys: Vec<Type<Closed>>,
+}
+
+impl EnumType<Closed> {
+    pub fn variants(&self, defs: &dyn EnumDefProvider) -> Vec<EnumVariant> {
+        defs.enum_def(&self.symbol)
+            .variants
+            .into_iter()
+            .map(|variant| EnumVariant {
+                ctor: variant.name,
+                discr: variant.discr,
+                field_tys: variant
+                    .field_tys
+                    .into_iter()
+                    .map(|field| {
+                        let mut field = RefinedType::unrefined(field.ty);
+                        field.instantiate_ty_params(self.args.clone());
+                        field.ty
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+/// An enum type.
+///
+/// An enum type includes its type arguments and the argument types can refer to outer variables `T`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EnumType<T> {
+    pub symbol: chc::DatatypeSymbol,
+    pub args: IndexVec<TypeParamIdx, RefinedType<T>>,
+}
+
+impl<'a, D, V> Pretty<'a, D, termcolor::ColorSpec> for &EnumType<V>
+where
+    V: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let inner = allocator.intersperse(
+            self.args.iter().map(|t| t.pretty(allocator)),
+            allocator.text(",").append(allocator.line()),
+        );
+        let sym = self.symbol.pretty(allocator);
+        if self.args.is_empty() {
+            sym
+        } else {
+            sym.append(allocator.line())
+                .append(inner.nest(2).angles())
+                .group()
+        }
+    }
+}
+
+impl<T> EnumType<T> {
+    pub fn new(symbol: chc::DatatypeSymbol, args: RefinedTypeArgs<T>) -> Self {
+        EnumType { symbol, args }
+    }
+
+    pub fn symbol(&self) -> &chc::DatatypeSymbol {
+        &self.symbol
+    }
+
+    pub fn arg_sorts(&self) -> Vec<chc::Sort> {
+        self.args.iter().map(|ty| ty.ty.to_sort()).collect()
+    }
+
+    pub fn subst_var<F, U>(self, mut f: F) -> EnumType<U>
+    where
+        F: FnMut(T) -> chc::Term<U>,
+    {
+        EnumType {
+            symbol: self.symbol,
+            args: self
+                .args
+                .into_iter()
+                .map(|ty| ty.subst_var(&mut f))
+                .collect(),
+        }
+    }
+
+    pub fn map_var<F, U>(self, mut f: F) -> EnumType<U>
+    where
+        F: FnMut(T) -> U,
+    {
+        EnumType {
+            symbol: self.symbol,
+            args: self.args.into_iter().map(|ty| ty.map_var(&mut f)).collect(),
+        }
+    }
+
+    pub fn strip_refinement(self) -> EnumType<Closed> {
+        EnumType {
+            symbol: self.symbol,
+            args: self
+                .args
+                .into_iter()
+                .map(|ty| RefinedType::unrefined(ty.strip_refinement()))
+                .collect(),
+        }
+    }
+
+    pub fn subst_ty_params(&mut self, subst: &TypeParamSubst<T>)
+    where
+        T: chc::Var,
+    {
+        for arg in &mut self.args {
+            arg.subst_ty_params(subst);
+        }
+    }
+}
+
+/// A type parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParamType {
+    type_param_idx: TypeParamIdx,
+    forall_sort_idx: ForallSortIdx,
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &ParamType
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        self.type_param_idx
+            .pretty(allocator)
+            .append(allocator.text("(ForallSortIdx="))
+            .append(self.forall_sort_idx.pretty(allocator))
+            .append(allocator.text(")"))
+    }
+}
+
+impl ParamType {
+    pub fn new(type_param_idx: TypeParamIdx, forall_sort_idx: ForallSortIdx) -> Self {
+        ParamType {
+            type_param_idx,
+            forall_sort_idx,
+        }
+    }
+
+    pub fn type_param_index(&self) -> TypeParamIdx {
+        self.type_param_idx
+    }
+
+    pub fn forall_sort_index(&self) -> ForallSortIdx {
+        self.forall_sort_idx
+    }
+
+    pub fn into_closed_ty(self) -> Type<Closed> {
+        Type::Param(self)
+    }
+}
+
+/// A projection type representing an unresolved associated type.
+///
+/// This preserves the structural identity of projections like `<T as Iterator>::Item`
+/// or `<Map<I, F> as Iterator>::Item`, keeping them distinct even before normalization.
+///
+/// The `args` field stores the generic arguments (Self type + other args), which can
+/// recursively contain other types including params, ADTs, and other projections.
+/// For example, `<Map<I, F> as Iterator>::Item` would have `args = [Map<I, F>]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AliasType {
+    forall_sort_idx: ForallSortIdx,
+    args: Vec<Type<Closed>>,
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &AliasType
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let sort = self.forall_sort_idx.pretty(allocator);
+        if self.args.is_empty() {
+            sort
+        } else {
+            let args = allocator.intersperse(
+                self.args.iter().map(|ty| ty.pretty(allocator)),
+                allocator.text(",").append(allocator.line()),
+            );
+            sort.append(allocator.line())
+                .append(args.nest(2).angles())
+                .group()
+        }
+    }
+}
+
+impl AliasType {
+    pub fn new(forall_sort_idx: ForallSortIdx, args: Vec<Type<Closed>>) -> Self {
+        AliasType {
+            forall_sort_idx,
+            args,
+        }
+    }
+
+    pub fn forall_sort_index(&self) -> ForallSortIdx {
+        self.forall_sort_idx
+    }
+
+    pub fn args(&self) -> &[Type<Closed>] {
+        &self.args
+    }
+}
+
+/// An array type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArrayType<T> {
+    pub index: Box<RefinedType<T>>,
+    pub elem: Box<RefinedType<T>>,
+}
+
+impl<'a, T, D> Pretty<'a, D, termcolor::ColorSpec> for &ArrayType<T>
+where
+    T: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.text("Array").append(
+            self.index
+                .pretty(allocator)
+                .append(allocator.text(", "))
+                .append(self.elem.pretty(allocator))
+                .angles(),
+        )
+    }
+}
+
+impl<T> ArrayType<T> {
+    pub fn new(index: Type<T>, elem: Type<T>) -> Self {
+        ArrayType {
+            index: Box::new(RefinedType::unrefined(index)),
+            elem: Box::new(RefinedType::unrefined(elem)),
+        }
+    }
+
+    pub fn subst_var<F, U>(self, mut f: F) -> ArrayType<U>
+    where
+        F: FnMut(T) -> chc::Term<U>,
+    {
+        ArrayType {
+            index: Box::new(self.index.subst_var(&mut f)),
+            elem: Box::new(self.elem.subst_var(&mut f)),
+        }
+    }
+
+    pub fn map_var<F, U>(self, mut f: F) -> ArrayType<U>
+    where
+        F: FnMut(T) -> U,
+    {
+        ArrayType {
+            index: Box::new(self.index.map_var(&mut f)),
+            elem: Box::new(self.elem.map_var(&mut f)),
+        }
+    }
+
+    pub fn strip_refinement(self) -> ArrayType<Closed> {
+        ArrayType {
+            index: Box::new(RefinedType::unrefined(self.index.strip_refinement())),
+            elem: Box::new(RefinedType::unrefined(self.elem.strip_refinement())),
+        }
+    }
+
+    pub fn subst_ty_params(&mut self, subst: &TypeParamSubst<T>)
+    where
+        T: chc::Var,
+    {
+        self.index.subst_ty_params(subst);
+        self.elem.subst_ty_params(subst);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BitVecType {
+    pub width: u32,
+    pub signed: bool,
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &BitVecType
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.text(format!("BitVec<{}, {}>", self.width, self.signed))
+    }
+}
+
+/// An underlying type of a refinement type.
+/// Whether the unsigned-fact check mode is on (`THRUST_CHECK_UINT_FACTS` set).
+///
+/// A value of [`Type::UInt`] is assumed non-negative, and the places where a value may leave the
+/// range are checked: a subtraction without overflow checks, a ghost term, an integer that becomes
+/// an unsigned value. The mode also checks the result of the other unsigned arithmetic operations,
+/// which stays in range by arithmetic, so that every place that makes an unsigned value is checked
+/// once; an obligation that fails points at a place that should be checked by default.
+pub fn check_uint_facts_mode() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var_os("THRUST_CHECK_UINT_FACTS").is_some())
+}
+
+/// How the range of a value of a Rust integer type is used (`THRUST_INT_RANGE`): `[0, 2^w)` for
+/// an unsigned type of `w` bits, `[-2^(w-1), 2^(w-1))` for a signed one. Without it only the lower
+/// bound of an unsigned value is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntRange {
+    /// Unset: no bound but `0 <=` of an unsigned value is assumed or checked.
+    Off,
+    /// `conversions`: the range is assumed wherever a value of the type is in the environment,
+    /// and checked where an integer becomes one (a cast, a checked operation, a ghost term, a value
+    /// of a wider or unbounded integer type). The result of arithmetic is not checked: it is
+    /// modelled on unbounded integers, so a path on which an operation overflows assumes a false
+    /// range and is dropped, as if every overflow stopped the program.
+    Conversions,
+    /// `all`: as `Conversions`, and the result of `+`, `-`, `*` and negation is checked too, so an
+    /// overflow is an error, as with rustc's overflow checks.
+    All,
+}
+
+pub fn int_range_mode() -> IntRange {
+    static MODE: std::sync::OnceLock<IntRange> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("THRUST_INT_RANGE").as_deref() {
+        Err(_) => IntRange::Off,
+        Ok("conversions") => IntRange::Conversions,
+        Ok("all") => IntRange::All,
+        Ok(other) => panic!("THRUST_INT_RANGE: expected `conversions` or `all`, got `{other}`"),
+    })
+}
+
+/// The range `[min, end)` of an integer of `width` bits, when [`int_range_mode`] is on and the type
+/// has a width.
+pub fn int_range(signed: bool, width: Option<u32>) -> Option<(BigInt, BigInt)> {
+    if int_range_mode() == IntRange::Off {
+        return None;
+    }
+    let width = width?;
+    if signed {
+        let half = BigInt::from(1) << (width - 1);
+        Some((-half.clone(), half))
+    } else {
+        Some((BigInt::from(0), BigInt::from(1) << width))
+    }
+}
+
+/// The lower and the upper bound of an integer value as atoms; see [`int_range_bounds`].
+pub struct IntRangeBounds<V> {
+    pub lower: Option<chc::Atom<V>>,
+    pub upper: Option<chc::Atom<V>>,
+}
+
+/// The bounds of a value `x` of the integer type `ty` as atoms: `0 <= x` of an unsigned type, and
+/// the bounds of [`int_range`] when they are in use. `None` when `ty` is not an integer type.
+pub fn int_range_bounds<T, V>(ty: &Type<T>, x: chc::Term<V>) -> Option<IntRangeBounds<V>>
+where
+    V: Clone,
+{
+    let (signed, width) = match ty {
+        Type::Int(width) => (true, *width),
+        Type::UInt(width) => (false, *width),
+        _ => return None,
+    };
+    let range = int_range(signed, width);
+    let min = match &range {
+        Some((min, _)) => Some(min.clone()),
+        None if !signed => Some(BigInt::from(0)),
+        None => None,
+    };
+    let lower = min.map(|min| {
+        chc::Atom::new(
+            chc::KnownPred::GREATER_THAN_OR_EQUAL.into(),
+            vec![x.clone(), chc::Term::int(min)],
+        )
+    });
+    let upper = range.map(|(_, end)| {
+        chc::Atom::new(
+            chc::KnownPred::LESS_THAN.into(),
+            vec![x, chc::Term::int(end)],
+        )
+    });
+    Some(IntRangeBounds { lower, upper })
+}
+
+/// The atoms of [`int_range_bounds`], the lower bound first. `None` when `ty` is not an integer
+/// type.
+pub fn int_range_atoms<T, V>(ty: &Type<T>, x: chc::Term<V>) -> Option<Vec<chc::Atom<V>>>
+where
+    V: Clone,
+{
+    let bounds = int_range_bounds(ty, x)?;
+    Some(bounds.lower.into_iter().chain(bounds.upper).collect())
+}
+
+/// The range of a value `x` of the integer type `ty` as a formula, when [`int_range`] is in use for
+/// `ty`; `None` otherwise.
+pub fn int_range_formula<T, V>(ty: &Type<T>, x: chc::Term<V>) -> Option<chc::Formula<V>>
+where
+    V: Clone,
+{
+    let (signed, width) = match ty {
+        Type::Int(width) => (true, *width),
+        Type::UInt(width) => (false, *width),
+        _ => return None,
+    };
+    int_range(signed, width)?;
+    int_range_atoms(ty, x)?
+        .into_iter()
+        .map(chc::Formula::Atom)
+        .reduce(chc::Formula::and)
+}
+
+/// The facts [`RefinedType::formula_with`] states of every value of `ty`, the ranges of the integers
+/// it holds through tuples, pointers, sequences and enum payloads, when [`int_range_mode`] is on;
+/// `None` when it is off.
+pub fn int_range_type_facts<FV>(ty: &Type<FV>, defs: &dyn EnumDefProvider) -> Option<Refinement<FV>>
+where
+    FV: chc::Var,
+{
+    if int_range_mode() == IntRange::Off {
+        return None;
+    }
+    Some(RefinedType::unrefined(ty.clone()).formula_with(Some(defs)))
+}
+
+/// Variables a quantifier binds, with their sorts.
+pub type QuantifiedVars = Vec<(chc::UserQuantifiedVarId, chc::Sort)>;
+
+/// The facts [`RefinedType::formula_with`] states of every value of `ty`, as a formula about
+/// `value`: [`int_range_type_facts`] when [`int_range_mode`] is on, and `0 <=` of the unsigned
+/// integers `ty` holds through tuples and pointers when it is off. `None` when there are none.
+///
+/// A binding is assumed to have these facts, so a variable that stands for a binding of a proof,
+/// such as a law's, ranges over them: the law's quantifier gets them as a premise. Their
+/// existentials (an enum's payloads) are variables `fresh` makes, returned with their sorts to be
+/// quantified with the law's own, since `forall x. (exists f. p) => q` is
+/// `forall x f. p => q`.
+pub fn int_range_type_formula<FV, W>(
+    ty: &Type<FV>,
+    value: chc::Term<W>,
+    mut fresh: impl FnMut() -> chc::UserQuantifiedVarId,
+    defs: &dyn EnumDefProvider,
+) -> Option<(QuantifiedVars, chc::Formula<W>)>
+where
+    FV: chc::Var,
+    W: chc::Var,
+{
+    let facts = RefinedType::unrefined(ty.clone()).formula_with(Some(defs));
+    if facts.is_top() {
+        return None;
+    }
+    let vars: Vec<_> = facts
+        .existentials()
+        .map(|(_, sort)| (fresh(), sort.clone()))
+        .collect();
+    let formula = facts.body.subst_var(|v| match v {
+        RefinedTypeVar::Value => value.clone(),
+        RefinedTypeVar::Existential(ev) => {
+            let (var, sort) = &vars[ev.index()];
+            chc::Term::UserQuantifiedVar(sort.clone(), *var)
+        }
+        RefinedTypeVar::Free(_) => unreachable!("the facts of a type have no free variable"),
+    });
+    Some((vars, formula.into_formula()))
+}
+
+/// The variable of the element facts of a sequence. They are stated only of a sequence of integers
+/// of a type with a width, so they never nest and one reserved identifier serves.
+fn seq_elem_var() -> chc::UserQuantifiedVarId {
+    chc::UserQuantifiedVarId::from_u32(0xFFFF_0000)
+}
+
+/// `forall i. 0 <= i < len(seq) => range(seq[i])` of a sequence whose element type `elem` is an
+/// integer type with a width whose range is in use ([`int_range`]); `None` otherwise.
+pub fn seq_elem_range<T, V>(elem: &Type<T>, seq: chc::Term<V>) -> Option<chc::Formula<V>>
+where
+    V: Clone,
+{
+    let (signed, width) = match elem {
+        Type::Int(width) => (true, *width),
+        Type::UInt(width) => (false, *width),
+        _ => return None,
+    };
+    int_range(signed, width)?;
+    let i = chc::Term::UserQuantifiedVar(chc::Sort::int(), seq_elem_var());
+    let in_bounds = chc::Formula::Atom(chc::Atom::new(
+        chc::KnownPred::GREATER_THAN_OR_EQUAL.into(),
+        vec![i.clone(), chc::Term::int(0)],
+    ))
+    .and(chc::Formula::Atom(chc::Atom::new(
+        chc::KnownPred::LESS_THAN.into(),
+        vec![i.clone(), seq.clone().seq_len()],
+    )));
+    let range = int_range_atoms(elem, seq.seq_nth(i))?
+        .into_iter()
+        .map(chc::Formula::Atom)
+        .reduce(chc::Formula::and)?;
+    Some(chc::Formula::forall(
+        vec![(seq_elem_var(), chc::Sort::int())],
+        in_bounds.implies(range),
+    ))
+}
+
+/// Whether facts of a type are stated of a value as an assumption (in a clause body) or as an
+/// obligation (in a clause head).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactsUse {
+    Assumed,
+    Checked,
+}
+
+/// The enum types nested more deeply than this, through their payloads, get no facts: the bound
+/// of a type whose definition recurses at other arguments (`enum N<T> { A(Box<N<(T, T)>>) }`).
+const ENUM_NESTING_LIMIT: usize = 8;
+
+/// What a traversal stating the facts of a type is at: how the facts are used, where the
+/// definitions of enums come from (none: their payloads get no facts) and the enum types whose
+/// payloads enclose the position.
+struct FactsCx<'a> {
+    use_: FactsUse,
+    defs: Option<&'a dyn EnumDefProvider>,
+    enclosing: Vec<EnumType<Closed>>,
+    /// A checked enum type whose facts no finite formula states, met on the way.
+    unsupported: Option<Type<Closed>>,
+}
+
+impl<'a> FactsCx<'a> {
+    fn new(use_: FactsUse, defs: Option<&'a dyn EnumDefProvider>) -> Self {
+        FactsCx {
+            use_,
+            defs,
+            enclosing: Vec::new(),
+            unsupported: None,
+        }
+    }
+}
+
+/// The facts of every value of `ty` ([`RefinedType::formula_with`]) as an obligation on a value,
+/// for a value made from a logical term, whose arithmetic is unbounded: the same traversal, with
+/// each enum payload checked as `forall f. v = C(f) => checks(f)` for each variant. A recursive
+/// enum whose payloads hold integers with facts cannot be checked by a finite formula: the error
+/// names it.
+pub fn type_fact_checks(
+    ty: &Type<Closed>,
+    defs: &dyn EnumDefProvider,
+) -> Result<Refinement<Closed>, Type<Closed>> {
+    let mut cx = FactsCx::new(FactsUse::Checked, Some(defs));
+    let checks = RefinedType::unrefined(ty.clone()).facts(&mut cx);
+    match cx.unsupported {
+        Some(ty) => Err(ty),
+        None => Ok(checks),
+    }
+}
+
+/// The clauses that a value of type `ty`, which `value` states in the scope `builder` holds, has
+/// `checks`, the facts of its type (`type_fact_checks`), with nothing of its type assumed: the
+/// check of a value made from a logical term, a ghost term or a logic function's definition.
+pub fn fact_check_clauses<FV>(
+    builder: &mut chc::ClauseBuilder,
+    ty: &Type<Closed>,
+    value: Refinement<FV>,
+    checks: Refinement<Closed>,
+) -> Vec<chc::Clause>
+where
+    FV: chc::Var,
+{
+    let checks: Refinement<FV> = checks.map_free_var(|v| match v {});
+    builder.with_value_var(ty).add_body(value).head(checks)
+}
+
+/// The quantifier-free part of the facts of a value of `ty`, the ranges of the integers it holds
+/// through tuples and pointers ([`int_range_bounds`]), as a Boolean term about `value`; `None`
+/// when there are none. A logic function's definition is restricted to arguments that have these
+/// (`Analyzer::checked_logic_fn_body`).
+pub fn domain_guard<V>(ty: &Type<Closed>, value: chc::Term<V>) -> Option<chc::Term<V>>
+where
+    V: Clone,
+{
+    let conj = |a: Option<chc::Term<V>>, b: Option<chc::Term<V>>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.and(b)),
+        (a, b) => a.or(b),
+    };
+    match ty {
+        Type::Int(_) | Type::UInt(_) => {
+            let bounds = int_range_bounds(ty, value)?;
+            // `lower` is `x >= min` and `upper` is `x < end`.
+            let lower = bounds.lower.map(|atom| {
+                let [x, min]: [chc::Term<V>; 2] = atom.args.try_into().ok()?;
+                Some(x.ge(min))
+            });
+            let upper = bounds.upper.map(|atom| {
+                let [x, end]: [chc::Term<V>; 2] = atom.args.try_into().ok()?;
+                Some(x.lt(end))
+            });
+            conj(lower.flatten(), upper.flatten())
+        }
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .enumerate()
+            .map(|(index, elem)| domain_guard(&elem.ty, value.clone().tuple_proj(index)))
+            .fold(None, conj),
+        Type::Pointer(pointer) => {
+            let current = domain_guard(&pointer.elem.ty, pointer.kind.deref_term(value.clone()));
+            let final_ = pointer
+                .is_mut()
+                .then(|| domain_guard(&pointer.elem.ty, value.mut_final()))
+                .flatten();
+            conj(current, final_)
+        }
+        _ => None,
+    }
+}
+
+/// A value of `ty` that has the facts of its type (`type_fact_checks`), for the value of a logic
+/// function at arguments outside its domain (`Analyzer::checked_logic_fn_body`), whose value
+/// elsewhere is `value`. A part of `ty` that holds no integer with facts ([`has_range_facts`]) may
+/// be anything, so it is the matching part of `value`. Otherwise: zero for an integer, the empty
+/// sequence, a tuple, box or `&mut` (its current and final values) of such values, and the first
+/// variant of an enum whose fields have such values, a field without facts being any value of its
+/// sort. `None` when an enum has no such variant without going through itself, or a field of a
+/// constructed variant is of a sort with no value to take (a type parameter's, a function's).
+pub fn fact_witness<V: Clone>(
+    ty: &Type<Closed>,
+    value: chc::Term<V>,
+    defs: &dyn EnumDefProvider,
+) -> Option<chc::Term<V>> {
+    fact_witness_within(ty, Some(value), defs, &mut Vec::new())
+}
+
+fn fact_witness_within<V: Clone>(
+    ty: &Type<Closed>,
+    value: Option<chc::Term<V>>,
+    defs: &dyn EnumDefProvider,
+    enclosing: &mut Vec<chc::DatatypeSymbol>,
+) -> Option<chc::Term<V>> {
+    if !has_range_facts(ty, defs, &mut Vec::new()) {
+        return value.or_else(|| any_value(ty, defs, enclosing));
+    }
+    match ty {
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .enumerate()
+            .map(|(index, elem)| {
+                let part = value.clone().map(|value| value.tuple_proj(index));
+                fact_witness_within(&elem.ty, part, defs, enclosing)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(chc::Term::tuple),
+        Type::Pointer(pointer) if pointer.is_mut() => {
+            let current = value.clone().map(chc::Term::mut_current);
+            let final_ = value.map(chc::Term::mut_final);
+            let current = fact_witness_within(&pointer.elem.ty, current, defs, enclosing)?;
+            let final_ = fact_witness_within(&pointer.elem.ty, final_, defs, enclosing)?;
+            Some(chc::Term::mut_(current, final_))
+        }
+        Type::Pointer(pointer) => {
+            let elem = value.map(|value| pointer.kind.deref_term(value));
+            Some(chc::Term::box_(fact_witness_within(
+                &pointer.elem.ty,
+                elem,
+                defs,
+                enclosing,
+            )?))
+        }
+        Type::Enum(enum_ty) => enum_value(enum_ty, defs, enclosing, |field_ty, enclosing| {
+            fact_witness_within(field_ty, None, defs, enclosing)
+        }),
+        _ => Some(chc::Term::default_for(&ty.to_sort())),
+    }
+}
+
+/// Some value of `ty`, with no facts to have; `None` for a type parameter's or a function's sort.
+fn any_value<V: Clone>(
+    ty: &Type<Closed>,
+    defs: &dyn EnumDefProvider,
+    enclosing: &mut Vec<chc::DatatypeSymbol>,
+) -> Option<chc::Term<V>> {
+    match ty {
+        Type::Enum(enum_ty) => enum_value(enum_ty, defs, enclosing, |field_ty, enclosing| {
+            any_value(field_ty, defs, enclosing)
+        }),
+        Type::Function(_) => None,
+        _ => match ty.to_sort() {
+            chc::Sort::Param(_) | chc::Sort::Datatype(_) => None,
+            sort => Some(chc::Term::default_for(&sort)),
+        },
+    }
+}
+
+/// The first variant of `enum_ty` whose fields `field` gives values for, without going through the
+/// enum itself.
+fn enum_value<V: Clone>(
+    enum_ty: &EnumType<Closed>,
+    defs: &dyn EnumDefProvider,
+    enclosing: &mut Vec<chc::DatatypeSymbol>,
+    mut field: impl FnMut(&Type<Closed>, &mut Vec<chc::DatatypeSymbol>) -> Option<chc::Term<V>>,
+) -> Option<chc::Term<V>> {
+    if enclosing.contains(&enum_ty.symbol) {
+        return None;
+    }
+    enclosing.push(enum_ty.symbol.clone());
+    let value = enum_ty.variants(defs).into_iter().find_map(|variant| {
+        let fields = variant
+            .field_tys
+            .iter()
+            .map(|field_ty| field(field_ty, enclosing))
+            .collect::<Option<Vec<_>>>()?;
+        Some(chc::Term::datatype_ctor(
+            enum_ty.symbol.clone(),
+            enum_ty.arg_sorts(),
+            variant.ctor,
+            fields,
+        ))
+    });
+    enclosing.pop();
+    value
+}
+
+/// The facts of the payloads of a value of the enum type `ty` when [`int_range_mode`] is on and
+/// `cx` has the definitions, for each variant whose fields have facts. Assumed:
+/// `exists f. discr(v) = d => v = C(f) && facts(f)`, quantifier-free in a clause body; where the
+/// variant is the value's, `f` is its payload, and elsewhere the implication holds for any `f`.
+/// Checked: `forall f. v = C(f) => facts(f)`. Both say of the value's payload what the facts of
+/// its type say, and nothing of the other variants.
+///
+/// An enum type inside its own payload (the same type, as a recursive definition makes it) gets no
+/// facts, since a finite formula cannot follow it; nor does one nested past
+/// [`ENUM_NESTING_LIMIT`]. Its check is an error ([`type_fact_checks`]) when it holds integers with
+/// facts, so no fact is assumed that is not checked.
+fn enum_payload_facts(ty: &EnumType<Closed>, cx: &mut FactsCx) -> Refinement<Closed> {
+    let Some(defs) = cx.defs.filter(|_| int_range_mode() != IntRange::Off) else {
+        return Refinement::top();
+    };
+    if cx.enclosing.contains(ty) || cx.enclosing.len() >= ENUM_NESTING_LIMIT {
+        let enum_ty = Type::Enum(ty.clone());
+        if cx.use_ == FactsUse::Checked && has_range_facts(&enum_ty, defs, &mut Vec::new()) {
+            cx.unsupported.get_or_insert(enum_ty);
+        }
+        return Refinement::top();
+    }
+    cx.enclosing.push(ty.clone());
+    let mut facts = Refinement::top();
+    for variant in ty.variants(defs) {
+        let variant_facts = match cx.use_ {
+            FactsUse::Assumed => assumed_variant_facts(ty, variant, cx),
+            FactsUse::Checked => checked_variant_facts(ty, variant, cx),
+        };
+        facts.push_conj(variant_facts);
+    }
+    cx.enclosing.pop();
+    facts
+}
+
+/// `exists f. discr(v) = d => v = C(f) && facts(f)` of `variant` of `ty`; top when its fields have
+/// no facts.
+fn assumed_variant_facts(
+    ty: &EnumType<Closed>,
+    variant: EnumVariant,
+    cx: &mut FactsCx,
+) -> Refinement<Closed> {
+    let value = || chc::Term::var(RefinedTypeVar::Value);
+    let mut facts = Refinement::top();
+    let mut fields = Vec::new();
+    for field_ty in &variant.field_tys {
+        // `exists f. facts(f)`, `f` the first existential.
+        let mut field = Refinement::new(
+            IndexVec::from_raw(vec![field_ty.to_sort()]),
+            chc::Body::top(),
+        );
+        field.push_conj(RefinedType::unrefined(field_ty.clone()).facts(cx));
+        let field = field.subst_value_var(|| {
+            chc::Term::var(RefinedTypeVar::Existential(ExistentialVarIdx::from_u32(0)))
+        });
+        let field_var = facts.existentials.next_index();
+        fields.push(chc::Term::var(RefinedTypeVar::Existential(field_var)));
+        facts.push_conj(field);
+    }
+    if facts.is_top() {
+        return facts;
+    }
+    let ctor = chc::Term::datatype_ctor(ty.symbol.clone(), ty.arg_sorts(), variant.ctor, fields);
+    // Into the body itself: `push_conj` would shift the existentials `ctor` refers to.
+    facts.body.push_conj(value().equal_to(ctor));
+    let discr = chc::Term::datatype_discr(ty.symbol.clone(), value())
+        .equal_to(chc::Term::int(variant.discr));
+    facts.guarded(discr.into())
+}
+
+/// `forall f. v = C(f) => checks(f)` of `variant` of `ty`; top when its fields have no facts.
+fn checked_variant_facts(
+    ty: &EnumType<Closed>,
+    variant: EnumVariant,
+    cx: &mut FactsCx,
+) -> Refinement<Closed> {
+    let depth = cx.enclosing.len() - 1;
+    let vars: QuantifiedVars = variant
+        .field_tys
+        .iter()
+        .enumerate()
+        .map(|(index, field_ty)| (enum_payload_var(depth, index), field_ty.to_sort()))
+        .collect();
+    let field = |(var, sort): &(chc::UserQuantifiedVarId, chc::Sort)| {
+        chc::Term::UserQuantifiedVar(sort.clone(), *var)
+    };
+    let mut checks = Refinement::top();
+    for (field_ty, var) in variant.field_tys.iter().zip(&vars) {
+        let field_checks = RefinedType::unrefined(field_ty.clone()).facts(cx);
+        checks.push_conj(field_checks.subst_value_var(|| field(var)));
+    }
+    if checks.is_top() {
+        return checks;
+    }
+    assert!(!checks.has_existentials(), "a check states no existential");
+    let fields = vars.iter().map(field).collect();
+    let ctor = chc::Term::datatype_ctor(ty.symbol.clone(), ty.arg_sorts(), variant.ctor, fields);
+    let is_variant = chc::Formula::Atom(chc::Term::var(RefinedTypeVar::Value).equal_to(ctor));
+    chc::Formula::forall(vars, is_variant.implies(checks.body.into_formula())).into()
+}
+
+/// The variable of the field `field` of a variant in the check of an enum's payloads at nesting
+/// `depth` ([`checked_variant_facts`]). Quantifiers of different depths nest, those of one depth
+/// do not; the identifiers are reserved, as [`seq_elem_var`]'s is.
+fn enum_payload_var(depth: usize, field: usize) -> chc::UserQuantifiedVarId {
+    assert!(
+        depth < 0x100 && field < 0x100,
+        "enum payload check too deep or too wide"
+    );
+    chc::UserQuantifiedVarId::from_usize(0xFFFE_0000 + (depth << 8) + field)
+}
+
+/// Whether a value of `ty` holds an integer with facts under [`int_range_mode`], through tuples,
+/// pointers, sequences and enum payloads. An enum met again on the way (`visited`) is searched no
+/// further, except in its arguments: what its recursive fields add over the first visit comes from
+/// them.
+pub(super) fn has_range_facts(
+    ty: &Type<Closed>,
+    defs: &dyn EnumDefProvider,
+    visited: &mut Vec<chc::DatatypeSymbol>,
+) -> bool {
+    let value = chc::Term::<RefinedTypeVar<Closed>>::var(RefinedTypeVar::Value);
+    match ty {
+        Type::Int(_) | Type::UInt(_) => {
+            int_range_atoms(ty, value).is_some_and(|atoms| !atoms.is_empty())
+        }
+        Type::Seq(elem) => seq_elem_range(&elem.ty, value).is_some(),
+        Type::Tuple(ty) => ty
+            .elems
+            .iter()
+            .any(|elem| has_range_facts(&elem.ty, defs, visited)),
+        Type::Pointer(ty) => has_range_facts(&ty.elem.ty, defs, visited),
+        Type::Enum(ty) if visited.contains(&ty.symbol) => ty
+            .args
+            .iter()
+            .any(|arg| has_range_facts(&arg.ty, defs, visited)),
+        Type::Enum(ty) => {
+            visited.push(ty.symbol.clone());
+            let found = ty.variants(defs).iter().any(|variant| {
+                variant
+                    .field_tys
+                    .iter()
+                    .any(|field_ty| has_range_facts(field_ty, defs, visited))
+            });
+            visited.pop();
+            found
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Type<T> {
+    /// An integer, with the width in bits of the signed Rust type it comes from; the model type
+    /// `Int` and the unbounded results of arithmetic have none. When [`int_range_mode`] is on, a
+    /// value of a type with a width is in [`int_range`], as for [`Type::UInt`].
+    Int(Option<u32>),
+    /// An integer of an unsigned type, with the width in bits of the Rust type it comes from; the
+    /// model type `UInt` has none. Every value of it is non-negative, and below `2^width` when
+    /// [`int_range_mode`] is on: the facts are assumed wherever such a value is in the environment
+    /// (see [`RefinedType::formula`]) and are checked only where a value may leave the range
+    /// (subtraction without overflow checks, an integer that becomes an unsigned value, and in
+    /// [`IntRange::All`] the arithmetic operations).
+    UInt(Option<u32>),
+    BitVec(BitVecType),
+    Bool,
+    String,
+    /// A raw pointer or a trait object, opaque as in Creusot: its value has the null sort, so
+    /// all values of it have the same model. That is sound only because verified code cannot
+    /// observe one: dereferencing, comparing or casting a raw pointer and calling a method of a
+    /// trait object are not supported. It lets a type hold one in a field, as `fmt::Arguments`
+    /// does, when verified code only passes the value on.
+    Opaque,
+    Never,
+    Param(ParamType),
+    Alias(AliasType),
+    Pointer(PointerType<T>),
+    Function(FunctionType),
+    Tuple(TupleType<T>),
+    Array(ArrayType<T>),
+    Seq(Box<RefinedType<T>>),
+    Enum(EnumType<T>),
+}
+
+impl<T> From<ParamType> for Type<T> {
+    fn from(t: ParamType) -> Type<T> {
+        Type::Param(t)
+    }
+}
+
+impl<T> From<AliasType> for Type<T> {
+    fn from(t: AliasType) -> Type<T> {
+        Type::Alias(t)
+    }
+}
+
+impl<T> From<FunctionType> for Type<T> {
+    fn from(t: FunctionType) -> Type<T> {
+        Type::Function(t)
+    }
+}
+
+impl<T> From<PointerType<T>> for Type<T> {
+    fn from(t: PointerType<T>) -> Type<T> {
+        Type::Pointer(t)
+    }
+}
+
+impl<T> From<TupleType<T>> for Type<T> {
+    fn from(t: TupleType<T>) -> Type<T> {
+        Type::Tuple(t)
+    }
+}
+
+impl<T> From<ArrayType<T>> for Type<T> {
+    fn from(t: ArrayType<T>) -> Type<T> {
+        Type::Array(t)
+    }
+}
+
+impl<T> From<EnumType<T>> for Type<T> {
+    fn from(t: EnumType<T>) -> Type<T> {
+        Type::Enum(t)
+    }
+}
+
+impl<'a, T, D> Pretty<'a, D, termcolor::ColorSpec> for &Type<T>
+where
+    T: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match self {
+            Type::Int(None) => allocator.text("int"),
+            Type::Int(Some(width)) => allocator.text(format!("i{width}")),
+            Type::UInt(None) => allocator.text("uint"),
+            Type::UInt(Some(width)) => allocator.text(format!("u{width}")),
+            Type::BitVec(ty) => ty.pretty(allocator),
+            Type::Bool => allocator.text("bool"),
+            Type::String => allocator.text("string"),
+            Type::Opaque => allocator.text("opaque"),
+            Type::Never => allocator.text("!"),
+            Type::Param(ty) => ty.pretty(allocator),
+            Type::Alias(ty) => ty.pretty(allocator),
+            Type::Pointer(ty) => ty.pretty(allocator),
+            Type::Function(ty) => ty.pretty(allocator),
+            Type::Tuple(ty) => ty.pretty(allocator),
+            Type::Array(ty) => ty.pretty(allocator),
+            Type::Seq(elem) => allocator
+                .text("Seq")
+                .append(elem.pretty(allocator).angles()),
+            Type::Enum(ty) => ty.pretty(allocator),
+        }
+    }
+}
+
+impl<T> Type<T> {
+    pub fn inherit_pointer_types<U: chc::Var>(
+        &mut self,
+        source: Type<U>,
+        subst: &mut impl FnMut(U) -> chc::Term<T>,
+    ) where
+        T: chc::Var,
+    {
+        match (self, source) {
+            (Type::Pointer(target), Type::Pointer(source)) => {
+                target.elem.refinement = source.elem.refinement.subst_free_var(&mut *subst);
+                target.elem.ty.inherit_pointer_types(source.elem.ty, subst);
+            }
+            (Type::Tuple(target), Type::Tuple(source)) => {
+                for (target, source) in target.elems.iter_mut().zip(source.elems) {
+                    target.ty.inherit_pointer_types(source.ty, subst);
+                }
+            }
+            (Type::Enum(target), Type::Enum(source)) => {
+                for (target, source) in target.args.iter_mut().zip(source.args) {
+                    target.ty.inherit_pointer_types(source.ty, subst);
+                }
+            }
+            (Type::Seq(target), Type::Seq(source)) => {
+                target.ty.inherit_pointer_types(source.ty, subst);
+            }
+            (Type::Array(target), Type::Array(source)) => {
+                target
+                    .index
+                    .ty
+                    .inherit_pointer_types(source.index.ty, subst);
+                target.elem.ty.inherit_pointer_types(source.elem.ty, subst);
+            }
+            _ => {}
+        }
+    }
+
+    /// Replaces each function type in `self` with the one at the same position in `source`.
+    ///
+    /// A function pointer's contract is in its type and in no term, so a type built from the
+    /// Rust type alone holds the unrefined function type, whose precondition is `true`.
+    pub fn inherit_function_types<U>(&mut self, source: &Type<U>) {
+        match (self, source) {
+            (Type::Function(target), Type::Function(source)) => {
+                *target = source.clone();
+            }
+            (Type::Pointer(target), Type::Pointer(source)) => {
+                target.elem.ty.inherit_function_types(&source.elem.ty);
+            }
+            (Type::Tuple(target), Type::Tuple(source)) => {
+                for (target, source) in target.elems.iter_mut().zip(&source.elems) {
+                    target.ty.inherit_function_types(&source.ty);
+                }
+            }
+            (Type::Enum(target), Type::Enum(source)) => {
+                for (target, source) in target.args.iter_mut().zip(&source.args) {
+                    target.ty.inherit_function_types(&source.ty);
+                }
+            }
+            (Type::Seq(target), Type::Seq(source)) => {
+                target.ty.inherit_function_types(&source.ty);
+            }
+            (Type::Array(target), Type::Array(source)) => {
+                target.elem.ty.inherit_function_types(&source.elem.ty);
+            }
+            _ => {}
+        }
+    }
+
+    fn pretty_atom<'a, 'b, D>(
+        &'b self,
+        allocator: &'a D,
+    ) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec>
+    where
+        T: chc::Var,
+        D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+        D::Doc: Clone,
+    {
+        match self {
+            Type::Function { .. } | Type::Pointer { .. } => self.pretty(allocator).parens(),
+            _ => self.pretty(allocator),
+        }
+    }
+
+    pub fn unit() -> Self {
+        Type::Tuple(TupleType::unit())
+    }
+
+    /// The model type `Int`, with no bounds.
+    pub fn int() -> Self {
+        Type::Int(None)
+    }
+
+    /// The type of a Rust signed integer of `width` bits.
+    pub fn int_of_width(width: u32) -> Self {
+        Type::Int(Some(width))
+    }
+
+    /// The model type `UInt`, with no upper bound.
+    pub fn uint() -> Self {
+        Type::UInt(None)
+    }
+
+    /// The type of a Rust unsigned integer of `width` bits.
+    pub fn uint_of_width(width: u32) -> Self {
+        Type::UInt(Some(width))
+    }
+
+    pub fn bool() -> Self {
+        Type::Bool
+    }
+
+    pub fn string() -> Self {
+        Type::String
+    }
+
+    pub fn opaque() -> Self {
+        Type::Opaque
+    }
+
+    pub fn never() -> Self {
+        Type::Never
+    }
+
+    pub fn function(ty: FunctionType) -> Self {
+        Type::Function(ty)
+    }
+
+    pub fn deref(self) -> RefinedType<T> {
+        if let Type::Pointer(ty) = self {
+            *ty.elem
+        } else {
+            panic!("invalid deref");
+        }
+    }
+
+    pub fn is_unit(&self) -> bool {
+        matches!(self, Type::Tuple(ty) if ty.is_unit())
+    }
+
+    pub fn as_function(&self) -> Option<&FunctionType> {
+        match self {
+            Type::Function(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn as_pointer(&self) -> Option<&PointerType<T>> {
+        match self {
+            Type::Pointer(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn as_enum(&self) -> Option<&EnumType<T>> {
+        match self {
+            Type::Enum(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn as_tuple(&self) -> Option<&TupleType<T>> {
+        match self {
+            Type::Tuple(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn into_enum(self) -> Option<EnumType<T>> {
+        match self {
+            Type::Enum(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn into_pointer(self) -> Option<PointerType<T>> {
+        match self {
+            Type::Pointer(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn into_tuple(self) -> Option<TupleType<T>> {
+        match self {
+            Type::Tuple(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn is_mut(&self) -> bool {
+        match self {
+            Type::Pointer(ty) => ty.is_mut(),
+            _ => false,
+        }
+    }
+
+    pub fn is_own(&self) -> bool {
+        match self {
+            Type::Pointer(ty) => ty.is_own(),
+            _ => false,
+        }
+    }
+
+    /// The resolution of the mutable references a value `term` of this type holds, directly or in
+    /// boxes, tuples and the payloads of enums: each one's final value is its current one, as
+    /// dropping the value makes it. Those behind a shared reference are left unresolved.
+    ///
+    /// An enum is resolved as Creusot resolves one, by resolving the fields of its variant:
+    /// `fresh` gives a variable of each field of each variant, which the caller binds
+    /// existentially, `matcher_pred` makes those of the value's variant its payload, and each
+    /// field is resolved; the fields of the other variants are free, so their resolution says
+    /// nothing. A field that is a pointer to the enum itself is not resolved.
+    pub fn resolution<V>(
+        &self,
+        term: chc::Term<V>,
+        defs: &dyn EnumDefProvider,
+        fresh: &mut impl FnMut(chc::Sort) -> chc::Term<V>,
+    ) -> chc::Body<V>
+    where
+        T: chc::Var,
+        V: Clone,
+    {
+        if self.is_mut() {
+            return term.clone().mut_final().equal_to(term.mut_current()).into();
+        }
+        if self.is_own() {
+            let inner = &self.as_pointer().unwrap().elem.ty;
+            return inner.resolution(term.box_current(), defs, fresh);
+        }
+        if let Some(tuple) = self.as_tuple() {
+            let mut body = chc::Body::default();
+            for (i, elem) in tuple.elems.iter().enumerate() {
+                body.push_conj(elem.ty.resolution(term.clone().tuple_proj(i), defs, fresh));
+            }
+            return body;
+        }
+        let Some(ety) = self.as_enum() else {
+            return chc::Body::default();
+        };
+        let mut body = chc::Body::default();
+        let mut pred_args = vec![];
+        for field_ty in defs.enum_def(&ety.symbol).field_tys() {
+            let mut field_rty = field_ty.clone().vacuous();
+            field_rty.instantiate_ty_params(ety.args.clone());
+            let field_type = field_rty.ty;
+
+            let field_term = fresh(field_type.to_sort());
+            pred_args.push(field_term.clone());
+
+            if let Some(p) = field_type.as_pointer() {
+                if matches!(&p.elem.ty, Type::Enum(e) if e.symbol == ety.symbol) {
+                    // TODO: we need recursively defined drop_pred for the recursive ADTs!
+                    tracing::warn!("skipping recursive variant");
+                    continue;
+                }
+            }
+
+            body.push_conj(field_type.resolution(field_term, defs, fresh));
+        }
+        pred_args.push(term);
+        let matcher_pred = chc::MatcherPred::new(ety.symbol.clone(), ety.arg_sorts());
+        body.push_conj(chc::Atom::new(matcher_pred.into(), pred_args));
+        body
+    }
+
+    pub fn to_sort(&self) -> chc::Sort {
+        match self {
+            Type::Int(_) | Type::UInt(_) => chc::Sort::int(),
+            Type::BitVec(ty) => chc::Sort::bit_vec(ty.width),
+            Type::Bool => chc::Sort::bool(),
+            // TODO: enable string reasoning
+            //       currently String sort seems not available in HORN logic of Z3
+            Type::String => chc::Sort::null(),
+            Type::Opaque => chc::Sort::null(),
+            Type::Never => chc::Sort::null(),
+            Type::Param(ty) => chc::Sort::forall(ty.forall_sort_index()),
+            Type::Alias(ty) => chc::Sort::Forall(ty.forall_sort_index()),
+            Type::Pointer(ty) => {
+                let elem_sort = ty.elem.ty.to_sort();
+
+                match ty.kind {
+                    PointerKind::Ref(RefKind::Immut) | PointerKind::Own => {
+                        chc::Sort::box_(elem_sort)
+                    }
+                    PointerKind::Ref(RefKind::Mut) => chc::Sort::mut_(elem_sort),
+                }
+            }
+            Type::Function { .. } => chc::Sort::null(),
+            Type::Tuple(ty) => {
+                let elem_sorts = ty.elems.iter().map(|ty| ty.ty.to_sort()).collect();
+                chc::Sort::tuple(elem_sorts)
+            }
+            Type::Seq(elem) => chc::Sort::seq(elem.ty.to_sort()),
+            Type::Array(ty) => {
+                let index_sort = ty.index.ty.to_sort();
+                let elem_sort = ty.elem.ty.to_sort();
+                chc::Sort::array(index_sort, elem_sort)
+            }
+            Type::Enum(ty) => {
+                let arg_sorts = ty.args.iter().map(|ty| ty.ty.to_sort()).collect();
+                chc::Sort::datatype(ty.symbol.clone(), arg_sorts)
+            }
+        }
+    }
+
+    pub fn subst_var<F, U>(self, f: F) -> Type<U>
+    where
+        F: FnMut(T) -> chc::Term<U>,
+    {
+        match self {
+            Type::Int(width) => Type::Int(width),
+            Type::UInt(width) => Type::UInt(width),
+            Type::BitVec(ty) => Type::BitVec(ty),
+            Type::Bool => Type::Bool,
+            Type::String => Type::String,
+            Type::Opaque => Type::Opaque,
+            Type::Never => Type::Never,
+            Type::Param(ty) => Type::Param(ty),
+            Type::Alias(ty) => Type::Alias(ty),
+            Type::Pointer(ty) => Type::Pointer(ty.subst_var(f)),
+            Type::Function(ty) => Type::Function(ty),
+            Type::Tuple(ty) => Type::Tuple(ty.subst_var(f)),
+            Type::Array(ty) => Type::Array(ty.subst_var(f)),
+            Type::Seq(elem) => Type::Seq(Box::new(elem.subst_var(f))),
+            Type::Enum(ty) => Type::Enum(ty.subst_var(f)),
+        }
+    }
+
+    pub fn map_var<F, U>(self, f: F) -> Type<U>
+    where
+        F: FnMut(T) -> U,
+    {
+        match self {
+            Type::Int(width) => Type::Int(width),
+            Type::UInt(width) => Type::UInt(width),
+            Type::BitVec(ty) => Type::BitVec(ty),
+            Type::Bool => Type::Bool,
+            Type::String => Type::String,
+            Type::Opaque => Type::Opaque,
+            Type::Never => Type::Never,
+            Type::Param(ty) => Type::Param(ty),
+            Type::Alias(ty) => Type::Alias(ty),
+            Type::Pointer(ty) => Type::Pointer(ty.map_var(f)),
+            Type::Function(ty) => Type::Function(ty),
+            Type::Tuple(ty) => Type::Tuple(ty.map_var(f)),
+            Type::Array(ty) => Type::Array(ty.map_var(f)),
+            Type::Seq(elem) => Type::Seq(Box::new(elem.map_var(f))),
+            Type::Enum(ty) => Type::Enum(ty.map_var(f)),
+        }
+    }
+
+    pub fn assert_closed(self) -> Type<Closed> {
+        self.map_var(|_v| panic!("unexpected variable"))
+    }
+
+    /// Whether a refinement inside this type, at any depth, has a predicate variable.
+    pub fn has_pred_var(&self) -> bool {
+        match self {
+            Type::Int(_)
+            | Type::UInt(_)
+            | Type::BitVec(_)
+            | Type::Bool
+            | Type::String
+            | Type::Opaque
+            | Type::Never
+            | Type::Param(_)
+            | Type::Alias(_) => false,
+            Type::Pointer(ty) => ty.elem.has_pred_var(),
+            Type::Function(ty) => {
+                ty.params.iter().any(RefinedType::has_pred_var) || ty.ret.has_pred_var()
+            }
+            Type::Tuple(ty) => ty.elems.iter().any(RefinedType::has_pred_var),
+            Type::Array(ty) => ty.index.has_pred_var() || ty.elem.has_pred_var(),
+            Type::Seq(elem) => elem.has_pred_var(),
+            Type::Enum(ty) => ty.args.iter().any(RefinedType::has_pred_var),
+        }
+    }
+
+    pub fn strip_refinement(self) -> Type<Closed> {
+        match self {
+            Type::Int(width) => Type::Int(width),
+            Type::UInt(width) => Type::UInt(width),
+            Type::BitVec(ty) => Type::BitVec(ty),
+            Type::Bool => Type::Bool,
+            Type::String => Type::String,
+            Type::Opaque => Type::Opaque,
+            Type::Never => Type::Never,
+            Type::Param(ty) => Type::Param(ty),
+            Type::Alias(ty) => Type::Alias(ty),
+            Type::Pointer(ty) => Type::Pointer(ty.strip_refinement()),
+            Type::Function(ty) => Type::Function(ty),
+            Type::Tuple(ty) => Type::Tuple(ty.strip_refinement()),
+            Type::Array(ty) => Type::Array(ty.strip_refinement()),
+            Type::Seq(elem) => Type::Seq(Box::new(RefinedType::unrefined(elem.strip_refinement()))),
+            Type::Enum(ty) => Type::Enum(ty.strip_refinement()),
+        }
+    }
+}
+
+impl Type<Closed> {
+    pub fn vacuous<FV>(self) -> Type<FV> {
+        self.map_var(|v| match v {})
+    }
+}
+
+/// A marker type for closed types.
+///
+/// Because the value of `Closed` can never exist, `Type<Closed>` ensures that no
+/// logical variables from outer scope appear in the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Closed {}
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {}
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &Closed
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, _allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match *self {}
+    }
+}
+
+rustc_index::newtype_index! {
+    /// An index representing existential variables.
+    ///
+    /// We manage existential variables using indices that are unique in a [`Formula`].
+    /// [`Formula`] contains `IndexVec<ExistentialVarIdx, chc::Sort>` that manages the indices
+    /// and sorts of the existential variables.
+    #[orderable]
+    #[debug_format = "e{}"]
+    pub struct ExistentialVarIdx { }
+}
+
+impl std::fmt::Display for ExistentialVarIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "e{}", self.index())
+    }
+}
+
+impl<'a, D> Pretty<'a, D, termcolor::ColorSpec> for &ExistentialVarIdx
+where
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        allocator.as_string(self)
+    }
+}
+
+pub trait ShiftExistential {
+    fn shift_existential(self, offset: usize) -> Self;
+}
+
+/// A logical variable in a refinement predicate.
+///
+/// Given a refinement type `{ v: T | ∃e. φ }`, there are three cases of logical variables
+/// occurring in the predicate `φ`:
+///
+/// - `RefinedTypeVar::Value`: a variable `v` representing the value of the type
+/// - `RefinedTypeVar::Existential`: an existential variable `e`
+/// - `RefinedTypeVar::Free`: a variable from the outer scope, such as function parameters or
+///   variables bound in the environment
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RefinedTypeVar<FV> {
+    Value,
+    Existential(ExistentialVarIdx),
+    Free(FV),
+}
+
+impl<T> From<ExistentialVarIdx> for RefinedTypeVar<T> {
+    fn from(v: ExistentialVarIdx) -> Self {
+        RefinedTypeVar::Existential(v)
+    }
+}
+
+impl<FV> std::fmt::Display for RefinedTypeVar<FV>
+where
+    FV: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            RefinedTypeVar::Value => f.write_str("ν"),
+            RefinedTypeVar::Existential(v) => v.fmt(f),
+            RefinedTypeVar::Free(v) => v.fmt(f),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for RefinedTypeVar<T>
+where
+    T: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            RefinedTypeVar::Value => f.write_str("ν"),
+            RefinedTypeVar::Existential(v) => v.fmt(f),
+            RefinedTypeVar::Free(v) => v.fmt(f),
+        }
+    }
+}
+
+impl<'a, D, FV> Pretty<'a, D, termcolor::ColorSpec> for &RefinedTypeVar<FV>
+where
+    FV: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        match self {
+            RefinedTypeVar::Value => allocator.text("ν"),
+            RefinedTypeVar::Existential(v) => v.pretty(allocator),
+            RefinedTypeVar::Free(v) => allocator.text(format!("{v:?}")),
+        }
+    }
+}
+
+impl<T> ShiftExistential for RefinedTypeVar<T> {
+    fn shift_existential(self, offset: usize) -> Self {
+        match self {
+            RefinedTypeVar::Existential(v) => RefinedTypeVar::Existential(v + offset),
+            v => v,
+        }
+    }
+}
+
+/// A formula, potentially equipped with an existential quantifier.
+///
+/// Note: This is not to be confused with [`crate::chc::Formula`] in the [`crate::chc`] module, which is a different notion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Formula<V> {
+    pub existentials: IndexVec<ExistentialVarIdx, chc::Sort>,
+    pub body: chc::Body<V>,
+}
+
+impl<V> Default for Formula<V> {
+    fn default() -> Self {
+        Formula {
+            existentials: Default::default(),
+            body: Default::default(),
+        }
+    }
+}
+
+impl<V> From<chc::Body<V>> for Formula<V> {
+    fn from(body: chc::Body<V>) -> Self {
+        Formula {
+            existentials: IndexVec::new(),
+            body,
+        }
+    }
+}
+
+impl<V> From<chc::Atom<V>> for Formula<V> {
+    fn from(atom: chc::Atom<V>) -> Self {
+        Formula {
+            existentials: IndexVec::new(),
+            body: chc::Body::new(vec![atom], chc::Formula::top()),
+        }
+    }
+}
+
+impl<V> From<chc::Formula<V>> for Formula<V> {
+    fn from(formula: chc::Formula<V>) -> Self {
+        Formula {
+            existentials: IndexVec::new(),
+            body: chc::Body::new(vec![], formula),
+        }
+    }
+}
+
+impl<V> Extend<Formula<V>> for Formula<V>
+where
+    V: ShiftExistential,
+{
+    fn extend<T>(&mut self, iter: T)
+    where
+        T: IntoIterator<Item = Formula<V>>,
+    {
+        for formula in iter {
+            self.push_conj(formula);
+        }
+        self.body.simplify();
+    }
+}
+
+impl<V> FromIterator<Formula<V>> for Formula<V>
+where
+    V: ShiftExistential,
+{
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = Formula<V>>,
+    {
+        let mut result = Formula::default();
+        result.extend(iter);
+        result
+    }
+}
+
+impl<'a, D, V> Pretty<'a, D, termcolor::ColorSpec> for &Formula<V>
+where
+    V: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        let existentials = allocator
+            .intersperse(
+                self.existentials
+                    .iter_enumerated()
+                    .map(|(v, s)| v.pretty(allocator).append(allocator.text(":")).append(s)),
+                allocator.text(",").append(allocator.line()),
+            )
+            .group();
+        let body = self.body.pretty(allocator);
+        if self.existentials.is_empty() {
+            body
+        } else {
+            allocator
+                .text("∃")
+                .append(existentials.nest(2))
+                .append(allocator.text("."))
+                .append(allocator.line().append(body).nest(2))
+                .group()
+        }
+    }
+}
+
+impl<V> Formula<V> {
+    pub fn new(existentials: IndexVec<ExistentialVarIdx, chc::Sort>, body: chc::Body<V>) -> Self {
+        Formula { existentials, body }
+    }
+
+    pub fn has_existentials(&self) -> bool {
+        !self.existentials.is_empty()
+    }
+
+    pub fn existentials(&self) -> impl Iterator<Item = (ExistentialVarIdx, &chc::Sort)> + '_ {
+        self.existentials.iter_enumerated()
+    }
+
+    pub fn is_top(&self) -> bool {
+        self.body.is_top()
+    }
+
+    pub fn is_bottom(&self) -> bool {
+        self.body.is_bottom()
+    }
+
+    pub fn has_pred_var(&self) -> bool {
+        self.body.has_pred_var()
+    }
+
+    pub fn top() -> Self {
+        Formula::new(IndexVec::new(), chc::Body::top())
+    }
+
+    pub fn bottom() -> Self {
+        Formula::new(IndexVec::new(), chc::Body::bottom())
+    }
+
+    pub fn subst_var<F, W>(self, mut f: F) -> Formula<W>
+    where
+        F: FnMut(V) -> chc::Term<W>,
+    {
+        Formula {
+            existentials: self.existentials,
+            body: self.body.subst_var(&mut f),
+        }
+    }
+
+    pub fn map_var<F, W>(self, mut f: F) -> Formula<W>
+    where
+        F: FnMut(V) -> W,
+    {
+        Formula {
+            existentials: self.existentials,
+            body: self.body.map_var(&mut f),
+        }
+    }
+}
+
+impl<V> Formula<V>
+where
+    V: chc::Var,
+{
+    pub fn guarded(self, guard: chc::Formula<V>) -> Self {
+        let Formula { existentials, body } = self;
+        Formula {
+            existentials,
+            body: body.guarded(guard),
+        }
+    }
+}
+
+impl<V> Formula<V>
+where
+    V: ShiftExistential,
+{
+    pub fn push_conj(&mut self, other: Self) {
+        let Formula { existentials, body } = other;
+        self.body
+            .push_conj(body.map_var(|v| v.shift_existential(self.existentials.len())));
+        self.existentials.extend(existentials);
+        self.body.simplify();
+    }
+}
+
+/// A refinement predicate in a refinement type.
+///
+/// This is a [`Formula`], but gives an explicit representation of the kinds of variables that can appear in
+/// the refinement predicates. See [`RefinedTypeVar`] for details.
+pub type Refinement<FV = Closed> = Formula<RefinedTypeVar<FV>>;
+
+impl<FV> Refinement<FV> {
+    pub fn subst_free_var<F, W>(self, mut f: F) -> Refinement<W>
+    where
+        F: FnMut(FV) -> chc::Term<W>,
+    {
+        self.subst_var(|v| match v {
+            RefinedTypeVar::Value => chc::Term::var(RefinedTypeVar::Value),
+            RefinedTypeVar::Existential(v) => chc::Term::var(RefinedTypeVar::Existential(v)),
+            RefinedTypeVar::Free(v) => f(v).map_var(RefinedTypeVar::Free),
+        })
+    }
+
+    pub fn subst_value_var<F>(self, mut f: F) -> Self
+    where
+        F: FnMut() -> chc::Term<RefinedTypeVar<FV>>,
+    {
+        self.subst_var(|v| match v {
+            RefinedTypeVar::Value => f(),
+            RefinedTypeVar::Existential(v) => chc::Term::var(RefinedTypeVar::Existential(v)),
+            RefinedTypeVar::Free(v) => chc::Term::var(RefinedTypeVar::Free(v)),
+        })
+    }
+
+    pub fn map_free_var<F, W>(self, mut f: F) -> Refinement<W>
+    where
+        F: FnMut(FV) -> W,
+    {
+        self.map_var(|v| match v {
+            RefinedTypeVar::Value => RefinedTypeVar::Value,
+            RefinedTypeVar::Existential(v) => RefinedTypeVar::Existential(v),
+            RefinedTypeVar::Free(v) => RefinedTypeVar::Free(f(v)),
+        })
+    }
+
+    pub fn instantiate(self) -> Instantiator<FV> {
+        Instantiator {
+            value_var: None,
+            value_term: None,
+            existentials: HashMap::new(),
+            refinement: self,
+        }
+    }
+
+    pub fn subst_ty_params_in_sorts<T>(&mut self, subst: &TypeParamSubst<T>) {
+        for sort in &mut self.existentials {
+            subst_ty_params_in_sort(sort, subst);
+        }
+        subst_ty_params_in_body(&mut self.body, subst);
+    }
+}
+
+/// A helper type to map logical variables in a refinement at once.
+///
+/// This is essentially just calling `Refinement::map_var`, but provides a convenient interface to
+/// construct the mapping of the variables.
+#[derive(Debug, Clone)]
+pub struct Instantiator<T> {
+    value_var: Option<T>,
+    value_term: Option<chc::Term<T>>,
+    existentials: HashMap<ExistentialVarIdx, T>,
+    refinement: Refinement<T>,
+}
+
+impl<T> Instantiator<T> {
+    pub fn value_var(&mut self, value_var: T) -> &mut Self {
+        self.value_var = Some(value_var);
+        self
+    }
+
+    pub fn value_term(&mut self, value_term: chc::Term<T>) -> &mut Self {
+        self.value_term = Some(value_term);
+        self
+    }
+
+    pub fn existential(&mut self, v: ExistentialVarIdx, value: T) -> &mut Self {
+        self.existentials.insert(v, value);
+        self
+    }
+
+    pub fn instantiate(self) -> chc::Body<T>
+    where
+        T: Clone,
+    {
+        let Instantiator {
+            value_var,
+            value_term,
+            existentials,
+            refinement,
+        } = self;
+        refinement.body.subst_var(move |v| match v {
+            RefinedTypeVar::Value => value_term
+                .clone()
+                .unwrap_or_else(|| chc::Term::var(value_var.clone().unwrap())),
+            RefinedTypeVar::Existential(v) => chc::Term::var(existentials[&v].clone()),
+            RefinedTypeVar::Free(v) => chc::Term::var(v),
+        })
+    }
+}
+
+/// A refinement type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RefinedType<FV = Closed> {
+    pub ty: Type<FV>,
+    pub refinement: Refinement<FV>,
+}
+
+impl<'a, D, FV> Pretty<'a, D, termcolor::ColorSpec> for &RefinedType<FV>
+where
+    FV: chc::Var,
+    D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+    D::Doc: Clone,
+{
+    fn pretty(self, allocator: &'a D) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec> {
+        if self.refinement.is_top() {
+            self.ty.pretty(allocator)
+        } else {
+            allocator
+                .space()
+                .append(&self.ty)
+                .append(allocator.line())
+                .append(allocator.text("|"))
+                .append(allocator.space())
+                .append(self.refinement.pretty(allocator))
+                .append(allocator.line())
+                .braces()
+                .group()
+        }
+    }
+}
+
+impl RefinedType<FunctionParamIdx> {
+    /// Installs `refinement` at the sub-type addressed by `steps`.
+    ///
+    /// An empty `steps` slice conjoins the refinement to the one at this node; otherwise
+    /// each step navigates one level deeper per [`TypePositionStep`].
+    pub fn install_refinement_at(
+        &mut self,
+        steps: &[TypePositionStep],
+        refinement: Refinement<FunctionParamIdx>,
+    ) {
+        let Some((step, rest)) = steps.split_first() else {
+            self.refinement.push_conj(refinement);
+            return;
+        };
+        match step {
+            TypePositionStep::TypeArg(i) => match &mut self.ty {
+                Type::Enum(e) => {
+                    let arg = e.args.get_mut(TypeParamIdx::from(*i)).unwrap_or_else(|| {
+                        panic!("refine step [{}] out of range for enum type", i)
+                    });
+                    arg.install_refinement_at(rest, refinement);
+                }
+                Type::Pointer(p) => {
+                    assert_eq!(*i, 0, "Box type position must be 0");
+                    p.elem.install_refinement_at(rest, refinement);
+                }
+                ty => panic!("TypeArg step on unsupported type: {:?}", ty),
+            },
+            TypePositionStep::Param(idx) => match &mut self.ty {
+                Type::Function(func) => {
+                    func.params[*idx].install_refinement_at(rest, refinement);
+                }
+                ty => panic!("Param step on non-function type: {:?}", ty),
+            },
+            TypePositionStep::Return => match &mut self.ty {
+                Type::Function(func) => {
+                    func.ret.install_refinement_at(rest, refinement);
+                }
+                ty => panic!("Return step on non-function type: {:?}", ty),
+            },
+        }
+    }
+}
+
+impl<FV> RefinedType<FV> {
+    fn pretty_atom<'a, 'b, D>(
+        &'b self,
+        allocator: &'a D,
+    ) -> pretty::DocBuilder<'a, D, termcolor::ColorSpec>
+    where
+        FV: chc::Var,
+        D: pretty::DocAllocator<'a, termcolor::ColorSpec>,
+        D::Doc: Clone,
+    {
+        if self.refinement.is_top() {
+            self.ty.pretty_atom(allocator)
+        } else {
+            self.pretty(allocator)
+        }
+    }
+
+    pub fn new(ty: Type<FV>, refinement: Refinement<FV>) -> Self {
+        RefinedType { ty, refinement }
+    }
+
+    /// The facts of a binding of this type: its refinement and the ranges of the integers it holds
+    /// through tuples, pointers and sequences, but not those in the payloads of enums, which need
+    /// the enums' definitions ([`Self::formula_with`]).
+    pub fn formula(&self) -> Refinement<FV>
+    where
+        FV: chc::Var,
+    {
+        self.facts(&mut FactsCx::new(FactsUse::Assumed, None))
+    }
+
+    /// [`Self::formula`] with the facts of the payloads of enums, whose definitions `defs` gives
+    /// (none: as [`Self::formula`]).
+    pub fn formula_with(&self, defs: Option<&dyn EnumDefProvider>) -> Refinement<FV>
+    where
+        FV: chc::Var,
+    {
+        self.facts(&mut FactsCx::new(FactsUse::Assumed, defs))
+    }
+
+    /// The facts of a value of this type as `cx` states them. Both uses traverse the type alike and
+    /// differ only in how an enum's payloads are stated ([`enum_payload_facts`]).
+    fn facts(&self, cx: &mut FactsCx) -> Refinement<FV>
+    where
+        FV: chc::Var,
+    {
+        let mut formula = self.refinement.clone();
+        match &self.ty {
+            Type::UInt(_) | Type::Int(_) => {
+                let atoms = int_range_atoms(&self.ty, chc::Term::var(RefinedTypeVar::Value))
+                    .expect("an integer type");
+                for atom in atoms {
+                    formula.push_conj(atom.into());
+                }
+            }
+            Type::Seq(elem) => {
+                if let Some(range) = seq_elem_range(&elem.ty, chc::Term::var(RefinedTypeVar::Value))
+                {
+                    formula.push_conj(range.into());
+                }
+            }
+            Type::Tuple(ty) => {
+                for (index, elem) in ty.elems.iter().enumerate() {
+                    formula.push_conj(elem.facts(cx).subst_value_var(|| {
+                        chc::Term::var(RefinedTypeVar::Value).tuple_proj(index)
+                    }));
+                }
+            }
+            Type::Pointer(ty) => {
+                formula.push_conj(
+                    ty.elem.facts(cx).subst_value_var(|| {
+                        ty.kind.deref_term(chc::Term::var(RefinedTypeVar::Value))
+                    }),
+                );
+                if ty.is_mut() {
+                    formula.push_conj(
+                        ty.elem
+                            .facts(cx)
+                            .subst_value_var(|| chc::Term::var(RefinedTypeVar::Value).mut_final()),
+                    );
+                }
+            }
+            Type::Enum(ty) => {
+                let ty = ty.clone().strip_refinement();
+                formula.push_conj(enum_payload_facts(&ty, cx).map_free_var(|v| match v {}));
+            }
+            _ => {}
+        }
+        formula
+    }
+
+    /// Moves the refinements of tuple elements, and of the content of an owned or shared
+    /// pointer, up to the refinement of the whole value, so that they are stated about the
+    /// value's own term.
+    ///
+    /// A struct field is an owned pointer in a tuple (fields are boxed), so a refinement of a
+    /// field's value sits under both. The content of a mutable reference stays where it is: its
+    /// refinement is about both the current and the final value.
+    pub fn normalize_tuple_refinements(mut self) -> Self
+    where
+        FV: chc::Var,
+    {
+        if let Type::Pointer(ty) = &mut self.ty {
+            if !ty.is_mut() {
+                let kind = ty.kind;
+                let elem = std::mem::replace(&mut *ty.elem, RefinedType::unrefined(Type::unit()));
+                let mut elem = elem.normalize_tuple_refinements();
+                let refinement = std::mem::take(&mut elem.refinement);
+                *ty.elem = elem;
+                self.refinement
+                    .push_conj(refinement.subst_value_var(|| {
+                        kind.deref_term(chc::Term::var(RefinedTypeVar::Value))
+                    }));
+            }
+        }
+        if let Type::Tuple(ty) = &mut self.ty {
+            for (index, elem) in ty.elems.iter_mut().enumerate() {
+                *elem = elem.clone().normalize_tuple_refinements();
+                let refinement = std::mem::take(&mut elem.refinement);
+                self.refinement.push_conj(
+                    refinement.subst_value_var(|| {
+                        chc::Term::var(RefinedTypeVar::Value).tuple_proj(index)
+                    }),
+                );
+            }
+        }
+        self
+    }
+
+    pub fn to_sort(&self) -> chc::Sort {
+        self.ty.to_sort()
+    }
+
+    pub fn refined_with_term(ty: Type<FV>, term: chc::Term<FV>) -> Self {
+        let term = term.map_var(RefinedTypeVar::Free);
+        let refinement = chc::Term::var(RefinedTypeVar::Value).equal_to(term);
+        RefinedType::new(ty, refinement.into())
+    }
+
+    pub fn boxed(self) -> Self {
+        let RefinedType {
+            ty: inner_ty,
+            refinement: inner_refinement,
+        } = self;
+        let ty = PointerType::own(inner_ty).into();
+        let refinement = inner_refinement
+            .subst_value_var(|| chc::Term::var(RefinedTypeVar::Value).box_current());
+        RefinedType { ty, refinement }
+    }
+
+    pub fn guarded(self, guard: chc::Formula<FV>) -> Self
+    where
+        FV: chc::Var,
+    {
+        let RefinedType { ty, refinement } = self;
+        let refinement = refinement.guarded(guard.map_var(RefinedTypeVar::Free));
+        RefinedType { ty, refinement }
+    }
+
+    /// Returns a dereferenced type of the immutable reference or owned pointer.
+    ///
+    /// e.g. `{ v: Box<T> | φ }  -->  { v: T | φ[box v/v] }`
+    pub fn deref(self) -> Self {
+        let RefinedType {
+            ty,
+            refinement: outer_refinement,
+        } = self;
+        let inner_ty = ty.into_pointer().expect("invalid deref");
+        if inner_ty.is_mut() {
+            // losing info about proph
+            panic!("invalid deref");
+        }
+        let RefinedType {
+            ty: inner_ty,
+            refinement: mut inner_refinement,
+        } = *inner_ty.elem;
+        inner_refinement.push_conj(
+            outer_refinement.subst_value_var(|| chc::Term::var(RefinedTypeVar::Value).boxed()),
+        );
+        RefinedType {
+            ty: inner_ty,
+            refinement: inner_refinement,
+        }
+    }
+
+    pub fn subst_var<F, W>(self, mut f: F) -> RefinedType<W>
+    where
+        F: FnMut(FV) -> chc::Term<W>,
+    {
+        RefinedType {
+            ty: self
+                .ty
+                .subst_var(Box::new(&mut f) as Box<dyn FnMut(FV) -> chc::Term<W>>),
+            refinement: self.refinement.subst_free_var(&mut f),
+        }
+    }
+
+    pub fn map_var<F, W>(self, mut f: F) -> RefinedType<W>
+    where
+        F: FnMut(FV) -> W,
+    {
+        RefinedType {
+            ty: self.ty.map_var(Box::new(&mut f) as Box<dyn FnMut(FV) -> W>),
+            refinement: self.refinement.map_free_var(&mut f),
+        }
+    }
+
+    pub fn is_refined(&self) -> bool {
+        !self.refinement.is_top()
+    }
+
+    pub fn unrefined(ty: Type<FV>) -> Self {
+        RefinedType::new(ty, chc::Atom::top().into())
+    }
+
+    pub fn extend_refinement(&mut self, refinement: Refinement<FV>) {
+        self.refinement.push_conj(refinement);
+    }
+
+    /// Whether the refinement of this type or of a type inside it has a predicate variable.
+    pub fn has_pred_var(&self) -> bool {
+        self.refinement.has_pred_var() || self.ty.has_pred_var()
+    }
+
+    pub fn strip_refinement(self) -> Type<Closed> {
+        self.ty.strip_refinement()
+    }
+
+    pub fn subst_ty_params(&mut self, subst: &TypeParamSubst<FV>)
+    where
+        FV: chc::Var,
+    {
+        self.refinement.subst_ty_params_in_sorts(subst);
+        match &mut self.ty {
+            Type::Int(_)
+            | Type::UInt(_)
+            | Type::BitVec(_)
+            | Type::Bool
+            | Type::String
+            | Type::Opaque
+            | Type::Never => {}
+            Type::Param(ty) => {
+                if let Some(rty) = subst.get(ty.type_param_index()) {
+                    let RefinedType {
+                        ty: replacement_ty,
+                        refinement,
+                    } = rty.clone();
+                    self.refinement.push_conj(refinement);
+                    self.ty = replacement_ty;
+                }
+            }
+            Type::Alias(alias) => {
+                let subst_closed = subst.clone().strip_refinement();
+                let new_args: Vec<Type<Closed>> = alias
+                    .args()
+                    .iter()
+                    .map(|arg| {
+                        let mut arg_rty = RefinedType::unrefined(arg.clone());
+                        arg_rty.subst_ty_params(&subst_closed);
+                        arg_rty.ty
+                    })
+                    .collect();
+                self.ty = Type::Alias(AliasType::new(alias.forall_sort_index(), new_args));
+            }
+            Type::Pointer(ty) => ty.subst_ty_params(subst),
+            Type::Function(ty) => {
+                let subst = subst.clone().strip_refinement();
+                ty.subst_ty_params(&subst)
+            }
+            Type::Tuple(ty) => ty.subst_ty_params(subst),
+            Type::Array(ty) => ty.subst_ty_params(subst),
+            Type::Seq(elem) => elem.subst_ty_params(subst),
+            Type::Enum(ty) => ty.subst_ty_params(subst),
+        }
+    }
+
+    pub fn instantiate_ty_params(&mut self, params: RefinedTypeArgs<FV>)
+    where
+        FV: chc::Var,
+    {
+        self.subst_ty_params(&params.into());
+    }
+}
+
+impl<FV> RefinedType<FV> {
+    /// Whether this type or a type inside it, the type of a value it holds, has a refinement.
+    pub fn has_refinement(&self) -> bool {
+        !self.refinement.is_top()
+            || match &self.ty {
+                Type::Pointer(ty) => ty.elem.has_refinement(),
+                Type::Tuple(ty) => ty.elems.iter().any(RefinedType::has_refinement),
+                Type::Array(ty) => ty.index.has_refinement() || ty.elem.has_refinement(),
+                Type::Seq(elem) => elem.has_refinement(),
+                Type::Enum(ty) => ty.args.iter().any(RefinedType::has_refinement),
+                _ => false,
+            }
+    }
+
+    /// Whether `f` holds of the predicate of some atom in a refinement anywhere in this type,
+    /// nested formulas included.
+    pub fn any_pred(&self, f: &mut impl FnMut(&chc::Pred) -> bool) -> bool {
+        self.refinement.body.iter_atoms().any(|atom| f(&atom.pred))
+            || match &self.ty {
+                Type::Int(_)
+                | Type::UInt(_)
+                | Type::BitVec(_)
+                | Type::Bool
+                | Type::String
+                | Type::Opaque
+                | Type::Never
+                | Type::Param(_)
+                | Type::Alias(_) => false,
+                Type::Pointer(ty) => ty.elem.any_pred(f),
+                Type::Function(ty) => {
+                    ty.params.iter().any(|param| param.any_pred(f)) || ty.ret.any_pred(f)
+                }
+                Type::Tuple(ty) => ty.elems.iter().any(|elem| elem.any_pred(f)),
+                Type::Array(ty) => ty.index.any_pred(f) || ty.elem.any_pred(f),
+                Type::Seq(elem) => elem.any_pred(f),
+                Type::Enum(ty) => ty.args.iter().any(|arg| arg.any_pred(f)),
+            }
+    }
+}
+
+impl RefinedType<Closed> {
+    pub fn vacuous<FV>(self) -> RefinedType<FV> {
+        self.map_var(|v| match v {})
+    }
+}
+
+/// Substitutes type parameters in a sort.
+fn subst_ty_params_in_sort<T>(sort: &mut chc::Sort, subst: &TypeParamSubst<T>) {
+    match sort {
+        chc::Sort::Null
+        | chc::Sort::Int
+        | chc::Sort::BitVec { .. }
+        | chc::Sort::Bool
+        | chc::Sort::String
+        | chc::Sort::Forall(_) => {}
+        chc::Sort::Param(idx) => {
+            let type_param_idx = TypeParamIdx::from_usize(*idx);
+            if let Some(rty) = subst.get(type_param_idx) {
+                *sort = rty.ty.to_sort();
+            }
+        }
+        chc::Sort::Box(s) | chc::Sort::Mut(s) | chc::Sort::Seq(s) => {
+            subst_ty_params_in_sort(s, subst);
+        }
+        chc::Sort::Tuple(sorts) => {
+            for s in sorts {
+                subst_ty_params_in_sort(s, subst);
+            }
+        }
+        chc::Sort::Array(s1, s2) => {
+            subst_ty_params_in_sort(s1, subst);
+            subst_ty_params_in_sort(s2, subst);
+        }
+        chc::Sort::Datatype(dt_sort) => {
+            for s in dt_sort.args_mut() {
+                subst_ty_params_in_sort(s, subst);
+            }
+        }
+    }
+}
+
+/// Substitutes type parameters in all sorts appearing in a body.
+fn subst_ty_params_in_body<T, V>(body: &mut chc::Body<V>, subst: &TypeParamSubst<T>) {
+    for atom in &mut body.atoms {
+        subst_ty_params_in_atom(atom, subst);
+    }
+    subst_ty_params_in_formula(&mut body.formula, subst);
+}
+
+/// Substitutes type parameters in all sorts appearing in an atom.
+fn subst_ty_params_in_atom<T, V>(atom: &mut chc::Atom<V>, subst: &TypeParamSubst<T>) {
+    if let Some(guard) = &mut atom.guard {
+        subst_ty_params_in_formula(guard, subst);
+    }
+    for term in &mut atom.args {
+        subst_ty_params_in_term(term, subst);
+    }
+}
+
+/// Substitutes type parameters in all sorts appearing in a formula.
+fn subst_ty_params_in_formula<T, V>(formula: &mut chc::Formula<V>, subst: &TypeParamSubst<T>) {
+    match formula {
+        chc::Formula::Atom(atom) => subst_ty_params_in_atom(atom, subst),
+        chc::Formula::Not(f) => subst_ty_params_in_formula(f, subst),
+        chc::Formula::And(fs) | chc::Formula::Or(fs) => {
+            for f in fs {
+                subst_ty_params_in_formula(f, subst);
+            }
+        }
+        chc::Formula::Implies(lhs, rhs) => {
+            subst_ty_params_in_formula(lhs, subst);
+            subst_ty_params_in_formula(rhs, subst);
+        }
+        chc::Formula::Exists(vars, f) => {
+            for (_, sort) in vars {
+                subst_ty_params_in_sort(sort, subst);
+            }
+            subst_ty_params_in_formula(f, subst);
+        }
+        chc::Formula::Forall(vars, f) => {
+            for (_, sort) in vars {
+                subst_ty_params_in_sort(sort, subst);
+            }
+            subst_ty_params_in_formula(f, subst);
+        }
+    }
+}
+
+/// Substitutes type parameters in all sorts appearing in a term.
+fn subst_ty_params_in_term<T, V>(term: &mut chc::Term<V>, subst: &TypeParamSubst<T>) {
+    match term {
+        chc::Term::Null
+        | chc::Term::ForallDefault(_)
+        | chc::Term::Var(_)
+        | chc::Term::Bool(_)
+        | chc::Term::Int(_)
+        | chc::Term::String(_) => {}
+        chc::Term::Box(t)
+        | chc::Term::BoxCurrent(t)
+        | chc::Term::MutCurrent(t)
+        | chc::Term::MutFinal(t)
+        | chc::Term::TupleProj(t, _)
+        | chc::Term::DatatypeDiscr(_, t)
+        | chc::Term::IntToBitVec { term: t, .. } => {
+            subst_ty_params_in_term(t, subst);
+        }
+        chc::Term::DatatypeSelector(sel, t) => {
+            for arg in sel.sort.args_mut() {
+                subst_ty_params_in_sort(arg, subst);
+            }
+            subst_ty_params_in_sort(&mut sel.field, subst);
+            subst_ty_params_in_term(t, subst);
+        }
+        chc::Term::Mut(t1, t2) => {
+            subst_ty_params_in_term(t1, subst);
+            subst_ty_params_in_term(t2, subst);
+        }
+        chc::Term::App(_, args) | chc::Term::Tuple(args) => {
+            for arg in args {
+                subst_ty_params_in_term(arg, subst);
+            }
+        }
+        chc::Term::UserDefinedFn(_, sort, args) => {
+            subst_ty_params_in_sort(sort, subst);
+            for arg in args {
+                subst_ty_params_in_term(arg, subst);
+            }
+        }
+        chc::Term::ForallFn(_, args) => {
+            for arg in args {
+                subst_ty_params_in_term(arg, subst);
+            }
+        }
+        chc::Term::ArrayEmpty(s1, s2) => {
+            subst_ty_params_in_sort(s1, subst);
+            subst_ty_params_in_sort(s2, subst);
+        }
+        chc::Term::SeqEmpty(sort) => subst_ty_params_in_sort(sort, subst),
+        chc::Term::DatatypeCtor(s, _, args) => {
+            for arg in s.args_mut() {
+                subst_ty_params_in_sort(arg, subst);
+            }
+            for arg in args {
+                subst_ty_params_in_term(arg, subst);
+            }
+        }
+        chc::Term::UserQuantifiedVar(sort, _) => {
+            subst_ty_params_in_sort(sort, subst);
+        }
+        chc::Term::ArrayLambda(_, sort, t) => {
+            subst_ty_params_in_sort(sort, subst);
+            subst_ty_params_in_term(t, subst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ParamType, TypeParamIdx};
+    use crate::chc::ForallSortIdx;
+    use crate::pretty::PrettyDisplayExt as _;
+
+    #[test]
+    fn param_type_display_includes_forall_sort() {
+        let param = ParamType::new(TypeParamIdx::from(0_usize), ForallSortIdx::from(2_usize));
+
+        assert_eq!(param.display().to_string(), "T0(ForallSortIdx=a2)");
+    }
+}

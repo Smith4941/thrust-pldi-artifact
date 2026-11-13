@@ -1,0 +1,285 @@
+{
+  "sizes": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "programs": {
+    "inferred_k1": {
+      "variant": "inferred",
+      "k": 1,
+      "files": [
+        "inferred_k1"
+      ],
+      "annotation_items": 6,
+      "code_lines": 22
+    },
+    "written_k1": {
+      "variant": "written",
+      "k": 1,
+      "files": [
+        "written_k1"
+      ],
+      "annotation_items": 7,
+      "code_lines": 22
+    },
+    "nested_k1": {
+      "variant": "nested",
+      "k": 1,
+      "files": [
+        "nested_k1"
+      ],
+      "annotation_items": 7,
+      "code_lines": 30
+    },
+    "inferred_k2": {
+      "variant": "inferred",
+      "k": 2,
+      "files": [
+        "inferred_k2"
+      ],
+      "annotation_items": 7,
+      "code_lines": 30
+    },
+    "written_k2": {
+      "variant": "written",
+      "k": 2,
+      "files": [
+        "written_k2"
+      ],
+      "annotation_items": 8,
+      "code_lines": 30
+    },
+    "nested_k2": {
+      "variant": "nested",
+      "k": 2,
+      "files": [
+        "nested_k2"
+      ],
+      "annotation_items": 8,
+      "code_lines": 38
+    },
+    "inferred_k4": {
+      "variant": "inferred",
+      "k": 4,
+      "files": [
+        "inferred_k4"
+      ],
+      "annotation_items": 9,
+      "code_lines": 46
+    },
+    "written_k4": {
+      "variant": "written",
+      "k": 4,
+      "files": [
+        "written_k4"
+      ],
+      "annotation_items": 10,
+      "code_lines": 46
+    },
+    "nested_k4": {
+      "variant": "nested",
+      "k": 4,
+      "files": [
+        "nested_k4"
+      ],
+      "annotation_items": 10,
+      "code_lines": 54
+    },
+    "inferred_k8": {
+      "variant": "inferred",
+      "k": 8,
+      "files": [
+        "inferred_k8"
+      ],
+      "annotation_items": 13,
+      "code_lines": 78
+    },
+    "written_k8": {
+      "variant": "written",
+      "k": 8,
+      "files": [
+        "written_k8"
+      ],
+      "annotation_items": 14,
+      "code_lines": 78
+    },
+    "nested_k8": {
+      "variant": "nested",
+      "k": 8,
+      "files": [
+        "nested_k8"
+      ],
+      "annotation_items": 14,
+      "code_lines": 86
+    },
+    "inferred_k16": {
+      "variant": "inferred",
+      "k": 16,
+      "files": [
+        "inferred_k16"
+      ],
+      "annotation_items": 21,
+      "code_lines": 142
+    },
+    "written_k16": {
+      "variant": "written",
+      "k": 16,
+      "files": [
+        "written_k16"
+      ],
+      "annotation_items": 22,
+      "code_lines": 142
+    },
+    "nested_k16": {
+      "variant": "nested",
+      "k": 16,
+      "files": [
+        "nested_k16"
+      ],
+      "annotation_items": 22,
+      "code_lines": 150
+    },
+    "inferred_k32": {
+      "variant": "inferred",
+      "k": 32,
+      "files": [
+        "inferred_k32"
+      ],
+      "annotation_items": 37,
+      "code_lines": 270
+    },
+    "written_k32": {
+      "variant": "written",
+      "k": 32,
+      "files": [
+        "written_k32"
+      ],
+      "annotation_items": 38,
+      "code_lines": 270
+    },
+    "nested_k32": {
+      "variant": "nested",
+      "k": 32,
+      "files": [
+        "nested_k32"
+      ],
+      "annotation_items": 38,
+      "code_lines": 278
+    },
+    "perinstance_k1": {
+      "variant": "perinstance",
+      "k": 1,
+      "files": [
+        "perinstance_t0"
+      ],
+      "annotation_items": 6,
+      "code_lines": 22
+    },
+    "perinstance_k2": {
+      "variant": "perinstance",
+      "k": 2,
+      "files": [
+        "perinstance_t0",
+        "perinstance_t1"
+      ],
+      "annotation_items": 12,
+      "code_lines": 44
+    },
+    "perinstance_k4": {
+      "variant": "perinstance",
+      "k": 4,
+      "files": [
+        "perinstance_t0",
+        "perinstance_t1",
+        "perinstance_t2",
+        "perinstance_t3"
+      ],
+      "annotation_items": 24,
+      "code_lines": 88
+    },
+    "perinstance_k8": {
+      "variant": "perinstance",
+      "k": 8,
+      "files": [
+        "perinstance_t0",
+        "perinstance_t1",
+        "perinstance_t2",
+        "perinstance_t3",
+        "perinstance_t4",
+        "perinstance_t5",
+        "perinstance_t6",
+        "perinstance_t7"
+      ],
+      "annotation_items": 48,
+      "code_lines": 176
+    },
+    "perinstance_k16": {
+      "variant": "perinstance",
+      "k": 16,
+      "files": [
+        "perinstance_t0",
+        "perinstance_t1",
+        "perinstance_t2",
+        "perinstance_t3",
+        "perinstance_t4",
+        "perinstance_t5",
+        "perinstance_t6",
+        "perinstance_t7",
+        "perinstance_t8",
+        "perinstance_t9",
+        "perinstance_t10",
+        "perinstance_t11",
+        "perinstance_t12",
+        "perinstance_t13",
+        "perinstance_t14",
+        "perinstance_t15"
+      ],
+      "annotation_items": 96,
+      "code_lines": 352
+    },
+    "perinstance_k32": {
+      "variant": "perinstance",
+      "k": 32,
+      "files": [
+        "perinstance_t0",
+        "perinstance_t1",
+        "perinstance_t2",
+        "perinstance_t3",
+        "perinstance_t4",
+        "perinstance_t5",
+        "perinstance_t6",
+        "perinstance_t7",
+        "perinstance_t8",
+        "perinstance_t9",
+        "perinstance_t10",
+        "perinstance_t11",
+        "perinstance_t12",
+        "perinstance_t13",
+        "perinstance_t14",
+        "perinstance_t15",
+        "perinstance_t16",
+        "perinstance_t17",
+        "perinstance_t18",
+        "perinstance_t19",
+        "perinstance_t20",
+        "perinstance_t21",
+        "perinstance_t22",
+        "perinstance_t23",
+        "perinstance_t24",
+        "perinstance_t25",
+        "perinstance_t26",
+        "perinstance_t27",
+        "perinstance_t28",
+        "perinstance_t29",
+        "perinstance_t30",
+        "perinstance_t31"
+      ],
+      "annotation_items": 192,
+      "code_lines": 704
+    }
+  }
+}

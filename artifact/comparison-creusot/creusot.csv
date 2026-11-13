@@ -1,0 +1,14 @@
+case,name,block,loc,spec,auto,time,search,wall,file
+common,common,adapter,4,16,,,,,creusot-port/common.rs
+range,Range,adapter,16,28,yes,0.69,0.44,0.48,creusot-port/range.rs
+iter_mut,IterMut,adapter,14,33,yes,0.81,1.57,1.51,creusot-port/iter_mut.rs
+map,Map,adapter,22,125,no,0.98,9.70,9.50,creusot-port/map.rs
+map_ext,MapExt,adapter,32,177,no,0.94,18.67,19.11,creusot-port/map_ext.rs
+skip,Skip,adapter,22,45,no,0.36,2.26,2.40,creusot-port/skip.rs
+take,Take,adapter,17,25,yes,0.65,0.42,0.47,creusot-port/take.rs
+fuse,Fuse,adapter,22,41,no,0.46,0.47,0.52,creusot-port/fuse.rs
+all_zero,all_zero,client,5,3,yes,1.72,0.46,1.50,creusot-port/all_zero.rs
+skip_take,skip_take,client,3,1,yes,1.72,0.39,0.44,creusot-port/skip_take.rs
+counter,counter,client,10,4,yes,1.72,5.50,5.14,creusot-port/counter.rs
+extend,concat_vec,client,5,3,yes,0.71,0.41,0.43,creusot-port/concat_vec.rs
+decuple_range,decuple_range,client,7,3,yes,,1.75,1.86,creusot-port/decuple_range.rs

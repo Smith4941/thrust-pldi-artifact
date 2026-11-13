@@ -1,0 +1,98 @@
+//@error-in-other-file: Unsat
+//@compile-flags: -C debug-assertions=off -A unused-variables
+//@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper THRUST_SOLVER_TIMEOUT_SECS=60
+
+// The innermost range starts past its end, so the invariant `next` requires of
+// `Take<Take<Range>>` fails two instantiations down.
+use thrust_models::Model;
+
+#[thrust_macros::context]
+trait Iterator {
+    type Item;
+
+    #[thrust_macros::requires(Self::invariant(*self))]
+    #[thrust_macros::ensures(Self::invariant(!self))]
+    fn next(&mut self) -> Option<Self::Item>;
+
+    #[thrust_macros::predicate]
+    fn invariant(self) -> bool;
+}
+
+#[derive(PartialEq)]
+struct Take<I> {
+    iter: I,
+    n: usize,
+}
+
+impl<I: Model> Model for Take<I> {
+    type Ty = Take<<I as Model>::Ty>;
+}
+
+#[thrust_macros::context]
+impl<I> Iterator for Take<I>
+where
+    I: Iterator + Model,
+    <I as Iterator>::Item: Model,
+    <I as Model>::Ty: Model<Ty = <I as Model>::Ty>,
+    <<I as Iterator>::Item as Model>::Ty:
+        Model<Ty = <<I as Iterator>::Item as Model>::Ty>,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        if self.n != 0 {
+            self.n -= 1;
+            self.iter.next()
+        } else {
+            None
+        }
+    }
+
+    // self.iter.invariant()
+    #[thrust_macros::predicate]
+    fn invariant(self) -> bool {
+        I::invariant(self.iter)
+    }
+}
+
+#[derive(PartialEq)]
+struct Range {
+    start: i64,
+    end: i64,
+}
+
+impl Model for Range {
+    type Ty = Range;
+}
+
+#[thrust_macros::context]
+impl Iterator for Range {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<i64> {
+        if self.start < self.end {
+            let item = self.start;
+            self.start += 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    // self.start <= self.end
+    #[thrust_macros::predicate]
+    fn invariant(self) -> bool {
+        self.start <= self.end
+    }
+}
+
+fn main() {
+    let mut t = Take {
+        iter: Take {
+            iter: Range { start: 4, end: 3 },
+            n: 2,
+        },
+        n: 1,
+    };
+    let _ = t.next();
+}

@@ -1,0 +1,12 @@
+marker,source,lines
+,target.rs,"2-3,26,28,33,278-281"
+// //== ./../rustc_hashes/src/lib.rs,target.rs,28-56
+"// //== ./../rustc_index/src/idx.rs (from bitset.rs, stage 2/4)",target.rs,"281-322,325-354,356-367"
+"// //== ./../rustc_index/src/slice.rs (from eligibility.rs, stage 2)",target.rs,"372-379,383-401,405-472,478-479,504-519"
+"// //== ./../rustc_index/src/vec.rs (from eligibility.rs, stage 2)",target.rs,"521-523,525-555,574-608,616-622,633-645"
+// //== ./src/layout.rs / ./src/layout/simple.rs value types (verbatim from,target.rs,"987,989,993-995,998,1000,1002,1004,1006,1010-1011,1088-1090,1121,1125,1214-1215,1224,1229,1235,1369,1391-1394"
+// //== ./src/lib.rs (verbatim from the target),target.rs,"1396,1405,1407-1408,1411-1449,1451-1457,1459-1465,1467-1504"
+// //== ./src/layout.rs / ./src/layout/coroutine.rs value types (verbatim),target.rs,"987,989,993-994,1392-1394"
+"// //== ./src/layout/simple.rs (verbatim, stays trusted per the stage plan)",target.rs,948-985
+// //== ./src/layout.rs: LayoutCalculator (verbatim; `univariant`/,target.rs,"989-1021,1023-1026,1028-1046,1048,1053-1061,1079-1095,1097-1252,1254-1282,1284-1394"
+// //== Thrust model declarations,target.rs,"26,32-33,55-56,2177-2185,2192,2208-2242,2244-2260,2264-2272,2278-2279,2286-2288,2295-2296"

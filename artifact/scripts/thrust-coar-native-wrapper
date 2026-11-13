@@ -1,0 +1,25 @@
+#!/bin/bash
+# THRUST_SOLVER without Docker: solves the query with the CoAR of the unpacked solver/coar.zip next
+# to this file, through its coar.sh, with that directory (and the zip's cvc5, when it has one) on
+# PATH, and prints the verdict the way tests/thrust-pcsat-wrapper does.
+# On Thrust's deadline (SIGTERM to this script) the solver's process group is killed with it.
+#
+# usage: THRUST_SOLVER=<this file> <thrust command>
+# COAR_CONFIG is a path under CoAR's directory, as for tests/thrust-pcsat-wrapper.
+here=$(cd "$(dirname "$0")" && pwd)
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
+# Job control puts the solver in a process group of its own, which the trap kills whole.
+solver=
+trap '[ -n "$solver" ] && kill -TERM -- -"$solver" 2>/dev/null; exit 143' TERM INT
+set -m
+PATH="$here/coar:$PATH" "$here/coar/coar.sh" -c "${COAR_CONFIG:-./config/solver/pcsat_thrust.json}" -p pcsp "$1" > "$out" &
+solver=$!
+set +m
+
+wait "$solver"
+code=$?
+result=$(< "$out")
+echo "${result%,*}"
+exit "$code"

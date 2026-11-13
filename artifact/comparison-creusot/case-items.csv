@@ -1,0 +1,21 @@
+id,file,items
+common,tests/ui/pass/creusot/auxiliary/common.rs,Iterator
+range,tests/ui/pass/creusot/range.rs,Range
+take,tests/ui/pass/creusot/take.rs,Take
+skip,tests/ui/pass/creusot/skip.rs,Skip
+fuse_produces,tests/ui/pass/creusot/fuse_produces.rs,Fuse FusedIterator
+fuse,tests/ui/pass/creusot/fuse.rs,Fuse
+map_ext,tests/ui/pass/creusot/map_ext.rs,Map map
+map_produces,tests/ui/pass/creusot/map.rs,Map map
+map,tests/ui/pass/creusot/weaker/map.rs,Map
+map_call,tests/ui/pass/creusot/weaker/map_call.rs,Map
+iter_mut,tests/ui/pass/creusot/iter_mut.rs,IterMut iter_mut
+collect_by_value,tests/ui/pass/creusot/collect_for.rs,collect
+collect_mutref,tests/ui/pass/creusot/weaker/collect_mutref.rs,Iterator::collect FromIterator Vec
+all_zero,tests/ui/pass/creusot/all_zero.rs,all_zero
+decuple_range_positional,tests/ui/pass/creusot/decuple_range.rs,decuple_range
+decuple_range,tests/ui/pass/creusot/weaker/decuple_range.rs,decuple_range
+skip_take,tests/ui/pass/creusot/skip_take.rs,skip_take
+counter_creusot,tests/ui/pass/creusot/counter_creusot.rs,counter
+counter,tests/ui/pass/creusot/counter.rs,push_produced counter
+extend,tests/ui/pass/creusot/concat_vec.rs,extend_index

@@ -1,0 +1,8 @@
+stage,file,module,type,function,files,unchecked,compile_only,loc,functions_verified,generic,loops,contracts,predicates,trusted_functions,invariants_written,invariants_inferred,ignored_functions,unchecked_functions,assumes,opaque,reveals,assume_stmts,trusted_helpers,spec_lines,contracts_inferred,compile_only_functions,compile_only_loc,functions_checked,generic_functions_checked,generic_contracts_inferred,functions_extracted
+1,../../../rustc_coroutine/compiler/rustc_hashes/src/lib.rs,rustc_hashes,,,hashes.rs,,,22,2,0,0,0,0,1,0,0,1,0,0,0,0,0,0,5,1,0,0,2,0,0,0
+1,../../../rustc_coroutine/compiler/rustc_abi/src/lib.rs,rustc_abi,,,values.rs,,Endian::as_str AbiAlign::max AbiAlign::deref LayoutData::is_uninhabited LayoutData::is_zst VariantLayout::is_uninhabited,601,37,13,0,40,14,4,0,0,4,0,0,4,4,0,0,361,11,6,29,37,13,3,5
+2,../../../rustc_coroutine/compiler/rustc_index/src/idx.rs,rustc_index,,,index.rs,IndexSlice::index,,394,44,38,2,81,41,3,1,1,1,1,0,13,43,0,0,926,17,0,0,44,38,15,2
+5,../../../rustc_coroutine/compiler/rustc_abi/src/layout/coroutine.rs,,,coroutine_saved_local_eligibility,eligibility.rs,,,68,1,1,7,2,0,0,6,1,0,0,0,0,0,0,0,302,0,0,0,1,1,0,2
+6,../../../rustc_coroutine/compiler/rustc_abi/src/layout.rs,,LayoutCalculator,univariant,univariant.rs,,,65,1,1,0,7,13,0,0,0,0,0,0,6,1,0,0,248,0,0,0,1,1,0,0
+6,../../../rustc_coroutine/compiler/rustc_abi/src/layout.rs,,LayoutCalculator,univariant_biased,scalar_pair.rs univariant_biased.rs,,,194,1,1,0,8,5,0,0,0,0,0,1,2,9,10,1,899,0,0,0,2,2,0,11
+7,../../../rustc_coroutine/compiler/rustc_abi/src/layout/coroutine.rs,,,layout,layout.rs lemmas.rs,,,92,0,0,0,2,29,0,0,0,0,0,1,13,22,4,0,2016,0,0,0,1,1,0,7

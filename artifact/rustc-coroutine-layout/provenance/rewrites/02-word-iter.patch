@@ -1,0 +1,68 @@
+From d3157ca1f80a36868e86e64c114493414d5b7f55 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Replace slice::Iter in BitIter with an own WordIter
+
+std's slice iterator stores raw pointers, which Thrust cannot model.
+WordIter walks the word slice by position and yields the same references
+in the same order; BitIter keeps its iterator field and its
+`*self.iter.next()?` unchanged. To be swapped for the std iterator
+model once slices are supported.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/main.rs | 31 +++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/src/main.rs b/src/main.rs
+index e7100687..434dbe92 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -100,12 +100,39 @@ impl<T: Idx> DenseBitSet<T> {
+     }
+ }
+ 
++/// Own iterator standing in for `slice::Iter<'a, Word>` (whose raw pointer
++/// fields have no model in Thrust): yields `&words[0]`, ..., `&words[len - 1]`.
++pub struct WordIter<'a> {
++    words: &'a [Word],
++    pos: usize,
++}
++
++impl<'a> WordIter<'a> {
++    fn new(words: &'a [Word]) -> WordIter<'a> {
++        WordIter { words, pos: 0 }
++    }
++}
++
++impl<'a> Iterator for WordIter<'a> {
++    type Item = &'a Word;
++
++    fn next(&mut self) -> Option<&'a Word> {
++        if self.pos < self.words.len() {
++            let item = &self.words[self.pos];
++            self.pos += 1;
++            Some(item)
++        } else {
++            None
++        }
++    }
++}
++
+ pub struct BitIter<'a, T: Idx> {
+     word: Word,
+ 
+     offset: usize,
+ 
+-    iter: slice::Iter<'a, Word>,
++    iter: WordIter<'a>,
+ 
+     marker: PhantomData<T>,
+ }
+@@ -116,7 +143,7 @@ impl<'a, T: Idx> BitIter<'a, T> {
+         BitIter {
+             word: 0,
+             offset: usize::MAX - (WORD_BITS - 1),
+-            iter: words.iter(),
++            iter: WordIter::new(words),
+             marker: PhantomData,
+         }
+     }

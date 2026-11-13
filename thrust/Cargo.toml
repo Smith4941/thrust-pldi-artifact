@@ -1,0 +1,42 @@
+[workspace]
+members = [".", "thrust-macros"]
+resolver = "2"
+
+[package]
+name = "thrust"
+version = "0.1.0"
+authors = ["Anonymous"]
+edition = "2021"
+
+[[bin]]
+name = "thrust-rustc"
+path = "src/main.rs"
+test = false
+
+[[test]]
+name = "ui"
+harness = false
+
+[dependencies]
+# Workaround until thrust supports invocation via cargo: adding thrust-macros as
+# a dependency ensures cargo builds (and rebuilds) it alongside thrust. thrust-rustc
+# passes the most recently modified build to the analyzed crate via --extern.
+thrust-macros = { path = "thrust-macros" }
+
+anyhow = "1.0.102"
+pretty = { version = "0.12.5", features = ["termcolor"] }
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+process_control = "5.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+nix = { version = "0.31.3", default-features = false, features = ["signal"] }
+num-bigint = "0.5.1"
+
+[dev-dependencies]
+ui_test = "0.30.6"
+
+[package.metadata.rust-analyzer]
+rustc_private = true

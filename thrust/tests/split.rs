@@ -1,0 +1,744 @@
+use std::process::{Command, Output};
+
+fn run(fixture: &str, split: Option<&str>) -> Output {
+    run_with(fixture, split, &[])
+}
+
+fn run_with(fixture: &str, split: Option<&str>, env: &[(&str, &str)]) -> Output {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/split")
+        .join(fixture);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_thrust-rustc"));
+    command
+        .args(["-Awarnings", "-C", "debug-assertions=off"])
+        .arg(fixture)
+        .env_remove("THRUST_SOLVER")
+        .env_remove("THRUST_CACHE_DIR")
+        .env_remove("THRUST_OUTPUT_DIR")
+        .env_remove("THRUST_PRETTY_OUTPUT")
+        .env_remove("THRUST_REPORT")
+        .env_remove("THRUST_REPORT_FORMAT")
+        .env_remove("THRUST_REPORT_FILE")
+        .env_remove("THRUST_REPORT_ONLY")
+        .env_remove("THRUST_SPLIT_GOALS");
+    match split {
+        Some(jobs) => command.env("THRUST_SPLIT", jobs),
+        None => command.env_remove("THRUST_SPLIT"),
+    };
+    command.envs(env.iter().copied());
+    command.output().unwrap()
+}
+
+/// Two functions with written contracts are solved apart, and the one whose ensures fails is
+/// reported with its part; the verdict is the one the whole query gets.
+#[test]
+fn a_failing_part_names_its_function() {
+    let whole = run("two_parts.rs", None);
+    let parts = run("two_parts.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&parts.stderr);
+    assert!(!whole.status.success());
+    assert!(!parts.status.success(), "{stderr}");
+    assert!(stderr.contains("`bad`"), "{stderr}");
+    assert!(!stderr.contains("`good`"), "{stderr}");
+    assert!(stderr.contains("parts solved on their own"), "{stderr}");
+}
+
+#[test]
+fn a_split_that_is_no_number_is_an_error() {
+    let output = run("two_parts.rs", Some("many"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`THRUST_SPLIT`: `many` is no number of parts"),
+        "{stderr}"
+    );
+}
+
+/// The report of a split run shows the failure of the refuted part, with the values where it
+/// fails.
+#[test]
+fn a_split_run_reports_the_refuted_part() {
+    let output = run_with("two_parts.rs", Some("2"), &[("THRUST_REPORT", "1")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("thrust: refuted: ensures in `bad`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("where it fails: x = 0"), "{stderr}");
+    assert!(
+        stderr.contains("error: verification error: Unsat (thrust: refuted: ensures in `bad`)\n"),
+        "{stderr}"
+    );
+}
+
+/// A function whose clauses a written invariant cuts into two parts: the failing part's error
+/// names the lines its clauses come from, and a note says why one function is in two parts.
+#[test]
+fn a_function_in_two_parts_is_explained() {
+    let output = run("invariant_parts.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    // Parts are numbered from 1.
+    assert!(stderr.contains("in part 1 of 2, of "), "{stderr}");
+    assert!(
+        stderr.contains(
+            "invariant_parts.rs:1-8, made at 1-8), `main` (tests/split/invariant_parts.rs:10-12)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("a function can be in several parts: `count_to` in 2"),
+        "{stderr}"
+    );
+}
+
+/// A split run shows the contracts inferred in the parts that are solved, beside the failure of
+/// the part that is refuted.
+#[test]
+fn a_split_run_shows_what_the_solved_parts_infer() {
+    let output = run_with("inferred_parts.rs", Some("2"), &[("THRUST_REPORT", "1")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("thrust: refuted: ensures in `bad`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("inferred: fn double(x: {int | x = 2})"),
+        "{stderr}"
+    );
+}
+
+/// A part line of the JSON report names each function with the span of its clauses.
+#[test]
+fn a_part_line_spans_its_functions() {
+    let output = run_with(
+        "invariant_parts.rs",
+        Some("2"),
+        &[("THRUST_REPORT", "1"), ("THRUST_REPORT_FORMAT", "json")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let part = r#"{"kind":"part","id":2,"clauses":1,"functions":[{"fn":"count_to","span":{"file":"#;
+    assert!(stdout.contains(part), "{stdout}");
+}
+
+/// A part's model is read over the sorts its own query declares, which it numbers apart from
+/// the other parts (here the tuple of a `&mut` and an integer of `gcd`'s loop).
+#[test]
+fn a_part_model_is_read_over_its_own_sorts() {
+    let output = run_with("tuple_sort_part.rs", Some("2"), &[("THRUST_REPORT", "1")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("inferred: fn gcd("), "{stderr}");
+}
+
+/// The report's second runs of the parts write no file: `THRUST_OUTPUT_DIR` gets each part's
+/// query once, and neither the whole query nor `THRUST_PRETTY_OUTPUT` is written.
+#[test]
+fn the_report_of_a_split_run_writes_only_the_parts() {
+    let dir = std::env::temp_dir().join(format!("thrust-split-output-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pretty = dir.join("pretty.txt");
+    let output = run_with(
+        "two_parts.rs",
+        Some("2"),
+        &[
+            ("THRUST_REPORT", "1"),
+            ("THRUST_OUTPUT_DIR", dir.to_str().unwrap()),
+            ("THRUST_PRETTY_OUTPUT", pretty.to_str().unwrap()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(
+        files.iter().any(|f| f == "thrust_output_part1.smt2"),
+        "{files:?} {stderr}"
+    );
+    assert!(
+        !files.iter().any(|f| f == "thrust_output.smt2"),
+        "{files:?}"
+    );
+    assert!(!files.iter().any(|f| f == "pretty.txt"), "{files:?}");
+}
+
+/// The part queries `THRUST_OUTPUT_DIR` gets, each with whether it has a comment line, from a
+/// run of `fixture` split in two with `RUST_LOG` set to `log`.
+fn part_comments(fixture: &str, run_id: usize, log: &str) -> Vec<(String, bool)> {
+    let dir = std::env::temp_dir().join(format!(
+        "thrust-split-comments-{}-{run_id}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let env = [
+        ("THRUST_OUTPUT_DIR", dir.to_str().unwrap()),
+        ("RUST_LOG", log),
+    ];
+    run_with(fixture, Some("2"), &env);
+    let mut parts: Vec<(String, bool)> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, text.lines().any(|l| l.starts_with(';')))
+        })
+        .collect();
+    std::fs::remove_dir_all(&dir).unwrap();
+    parts.sort();
+    parts
+}
+
+/// Every part's query has the comments the log level asks for, whichever thread formats it:
+/// none by default, the origin of each clause at `info`.
+#[test]
+fn part_queries_have_the_comments_of_the_log_level() {
+    for run_id in 0..4 {
+        let quiet = part_comments("two_parts.rs", run_id, "");
+        assert!(quiet.len() > 1, "{quiet:?}");
+        assert!(quiet.iter().all(|(_, comments)| !comments), "{quiet:?}");
+        let info = part_comments("two_parts.rs", run_id, "thrust::chc::smtlib2=info");
+        assert!(info.len() > 1, "{info:?}");
+        assert!(info.iter().all(|(_, comments)| *comments), "{info:?}");
+    }
+}
+
+/// A `z3` on `PATH` that answers `unknown` when asked for a model or a refutation, so that only
+/// the report's second runs fail.
+fn z3_without_evidence() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("thrust-z3-no-evidence-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let z3 = dir.join("z3");
+    let script = "#!/bin/sh\n\
+        file=\"\"; for a in \"$@\"; do file=\"$a\"; done\n\
+        if grep -q 'get-model\\|get-proof' \"$file\"; then echo unknown; exit 0; fi\n\
+        PATH=\"${PATH#*:}\" exec z3 \"$@\"\n";
+    std::fs::write(&z3, script).unwrap();
+    std::fs::set_permissions(&z3, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// When the second run of a part gives no refutation or no model, the report says so, with what
+/// it gave, rather than nothing or that the part has no solution.
+#[test]
+fn a_failed_second_run_is_reported_with_its_verdict() {
+    let dir = z3_without_evidence();
+    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+    let output = run_with(
+        "inferred_parts.rs",
+        Some("2"),
+        &[("THRUST_REPORT", "1,template"), ("PATH", &path)],
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "thrust: no failing obligation to show for part 1: the second run, asked for a \
+             refutation, gave none (unknown)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("no solution: the second run, asked for a model, gave none (unknown)"),
+        "{stderr}"
+    );
+}
+
+/// A solver that gives no model or refutation (any but `z3`) is not asked again by the report:
+/// each part is solved once.
+#[test]
+fn a_solver_without_evidence_solves_each_part_once() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("thrust-sat-solver-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let solver = dir.join("always-sat");
+    let log = dir.join("runs");
+    let script = format!("#!/bin/sh\necho run >> '{}'\necho sat\n", log.display());
+    std::fs::write(&solver, script).unwrap();
+    std::fs::set_permissions(&solver, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = run_with(
+        "two_parts.rs",
+        Some("2"),
+        &[
+            ("THRUST_REPORT", "1"),
+            ("THRUST_SOLVER", solver.to_str().unwrap()),
+        ],
+    );
+    let runs = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("thrust: 3 parts solved on their own"),
+        "{stderr}"
+    );
+    assert_eq!(runs, 3, "{stderr}");
+}
+
+/// A solver other than `z3` that reads PCSat's declarations: the stand-in turns them into
+/// `z3`'s and runs `z3`, so that it refutes as PCSat would and gives no refutation.
+fn pcsat_stand_in() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("thrust-pcsat-stand-in-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let solver = dir.join("pcsat");
+    let script = "#!/bin/sh\n\
+        file=\"\"; for a in \"$@\"; do file=\"$a\"; done\n\
+        sed 's/(declare-dep-exists-fun \\([^ ]*\\) () /(declare-fun \\1 /' \"$file\" > \"$file.z3\"\n\
+        z3 fp.engine=spacer -smt2 \"$file.z3\"; status=$?\n\
+        rm -f \"$file.z3\"; exit $status\n";
+    std::fs::write(&solver, script).unwrap();
+    std::fs::set_permissions(&solver, std::fs::Permissions::from_mode(0o755)).unwrap();
+    solver
+}
+
+/// A part a solver without refutations refutes is refuted by `z3` for the report when `z3` reads
+/// it, which the run says; so is the whole query.
+#[test]
+fn z3_gives_the_run_of_a_part_another_solver_refutes() {
+    let solver = pcsat_stand_in();
+    let env = [
+        ("THRUST_REPORT", "1"),
+        ("THRUST_SOLVER", solver.to_str().unwrap()),
+    ];
+    let split = run_with("two_parts.rs", Some("2"), &env);
+    let mut json_env = env.to_vec();
+    json_env.push(("THRUST_REPORT_FORMAT", "json"));
+    let whole = run_with("two_parts.rs", None, &json_env);
+    std::fs::remove_dir_all(solver.parent().unwrap()).unwrap();
+    let stderr = String::from_utf8_lossy(&split.stderr);
+    assert!(
+        stderr.contains("thrust: refuted: ensures in `bad`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("how `z3` (asked for the run, as the solver gives none) reaches it"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("bad.bb0(x = 0, old(x) = 0)"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&whole.stdout);
+    assert!(stdout.contains(r#""run_by_z3":true"#), "{stdout}");
+}
+
+/// When `z3`, asked in place of a solver that gives no refutation, finds a part the solver
+/// refutes satisfiable, the report says the solvers disagree rather than showing nothing.
+#[test]
+fn z3_finding_a_refuted_part_sat_is_a_disagreement() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("thrust-unsat-solver-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let solver = dir.join("always-unsat");
+    std::fs::write(&solver, "#!/bin/sh\necho unsat\n").unwrap();
+    std::fs::set_permissions(&solver, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [
+        ("THRUST_REPORT", "1"),
+        ("THRUST_SOLVER", solver.to_str().unwrap()),
+    ];
+    let output = run_with("two_parts.rs", Some("2"), &env);
+    let mut json_env = env.to_vec();
+    json_env.push(("THRUST_REPORT_FORMAT", "json"));
+    let json = run_with("two_parts.rs", Some("2"), &json_env);
+    std::fs::remove_dir_all(&dir).unwrap();
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    let part = stdout
+        .lines()
+        .find(|l| l.contains(r#""kind":"part","id":1,"#))
+        .unwrap_or_default();
+    assert!(part.ends_with(r#""z3_answer":"sat"}"#), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "thrust: no failing obligation to show for part 1: `z3`, asked for the run as the \
+             solver gives none, answers `sat`: the two solvers disagree on the query"
+        ),
+        "{stderr}"
+    );
+}
+
+/// A split run's JSON states one refutation per part, and each failure names its part; without
+/// the report, a failing part's error is at the code of the part.
+#[test]
+fn a_split_failure_names_its_part() {
+    let json = run_with(
+        "two_parts.rs",
+        Some("2"),
+        &[("THRUST_REPORT", "1"), ("THRUST_REPORT_FORMAT", "json")],
+    );
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    let verdict = r#"{"kind":"verdict","verdict":"unsat","refutations":"one per part","message":null,"functions":null,"z3_answer":null}"#;
+    assert!(stdout.contains(verdict), "{stdout}");
+    assert!(
+        stdout.contains(r#"{"kind":"failure","part":2,"constraint":"#),
+        "{stdout}"
+    );
+    let plain = run("two_parts.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    let at = stderr
+        .split("error: verification error: Unsat\n")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_default();
+    assert!(at.ends_with("two_parts.rs:9:1"), "{stderr}");
+}
+
+/// What needs no answer of the solver, the templates and the constraints, is shown of every part
+/// as without `THRUST_SPLIT`.
+#[test]
+fn a_split_run_shows_the_constraints_of_every_part() {
+    let notes = |split| {
+        let output = run_with(
+            "inferred_parts.rs",
+            split,
+            &[("THRUST_REPORT", "template,constraints")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (stderr.matches("constraints from this code").count(), stderr)
+    };
+    let (whole, _) = notes(None);
+    let (parts, stderr) = notes(Some("2"));
+    assert!(whole >= 3, "{stderr}");
+    assert_eq!(parts, whole, "{stderr}");
+    assert!(stderr.contains("template: fn double("), "{stderr}");
+}
+
+/// A failing part of several functions without a refutation has its error at the first and
+/// labels the others.
+#[test]
+fn a_part_of_several_functions_spans_each() {
+    let output = run("several_functions.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("`main` is in this part too"), "{stderr}");
+}
+
+/// A part declares only what its assertions use: the part of `bad`, which has no sequence, is
+/// refuted by `z3`, and the part of `count`, whose loop's sequence datatypes no assertion uses,
+/// declares none of them, so `z3` reads it too.
+#[test]
+fn a_part_without_sequences_declares_none() {
+    let output = run("sequence_and_not.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error: verification error: Unsat"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("verification error").count(), 1, "{stderr}");
+}
+
+/// A failing part's error and the labels of its other functions are at the functions'
+/// signatures, not their bodies; a return's constraint, whose span is empty, is at the signature.
+#[test]
+fn a_part_error_names_signatures() {
+    let output = run("several_functions.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("units * 9"), "{stderr}");
+    let json = run_with(
+        "two_parts.rs",
+        Some("2"),
+        &[("THRUST_REPORT", "1"), ("THRUST_REPORT_FORMAT", "json")],
+    );
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    let failure = stdout
+        .lines()
+        .find(|l| l.contains(r#""kind":"failure""#))
+        .unwrap_or_default();
+    assert!(
+        !failure.contains(r#""line":11,"column":2,"end_line":11,"end_column":2"#),
+        "{stdout}"
+    );
+}
+
+/// In a split run, a part without an answer gives what the solver answered on its line, and the
+/// verdict line names the first such part.
+#[test]
+fn a_part_without_an_answer_gives_the_solver_s_limit() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("thrust-slow-part-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let solver = dir.join("slow");
+    std::fs::write(&solver, "#!/bin/sh\nsleep 5\necho sat\n").unwrap();
+    std::fs::set_permissions(&solver, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = run_with(
+        "two_parts.rs",
+        Some("4"),
+        &[
+            ("THRUST_REPORT", "1"),
+            ("THRUST_REPORT_FORMAT", "json"),
+            ("THRUST_SOLVER", solver.to_str().unwrap()),
+            ("THRUST_SOLVER_TIMEOUT_SECS", "1"),
+        ],
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let verdict = r#"{"kind":"verdict","verdict":"timeout","refutations":"one per part","message":"part 1: Timeout(1s)","functions":null,"z3_answer":null}"#;
+    assert!(stdout.contains(verdict), "{stdout}");
+    assert!(
+        stdout.contains(
+            r#""verdict":"timeout","message":"Timeout(1s)","cached":false,"z3_answer":null}"#
+        ),
+        "{stdout}"
+    );
+}
+
+/// With the JSON report, a split run's error of a refuted part is a plain error at the refuted
+/// obligation, the report's failure line naming the part.
+#[test]
+fn a_split_json_run_has_its_error_at_the_obligation() {
+    let output = run_with(
+        "two_parts.rs",
+        Some("2"),
+        &[("THRUST_REPORT", "1"), ("THRUST_REPORT_FORMAT", "json")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let at = stderr
+        .split("error: verification error: Unsat\n")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_default();
+    assert!(at.ends_with("two_parts.rs:9:1"), "{stderr}");
+    assert!(!stderr.contains("thrust: refuted"), "{stderr}");
+}
+
+/// A part declares the datatypes of its own unknowns only: the part of `bad` is refuted by `z3`
+/// although the unknowns of `first_or_zero`, in another part, take a sequence.
+#[test]
+fn a_part_declares_only_its_unknowns_sorts() {
+    let output = run("sequence_in_signature.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bad = stderr
+        .split("error: verification error: ")
+        .find(|e| e.contains("clauses from `bad`"))
+        .unwrap_or_default();
+    assert!(bad.starts_with("Unsat"), "{stderr}");
+}
+
+/// With candidate atoms (`THRUST_CANDIDATE_ATOMS`), a part keeps those of its own unknowns: the
+/// others have no sorts there.
+#[test]
+fn a_part_keeps_its_own_candidate_atoms() {
+    for mode in ["1", "2"] {
+        let output = run_with(
+            "candidate_atoms.rs",
+            Some("2"),
+            &[("THRUST_CANDIDATE_ATOMS", mode)],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(stderr.contains("parts solved on their own"), "{stderr}");
+    }
+}
+
+/// Two parts of one function, on the two sides of a written invariant, tell apart by the lines
+/// their clauses were made at.
+#[test]
+fn the_parts_of_one_function_tell_apart() {
+    let output = run("invariant_not_preserved.rs", Some("4"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let made_at: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("note: in part"))
+        .filter_map(|l| l.split(", made at ").nth(1))
+        .collect();
+    assert_eq!(made_at.len(), 2, "{stderr}");
+    assert_ne!(made_at[0], made_at[1], "{stderr}");
+}
+
+/// The variables of a written invariant at the loop's exit, which no longer hold a variable of
+/// the program there, are named by the variables they held at the loop's head.
+#[test]
+fn the_variables_of_an_invariant_keep_their_names_after_the_loop() {
+    let output = run_with(
+        "invariant_not_preserved.rs",
+        Some("4"),
+        &[("THRUST_REPORT", "failure")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit = stderr
+        .lines()
+        .filter(|l| l.contains("where it fails:"))
+        .find(|l| l.contains("result = "))
+        .unwrap_or_default();
+    assert_eq!(
+        exit.trim(),
+        "= note: where it fails: result = 1, n = 1, i = 1",
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "c1: (i = n ∧ 0 <= i ∧ 2 * result = i * (i + 1)) ==> 2 * result = n * (n - 1)"
+        ),
+        "{stderr}"
+    );
+}
+
+/// `double`, left to inference, is shared by the two assertions of `main`, so the whole crate is
+/// one class of clauses; `THRUST_SPLIT_GOALS` solves each assertion with the clauses deriving what
+/// it reads, and the refuted one fails alone, with the clauses of `double` in both parts.
+#[test]
+fn each_goal_is_solved_with_its_cone() {
+    let classes = run("goal_cones.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&classes.stderr);
+    assert!(stderr.contains("in part 1 of 1, "), "{stderr}");
+
+    let cones = run_with(
+        "goal_cones.rs",
+        Some("2"),
+        &[
+            ("THRUST_SPLIT_GOALS", "1"),
+            ("THRUST_REPORT", "functions,failure"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&cones.stderr);
+    assert!(!cones.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("error: verification error: Unsat (thrust: refuted: assertion in `main`)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("goal_cones.rs:9:5"), "{stderr}");
+    assert_eq!(stderr.matches("verification error").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("2 parts solved on their own, 0 of them from earlier runs, one per goal"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`double`: checked, in parts 1, 2"),
+        "{stderr}"
+    );
+}
+
+/// The inferred contract of a function two cones share is the conjunction of their models, a
+/// model of both; with both assertions holding, every cone and so the crate is `sat`.
+#[test]
+fn goal_cones_that_all_hold_verify_the_crate() {
+    let output = run_with(
+        "goal_cones_hold.rs",
+        Some("2"),
+        &[("THRUST_SPLIT_GOALS", "1"), ("THRUST_REPORT", "inferred")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("2 parts solved on their own"), "{stderr}");
+    assert!(stderr.contains("inferred: fn double("), "{stderr}");
+}
+
+/// `THRUST_SPLIT_GOALS` makes each conjunct of a checked postcondition a goal of its own: the
+/// two `ensures` of `succ` are two parts, and the refuted one states only the false conjunct.
+#[test]
+fn each_conjunct_of_a_postcondition_is_a_goal() {
+    let classes = run("conjunct_goals.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&classes.stderr);
+    assert!(stderr.contains("of 2 clauses from `succ`"), "{stderr}");
+
+    let cones = run_with(
+        "conjunct_goals.rs",
+        Some("2"),
+        &[
+            ("THRUST_SPLIT_GOALS", "1"),
+            ("THRUST_REPORT", "functions,failure"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&cones.stderr);
+    assert!(!cones.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("2 parts solved on their own, 0 of them from earlier runs, one per goal"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("verification error").count(), 1, "{stderr}");
+    assert!(stderr.contains(") ==> result > 2\n"), "{stderr}");
+    assert!(!stderr.contains("result > x ∧"), "{stderr}");
+    assert!(
+        stderr.contains("`succ`: checked, in parts 1, 2 (unsat)"),
+        "{stderr}"
+    );
+}
+
+/// `#[thrust::split_goals]` sets apart the goals of `twice` only: each of its two assertions is a
+/// part with the clauses of `double` it reads, and the assertion of `main` stays in what is left
+/// of the one class; the refuted assertion fails alone.
+#[test]
+fn split_goals_sets_apart_the_goals_of_its_function() {
+    let output = run("goals_apart.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("3 parts solved on their own, 0 of them from earlier runs, each goal of a"),
+        "{stderr}"
+    );
+
+    let output = run("goals_apart_fail.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(stderr.matches("verification error").count(), 1, "{stderr}");
+    assert!(stderr.contains("in part 2 of 3, "), "{stderr}");
+}
+
+/// In a function marked `#[thrust::split_goals]`, each conjunct of a checked postcondition is a
+/// goal of its own, as with `THRUST_SPLIT_GOALS`: the two `ensures` of `succ` are two parts, after
+/// the class with no goal that the run without the attribute has too, and only the second fails.
+#[test]
+fn split_goals_makes_each_conjunct_a_goal() {
+    let output = run("conjunct_goals_marked.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("3 parts solved on their own, 0 of them from earlier runs, each goal of a"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("verification error").count(), 1, "{stderr}");
+    assert!(stderr.contains("in part 3 of 3, "), "{stderr}");
+}
+
+/// The goals of an unmarked function analyzed while a marked one is (`h`, a callee analyzed at its
+/// instance inside `m`) keep their conjunctions: the precondition of `g` at the call in `h` is one
+/// goal, `x > 0 ∧ x < 100`.
+#[test]
+fn a_callee_of_a_marked_function_keeps_its_conjunctions() {
+    let dir = std::env::temp_dir().join(format!("thrust-split-callee-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = run_with(
+        "goals_apart_callee.rs",
+        Some("2"),
+        &[("THRUST_OUTPUT_DIR", dir.to_str().unwrap())],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let queries: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(
+        stderr.contains("each goal of a `#[thrust::split_goals]` function apart"),
+        "{stderr}"
+    );
+    let preconditions: Vec<&str> = queries
+        .iter()
+        .flat_map(|q| q.lines())
+        .filter(|l| l.contains("(< v5 100)"))
+        .collect();
+    assert!(!preconditions.is_empty(), "{queries:?}");
+    assert!(
+        preconditions.iter().all(|l| l.contains("(not (and")),
+        "{preconditions:?}"
+    );
+}
+
+/// `#[thrust::split_goals]` on anything but a function whose body Thrust analyzes is an error: a
+/// struct, and a closure, which takes the attribute of the function it is written in.
+#[test]
+fn a_misplaced_split_goals_is_an_error() {
+    let output = run("split_goals_misplaced.rs", Some("2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches(
+                "`#[thrust::split_goals]` applies only to a function whose body Thrust analyzes"
+            )
+            .count(),
+        2,
+        "{stderr}"
+    );
+}

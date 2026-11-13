@@ -1,0 +1,52 @@
+From a57c28303a0f1b2b81bf31cfc5ccbcc98019ac97 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Write out the two ? operators in layout()
+
+? desugars to Try::branch and FromResidual::from_residual, std bodies
+without specs. Both sites convert between the same error type, where ?
+is exactly the match written here.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/main.rs | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/src/main.rs b/src/main.rs
+index ba69ce25..fd0ca86a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -745,11 +745,15 @@ pub fn layout<
+     let promoted_layouts = ineligible_locals.iter().map(|local| local_layouts[local]);
+     prefix_layouts.push(tag_to_layout(tag));
+     prefix_layouts.extend(promoted_layouts);
+-    let prefix = calc.univariant(
++    // `?` written out (same error type, so its From conversion is the identity)
++    let prefix = match calc.univariant(
+         &prefix_layouts,
+         &ReprOptions::default(),
+         StructKind::AlwaysSized,
+-    )?;
++    ) {
++        Ok(prefix) => prefix,
++        Err(err) => return Err(err),
++    };
+ 
+     let (prefix_size, prefix_align) = (prefix.size, prefix.align);
+ 
+@@ -803,11 +807,15 @@ pub fn layout<
+                 })
+                 .map(|local| local_layouts[*local]);
+ 
+-            let mut variant = calc.univariant(
++            // `?` written out (same error type, so its From conversion is the identity)
++            let mut variant = match calc.univariant(
+                 &variant_only_tys.collect::<IndexVec<_, _>>(),
+                 &ReprOptions::default(),
+                 StructKind::Prefixed(prefix_size, prefix_align.abi),
+-            )?;
++            ) {
++                Ok(variant) => variant,
++                Err(err) => return Err(err),
++            };
+ 
+             let FieldsShape::Arbitrary {
+                 offsets,

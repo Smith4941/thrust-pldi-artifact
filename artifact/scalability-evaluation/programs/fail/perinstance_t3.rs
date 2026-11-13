@@ -1,0 +1,51 @@
+//@error-in-other-file: Unsat
+//@compile-flags: -C debug-assertions=off
+//@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper THRUST_SOLVER_TIMEOUT_SECS=300
+
+// Scalability evaluation, variant perinstance, the instantiation at S3 alone; the variant at size k is t0 .. t(k-1). Fail twin: the loop of `repeat_s3` stops one step early, so its body breaks its postcondition.
+
+#[thrust_macros::context]
+trait Step {
+    #[thrust_macros::requires(Self::inv(x))]
+    #[thrust_macros::ensures(Self::inv(result) && result > x)]
+    fn step(&self, x: i64) -> i64;
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool;
+}
+
+#[derive(PartialEq)]
+struct S3 {}
+
+impl thrust_models::Model for S3 {
+    type Ty = S3;
+}
+
+#[thrust_macros::context]
+impl Step for S3 {
+    fn step(&self, x: i64) -> i64 {
+        x + 1
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 3
+    }
+}
+
+#[thrust_macros::requires(S3::inv(x) && n >= 0)]
+#[thrust_macros::ensures(S3::inv(result) && result >= x + n)]
+fn repeat_s3(a: &S3, x: i64, n: i64) -> i64 {
+    let mut v = x;
+    let mut i = 0;
+    while i + 1 < n {
+        v = a.step(v);
+        i += 1;
+    }
+    v
+}
+
+fn main() {
+    let r_s3 = repeat_s3(&S3 {}, 3, 3);
+    assert!(r_s3 >= 6);
+}

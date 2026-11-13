@@ -1,0 +1,51 @@
+//@check-pass
+//@compile-flags: -C debug-assertions=off
+//@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper THRUST_SOLVER_TIMEOUT_SECS=300
+
+// Scalability evaluation, variant perinstance, the instantiation at S15 alone; the variant at size k is t0 .. t(k-1).
+
+#[thrust_macros::context]
+trait Step {
+    #[thrust_macros::requires(Self::inv(x))]
+    #[thrust_macros::ensures(Self::inv(result) && result > x)]
+    fn step(&self, x: i64) -> i64;
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool;
+}
+
+#[derive(PartialEq)]
+struct S15 {}
+
+impl thrust_models::Model for S15 {
+    type Ty = S15;
+}
+
+#[thrust_macros::context]
+impl Step for S15 {
+    fn step(&self, x: i64) -> i64 {
+        x + 1
+    }
+
+    #[thrust_macros::predicate]
+    fn inv(x: i64) -> bool {
+        x >= 15
+    }
+}
+
+#[thrust_macros::requires(S15::inv(x) && n >= 0)]
+#[thrust_macros::ensures(S15::inv(result) && result >= x + n)]
+fn repeat_s15(a: &S15, x: i64, n: i64) -> i64 {
+    let mut v = x;
+    let mut i = 0;
+    while i < n {
+        v = a.step(v);
+        i += 1;
+    }
+    v
+}
+
+fn main() {
+    let r_s15 = repeat_s15(&S15 {}, 15, 3);
+    assert!(r_s15 >= 18);
+}

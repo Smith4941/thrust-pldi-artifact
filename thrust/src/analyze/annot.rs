@@ -1,0 +1,656 @@
+//! Supporting implementation for parsing Thrust annotations.
+
+use rustc_ast::tokenstream::TokenStream;
+use rustc_hir::Attribute;
+use rustc_span::symbol::Symbol;
+
+use crate::rty;
+
+pub fn trusted_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("trusted")]
+}
+
+pub fn sealed_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("sealed")]
+}
+
+pub fn opaque_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("opaque")]
+}
+
+pub fn split_goals_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("split_goals")]
+}
+
+pub fn reveal_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("reveal")]
+}
+
+pub fn callable_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("callable")]
+}
+
+pub fn extern_spec_fn_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("extern_spec_fn")]
+}
+
+pub fn raw_command_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("raw_command")]
+}
+
+pub fn predicate_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("predicate")]
+}
+
+pub fn logic_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("logic")]
+}
+
+pub fn lemma_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("lemma")]
+}
+
+pub fn lemma_rec_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("lemma_rec")]
+}
+
+pub fn derived_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("derived")]
+}
+
+pub fn law_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("law")]
+}
+
+pub fn ignored_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("ignored")]
+}
+
+pub fn formula_fn_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("formula_fn")]
+}
+
+pub fn variant_path_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("variant_path")]
+}
+
+pub fn requires_path_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("requires_path")]
+}
+
+pub fn ensures_path_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("ensures_path")]
+}
+
+pub fn refinement_path_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("refinement_path")]
+}
+
+pub fn hist_inv_path_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("hist_inv_path")]
+}
+
+/// `#[thrust::open_inv]` on a parameter: its type invariant is neither assumed at entry nor, for a
+/// `&mut`, required of its final value (Creusot's `#[creusot::open_inv]`).
+pub fn open_inv_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("open_inv")]
+}
+
+/// `#[thrust::open_inv_result]` on a function: its result's type invariant is not ensured
+/// (Creusot's `#[open_inv_result]`).
+pub fn open_inv_result_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("open_inv_result")]
+}
+
+pub fn type_invariant_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("type_invariant"),
+    ]
+}
+
+pub fn closure_upvars_path() -> [Symbol; 2] {
+    [Symbol::intern("thrust"), Symbol::intern("closure_upvars")]
+}
+
+pub fn model_ty_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("model_ty"),
+    ]
+}
+
+pub fn int_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("int_model"),
+    ]
+}
+
+pub fn uint_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("uint_model"),
+    ]
+}
+
+pub fn int_n_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("int_n_model"),
+    ]
+}
+
+pub fn uint_n_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("uint_n_model"),
+    ]
+}
+
+pub fn bit_vec_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("bit_vec_model"),
+    ]
+}
+
+pub fn bit_vec_from_int_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("bit_vec_from_int"),
+    ]
+}
+
+pub fn bit_vec_to_int_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("bit_vec_to_int"),
+    ]
+}
+
+pub fn mut_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("mut_model"),
+    ]
+}
+
+pub fn box_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("box_model"),
+    ]
+}
+
+pub fn array_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("array_model"),
+    ]
+}
+
+pub fn closure_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("closure_model"),
+    ]
+}
+
+pub fn iterator_spec_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("iterator_spec"),
+    ]
+}
+
+pub fn partial_ord_spec_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("partial_ord_spec"),
+    ]
+}
+
+pub fn model_eq_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("model_eq"),
+    ]
+}
+
+pub fn no_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("no_model"),
+    ]
+}
+
+pub fn dyn_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("dyn_model"),
+    ]
+}
+
+pub fn ghost_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("ghost_model"),
+    ]
+}
+
+pub fn mut_model_new_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("mut_new"),
+    ]
+}
+
+pub fn box_model_new_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("box_new"),
+    ]
+}
+
+pub fn array_model_store_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("array_store"),
+    ]
+}
+
+pub fn array_model_from_fn_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("array_from_fn"),
+    ]
+}
+
+pub fn seq_model_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_model"),
+    ]
+}
+
+pub fn seq_empty_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_empty"),
+    ]
+}
+
+pub fn int_to_int_n_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("int_to_int_n"),
+    ]
+}
+
+pub fn proof_branch_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("proof_branch"),
+    ]
+}
+
+pub fn int_lit_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("int_lit"),
+    ]
+}
+
+pub fn int_n_to_int_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("int_n_to_int"),
+    ]
+}
+
+pub fn uint_to_uint_n_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("uint_to_uint_n"),
+    ]
+}
+
+pub fn uint_n_to_uint_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("uint_n_to_uint"),
+    ]
+}
+
+pub fn seq_singleton_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_singleton"),
+    ]
+}
+
+pub fn seq_len_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_len"),
+    ]
+}
+
+pub fn seq_push_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_push"),
+    ]
+}
+
+pub fn seq_store_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_store"),
+    ]
+}
+
+pub fn seq_subsequence_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_subsequence"),
+    ]
+}
+
+pub fn seq_concat_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("seq_concat"),
+    ]
+}
+
+pub fn exists_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("exists"),
+    ]
+}
+
+pub fn forall_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("forall"),
+    ]
+}
+
+pub fn implies_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("implies"),
+    ]
+}
+
+pub fn log_eq_args_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("log_eq_args"),
+    ]
+}
+
+pub fn invariant_marker_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("invariant_marker"),
+    ]
+}
+
+pub fn partial_invariant_marker_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("partial_invariant_marker"),
+    ]
+}
+
+pub fn for_loop_history_marker_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("for_loop_history_marker"),
+    ]
+}
+
+pub fn for_loop_history_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("for_loop_history"),
+    ]
+}
+
+pub fn assert_marker_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("assert_marker"),
+    ]
+}
+
+pub fn assume_marker_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("assume_marker"),
+    ]
+}
+
+pub fn choose_marker_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("choose_marker"),
+    ]
+}
+
+pub fn witness_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("witness"),
+    ]
+}
+
+pub fn ghost_marker_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("ghost_marker"),
+    ]
+}
+
+pub fn fn_param_wrapper_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("fn_param_wrapper"),
+    ]
+}
+
+pub fn fn_param_at_entry_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("fn_param_at_entry"),
+    ]
+}
+
+pub fn closure_precondition_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("closure_precondition"),
+    ]
+}
+
+pub fn closure_postcondition_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("closure_postcondition"),
+    ]
+}
+
+pub fn closure_hist_inv_path() -> [Symbol; 3] {
+    [
+        Symbol::intern("thrust"),
+        Symbol::intern("def"),
+        Symbol::intern("closure_hist_inv"),
+    ]
+}
+
+pub fn extract_annot_tokens(attr: Attribute) -> TokenStream {
+    let Attribute::Unparsed(item) = attr else {
+        panic!("invalid attribute: expected unparsed");
+    };
+    let rustc_hir::AttrArgs::Delimited(d) = item.args else {
+        panic!("invalid attribute: expected delimited args");
+    };
+    d.tokens
+}
+
+/// Parses a [`rty::TypePosition`] from the tokens of a
+/// `#[thrust::refinement_path(..)]` attribute.
+///
+/// Tokens are comma-separated [`rty::TypePositionStep`]s, each encoded as
+/// `result` (→ `Return`), `$i` (→ `Param(i)`), or a bare integer `i` (→
+/// `TypeArg(i)`).
+pub fn parse_type_position(ts: &TokenStream) -> rty::TypePosition {
+    use rustc_ast::token::{LitKind, TokenKind};
+    use rustc_ast::tokenstream::TokenTree;
+
+    let parse_int = |lit: &rustc_ast::token::Lit| -> usize {
+        assert_eq!(
+            lit.kind,
+            LitKind::Integer,
+            "expected an integer in type position"
+        );
+        lit.symbol
+            .as_str()
+            .parse()
+            .expect("invalid integer in type position")
+    };
+
+    let mut steps = Vec::new();
+    let mut iter = ts.iter();
+    while let Some(tt) = iter.next() {
+        let TokenTree::Token(t, _) = tt else {
+            panic!("unexpected token tree in type position");
+        };
+        match &t.kind {
+            TokenKind::Comma => {}
+            TokenKind::Ident(sym, _) if sym.as_str() == "result" => {
+                steps.push(rty::TypePositionStep::Return);
+            }
+            TokenKind::Dollar => {
+                let i = match iter.next() {
+                    Some(TokenTree::Token(t, _)) => match &t.kind {
+                        TokenKind::Literal(lit) => parse_int(lit),
+                        _ => panic!("expected integer after `$` in type position: {:?}", t),
+                    },
+                    _ => panic!("expected integer after `$` in type position"),
+                };
+                steps.push(rty::TypePositionStep::Param(rty::FunctionParamIdx::from(i)));
+            }
+            TokenKind::Literal(lit) => {
+                steps.push(rty::TypePositionStep::TypeArg(parse_int(lit)));
+            }
+            _ => panic!("unexpected token in type position: {:?}", t),
+        }
+    }
+
+    rty::TypePosition::new(steps)
+}
+
+/// The paths a `#[thrust::reveal(a::b::f, ..)]` names, each as its segments; `None` for the bare
+/// `#[thrust::reveal]`, and `Err` with a message for any other form (`= ..`, brackets or braces) or
+/// for tokens that are not comma-separated paths (a leading or trailing `::` included).
+pub fn reveal_paths(attr: &Attribute) -> Result<Option<Vec<Vec<Symbol>>>, String> {
+    use rustc_ast::token::{Delimiter, TokenKind};
+    use rustc_ast::tokenstream::TokenTree;
+
+    let form = "`#[thrust::reveal]` is bare or takes paths in parentheses, separated by commas: `#[thrust::reveal(path::to::f, ..)]`";
+    let Attribute::Unparsed(item) = attr else {
+        return Ok(None);
+    };
+    let d = match &item.args {
+        rustc_hir::AttrArgs::Empty => return Ok(None),
+        rustc_hir::AttrArgs::Delimited(d) if d.delim == Delimiter::Parenthesis => d,
+        _ => return Err(form.to_owned()),
+    };
+    let mut paths: Vec<Vec<Symbol>> = vec![Vec::new()];
+    // Whether the next token must be a segment: at the start of a path and after `::`.
+    let mut want_segment = true;
+    for tree in d.tokens.iter() {
+        let TokenTree::Token(token, _) = tree else {
+            return Err(form.to_owned());
+        };
+        match (token.kind, want_segment) {
+            (TokenKind::Ident(name, _), true) => {
+                paths.last_mut().unwrap().push(name);
+                want_segment = false;
+            }
+            (TokenKind::PathSep, false) => want_segment = true,
+            (TokenKind::Comma, false) => {
+                paths.push(Vec::new());
+                want_segment = true;
+            }
+            _ => return Err(form.to_owned()),
+        }
+    }
+    if want_segment && !paths.last().unwrap().is_empty() {
+        return Err(form.to_owned());
+    }
+    paths.retain(|p| !p.is_empty());
+    if paths.is_empty() {
+        return Err("`#[thrust::reveal(..)]` names no function; write `#[thrust::reveal]` for the opaque functions of the module".to_owned());
+    }
+    Ok(Some(paths))
+}

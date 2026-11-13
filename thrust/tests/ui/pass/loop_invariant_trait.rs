@@ -1,0 +1,29 @@
+//@check-pass
+//@compile-flags: -C debug-assertions=off
+//@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper
+#[thrust_macros::requires(true)]
+#[thrust_macros::ensures(true)]
+#[thrust::trusted]
+fn rand() -> i64 { unimplemented!() }
+
+#[thrust_macros::context]
+trait Foo {
+    fn run(&mut self) {
+        let mut x: i64 = 0;
+        while rand() == 0 {
+            thrust_macros::invariant!(|x: i64| x >= 0);
+            x += 1;
+        }
+        assert!(x >= 0);
+    }
+}
+
+struct Bar;
+impl thrust_models::Model for Bar {
+    type Ty = ();
+}
+impl Foo for Bar {}
+
+fn main() {
+    Bar.run();
+}

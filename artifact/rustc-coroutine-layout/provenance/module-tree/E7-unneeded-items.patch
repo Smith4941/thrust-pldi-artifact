@@ -1,0 +1,106 @@
+diff --git a/tests/rustc_coroutine/compiler/rustc_abi/src/lib.rs b/tests/rustc_coroutine/compiler/rustc_abi/src/lib.rs
+index 8019402e..1b5c250c 100644
+--- a/tests/rustc_coroutine/compiler/rustc_abi/src/lib.rs
++++ b/tests/rustc_coroutine/compiler/rustc_abi/src/lib.rs
+@@ -992,10 +992,6 @@ impl<FieldIdx: Idx> VariantLayout<FieldIdx> {
+     pub fn is_uninhabited(&self) -> bool {
+         self.uninhabited
+     }
+-
+-    pub fn has_fields(&self) -> bool {
+-        self.field_offsets.len() > 0
+-    }
+ }
+ 
+ // The derived `PartialOrd` and `Ord` of `Size` and `Align` compare the single field, so `max` and
+diff --git a/tests/rustc_coroutine/compiler/rustc_hashes/src/lib.rs b/tests/rustc_coroutine/compiler/rustc_hashes/src/lib.rs
+index 782ccc06..8216125c 100644
+--- a/tests/rustc_coroutine/compiler/rustc_hashes/src/lib.rs
++++ b/tests/rustc_coroutine/compiler/rustc_hashes/src/lib.rs
+@@ -20,11 +20,6 @@ impl Hash64 {
+         Self { inner: n }
+     }
+ 
+-    #[inline]
+-    pub fn as_u64(self) -> u64 {
+-        self.inner
+-    }
+-
+     #[inline]
+     #[thrust::callable]
+     pub fn wrapping_add(self, other: Self) -> Self {
+diff --git a/tests/rustc_coroutine/compiler/rustc_index/src/slice.rs b/tests/rustc_coroutine/compiler/rustc_index/src/slice.rs
+index 14cd4060..0236fe8c 100644
+--- a/tests/rustc_coroutine/compiler/rustc_index/src/slice.rs
++++ b/tests/rustc_coroutine/compiler/rustc_index/src/slice.rs
+@@ -1,4 +1,3 @@
+-use std::fmt;
+ use crate::thrust_models;
+ use std::marker::PhantomData;
+ use std::slice::SliceIndex;
+@@ -17,13 +16,6 @@ pub struct IndexSlice<I: Idx, T> {
+     pub raw: [T],
+ }
+ 
+-impl<I: Idx, T: fmt::Debug> fmt::Debug for IndexSlice<I, T> {
+-    #[thrust::ignored]
+-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        fmt::Debug::fmt(&self.raw, fmt)
+-    }
+-}
+-
+ /// Own iterator standing in for `slice::Iter<'a, T>` (whose raw pointer
+ /// fields have no model in Thrust): yields `&raw[0]`, ..., `&raw[len - 1]`.
+ pub struct SliceIter<'a, T> {
+diff --git a/tests/rustc_coroutine/compiler/rustc_index/src/vec.rs b/tests/rustc_coroutine/compiler/rustc_index/src/vec.rs
+index a04fdbe9..f55993c7 100644
+--- a/tests/rustc_coroutine/compiler/rustc_index/src/vec.rs
++++ b/tests/rustc_coroutine/compiler/rustc_index/src/vec.rs
+@@ -1,6 +1,5 @@
+ use std::fmt;
+ use crate::thrust_models;
+-use std::borrow::{Borrow, BorrowMut};
+ use std::marker::PhantomData;
+ use std::ops::{Deref, DerefMut};
+ use std::vec;
+@@ -152,40 +151,6 @@ fn _extern_spec_index_vec_deref_mut<I: Idx + thrust_models::Model, T: thrust_mod
+     <IndexVec<I, T> as DerefMut>::deref_mut(slf)
+ }
+ 
+-impl<I: Idx, T> Borrow<IndexSlice<I, T>> for IndexVec<I, T> {
+-    fn borrow(&self) -> &IndexSlice<I, T> {
+-        self
+-    }
+-}
+-
+-impl<I: Idx, T> BorrowMut<IndexSlice<I, T>> for IndexVec<I, T> {
+-    fn borrow_mut(&mut self) -> &mut IndexSlice<I, T> {
+-        self
+-    }
+-}
+-
+-impl<I: Idx, T> Extend<T> for IndexVec<I, T> {
+-    #[inline]
+-    // Not analysed and not callable: `layout()` calls `extend_from` (rewrites.md R8) instead.
+-    #[thrust::ignored]
+-    fn extend<J: IntoIterator<Item = T>>(&mut self, iter: J) {
+-        self.raw.extend(iter);
+-    }
+-}
+-
+-impl<I: Idx, T> FromIterator<T> for IndexVec<I, T> {
+-    #[inline]
+-    // Not analysed and not callable: its only caller, the `collect` in `univariant_biased`, is
+-    // trusted.
+-    #[thrust::ignored]
+-    fn from_iter<J>(iter: J) -> Self
+-    where
+-        J: IntoIterator<Item = T>,
+-    {
+-        IndexVec::from_raw(Vec::from_iter(iter))
+-    }
+-}
+-
+ impl<I: Idx, T> IntoIterator for IndexVec<I, T> {
+     type Item = T;
+     type IntoIter = vec::IntoIter<T>;

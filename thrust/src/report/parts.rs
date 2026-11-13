@@ -1,0 +1,317 @@
+//! The parts of a system solved on their own (`THRUST_SPLIT`) as the output names them: each
+//! by its number and the code its clauses come from, with its verdict.
+
+use std::collections::BTreeMap;
+
+use rustc_middle::ty::TyCtxt;
+use rustc_span::def_id::LocalDefId;
+use rustc_span::Span;
+
+use crate::chc;
+
+use super::constraints::Provenance;
+use super::file_name;
+
+/// A part of the system solved on its own.
+pub struct Part {
+    /// Its number among the parts, from 1.
+    pub id: usize,
+    pub clauses: usize,
+    /// The functions its clauses come from, in the order of their code.
+    pub functions: Vec<PartCode>,
+    /// See [`chc::verdict`].
+    pub verdict: &'static str,
+    /// What the solver answered when it is neither `sat` nor `unsat` (`Timeout(30s)`).
+    pub message: Option<String>,
+    /// Whether the verdict was that of an earlier run (`THRUST_CACHE_DIR`).
+    pub cached: bool,
+}
+
+/// What the solver answered for `result` when it is neither `sat` nor `unsat`.
+pub fn message(result: &Result<(), chc::CheckSatError>) -> Option<String> {
+    match result {
+        Ok(()) | Err(chc::CheckSatError::Unsat) => None,
+        Err(err) => Some(format!("{err:?}")),
+    }
+}
+
+/// The verdict of the crate from those of its parts: `unsat` if a part is, else the first that
+/// is not `sat`.
+pub fn crate_verdict(verdicts: &[&'static str]) -> &'static str {
+    if verdicts.contains(&"unsat") {
+        return "unsat";
+    }
+    verdicts
+        .iter()
+        .copied()
+        .find(|v| *v != "sat")
+        .unwrap_or("sat")
+}
+
+/// A function some clauses of a part come from, with the span of the whole function.
+pub struct PartCode {
+    pub def: LocalDefId,
+    pub r#fn: String,
+    pub span: Span,
+    /// The function's signature, where an error names it.
+    pub head: Span,
+    /// The code the part's clauses of the function were made at, from the first to the last.
+    pub clauses: Span,
+}
+
+impl Part {
+    pub fn new(tcx: TyCtxt<'_>, system: &chc::System, index: usize, part: &chc::Part) -> Self {
+        Part {
+            id: index + 1,
+            clauses: part.clauses.len(),
+            functions: code(tcx, system, &part.clauses),
+            verdict: chc::verdict(&part.result),
+            message: message(&part.result),
+            cached: part.cached,
+        }
+    }
+
+    /// `` `f` (a.rs:3-6), `g` (a.rs:9) ``, and for a function in other `parts` too the lines
+    /// of its clauses in this one, which tell its parts apart (`, made at 6-11`).
+    fn functions(&self, tcx: TyCtxt<'_>, parts: &[Part]) -> String {
+        if self.functions.is_empty() {
+            return "no function".to_owned();
+        }
+        let elsewhere = |f: &PartCode| {
+            parts
+                .iter()
+                .filter(|p| p.id != self.id)
+                .any(|p| p.functions.iter().any(|g| g.r#fn == f.r#fn))
+        };
+        let named: Vec<String> = self
+            .functions
+            .iter()
+            .map(|f| {
+                let code = lines(tcx, f.span);
+                if elsewhere(f) {
+                    let clauses = line_range(tcx, f.clauses);
+                    format!("`{}` ({code}, made at {clauses})", f.r#fn)
+                } else {
+                    format!("`{}` ({code})", f.r#fn)
+                }
+            })
+            .collect();
+        named.join(", ")
+    }
+
+    /// What the error of a part that fails says of it, among `parts`.
+    pub fn error_note(&self, tcx: TyCtxt<'_>, parts: &[Part]) -> String {
+        let clauses = match self.clauses {
+            1 => "1 clause".to_owned(),
+            n => format!("{n} clauses"),
+        };
+        format!(
+            "in part {} of {}, of {clauses} from {}",
+            self.id,
+            parts.len(),
+            self.functions(tcx, parts)
+        )
+    }
+}
+
+/// The functions the clauses `ids` come from, each with its whole span.
+pub fn code(tcx: TyCtxt<'_>, system: &chc::System, ids: &[chc::ClauseId]) -> Vec<PartCode> {
+    let mut clauses: Vec<(LocalDefId, Span)> = Vec::new();
+    for &id in ids {
+        let provenance = Provenance::of(&system.clauses[id].debug_info);
+        let (Some(def), Some(span)) = (provenance.def, provenance.span(tcx)) else {
+            continue;
+        };
+        // Joined in the program's own context, not across macro expansions.
+        let span = span.source_callsite();
+        match clauses.iter_mut().find(|(d, _)| *d == def) {
+            Some((_, all)) => *all = all.to(span),
+            None => clauses.push((def, span)),
+        }
+    }
+    let mut code: Vec<PartCode> = clauses
+        .into_iter()
+        .map(|(def, clauses)| PartCode {
+            def,
+            r#fn: tcx.def_path_str(def.to_def_id()),
+            span: tcx
+                .hir_span_with_body(tcx.local_def_id_to_hir_id(def))
+                .source_callsite(),
+            head: tcx.def_span(def.to_def_id()).source_callsite(),
+            clauses,
+        })
+        .collect();
+    code.sort_by_key(|c| c.span.lo());
+    code
+}
+
+/// `first-last` of the lines of `span`, or `line`.
+fn line_range(tcx: TyCtxt<'_>, span: Span) -> String {
+    let source_map = tcx.sess.source_map();
+    let first = source_map.lookup_char_pos(span.lo()).line;
+    let last = source_map.lookup_char_pos(span.hi()).line;
+    if last > first {
+        format!("{first}-{last}")
+    } else {
+        format!("{first}")
+    }
+}
+
+/// `file:first-last` of the lines of `span`, or `file:line`.
+fn lines(tcx: TyCtxt<'_>, span: Span) -> String {
+    let source_map = tcx.sess.source_map();
+    let first = source_map.lookup_char_pos(span.lo()).line;
+    let last = source_map.lookup_char_pos(span.hi()).line;
+    if last > first {
+        format!("{}:{first}-{last}", file_name(tcx, span))
+    } else {
+        format!("{}:{first}", file_name(tcx, span))
+    }
+}
+
+/// At most this many of the parts solved now are named.
+const SOLVED_SHOWN: usize = 5;
+
+/// What the parts of a split run are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parts {
+    /// The classes of clauses that share an unknown (`THRUST_SPLIT`).
+    Classes,
+    /// The cone of each goal (`THRUST_SPLIT_GOALS`).
+    GoalCones,
+    /// The classes, with each goal of the functions marked `#[thrust::split_goals]` solved
+    /// apart in its cone.
+    GoalsApart,
+}
+
+/// The notes after the errors of the parts: how many were solved and which of them now, and the
+/// functions of a failing part whose clauses fall into more than one part, with why.
+pub fn emit_notes(tcx: TyCtxt<'_>, parts: &[Part], kind: Parts) {
+    let cached = parts.iter().filter(|p| p.cached).count();
+    let solved: Vec<String> = parts
+        .iter()
+        .filter(|p| !p.cached)
+        .map(|p| format!("part {} from {}", p.id, p.functions(tcx, parts)))
+        .collect();
+    let mut note = match parts.len() {
+        1 if cached == 1 => "thrust: 1 part solved on its own, from an earlier run".to_owned(),
+        1 => "thrust: 1 part solved on its own".to_owned(),
+        n => format!("thrust: {n} parts solved on their own, {cached} of them from earlier runs"),
+    };
+    match kind {
+        Parts::Classes => {}
+        Parts::GoalCones => note.push_str(", one per goal with the clauses it depends on"),
+        Parts::GoalsApart => note.push_str(
+            ", each goal of a `#[thrust::split_goals]` function apart with the clauses it depends \
+             on",
+        ),
+    }
+    if !solved.is_empty() && cached > 0 {
+        let more = solved.len().saturating_sub(SOLVED_SHOWN);
+        let shown = &solved[..solved.len() - more];
+        note.push_str(&format!("; solved now: {}", shown.join("; ")));
+        if more > 0 {
+            note.push_str(&format!(" and {more} more"));
+        }
+    }
+    tcx.dcx().note(note);
+
+    // Said where it explains a failing part's error.
+    let failing: Vec<&str> = parts
+        .iter()
+        .filter(|p| p.verdict != "sat")
+        .flat_map(|p| p.functions.iter().map(|f| f.r#fn.as_str()))
+        .collect();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for f in parts.iter().flat_map(|p| &p.functions) {
+        *counts.entry(&f.r#fn).or_default() += 1;
+    }
+    let split: Vec<String> = counts
+        .into_iter()
+        .filter(|(f, n)| *n > 1 && failing.contains(f))
+        .map(|(f, n)| format!("`{f}` in {n}"))
+        .collect();
+    if split.is_empty() {
+        return;
+    }
+    if kind == Parts::GoalCones {
+        tcx.dcx().note(format!(
+            "thrust: a function can be in several parts: {}. Each goal is a part with every clause \
+             deriving an unknown it depends on, so goals that depend on one unknown share its \
+             clauses",
+            split.join(", ")
+        ));
+        return;
+    }
+    let apart = match kind {
+        Parts::GoalsApart => {
+            "; a goal solved apart is a part with every clause deriving an unknown it depends on, \
+             which other parts can share"
+        }
+        _ => "",
+    };
+    tcx.dcx().note(format!(
+        "thrust: a function can be in several parts: {}. Its clauses fall apart where they share \
+         no unknown, as on the two sides of a written annotation (a contract, an `invariant!`, a \
+         refined type), and a clause with no unknown is a part of its own{apart}",
+        split.join(", ")
+    ));
+}
+
+/// Why `asked_by` (`THRUST_SPLIT_GOALS`, or the attributes that set goals apart) does not split
+/// `system` into the cones of its goals, at the clause that is no definite Horn clause when it
+/// is one.
+pub fn emit_not_horn_note(
+    tcx: TyCtxt<'_>,
+    system: &chc::System,
+    why: chc::NotHorn,
+    asked_by: &str,
+) {
+    let instead = "the parts are the classes of clauses that share an unknown instead";
+    let clause = match why {
+        chc::NotHorn::InLaw => {
+            tcx.dcx().note(format!(
+                "thrust: {asked_by}: an unknown is applied in a law, directly or through \
+                 a predicate's definition, or raw SMT-LIB text names a definition that applies \
+                 one; {instead}"
+            ));
+            return;
+        }
+        chc::NotHorn::RecursiveDefinition => {
+            tcx.dcx().note(format!(
+                "thrust: {asked_by}: a predicate's definition that applies an unknown \
+                 applies itself; {instead}"
+            ));
+            return;
+        }
+        chc::NotHorn::Derived => {
+            tcx.dcx().note(format!(
+                "thrust: {asked_by}: a derived predicate is an unknown; {instead}"
+            ));
+            return;
+        }
+        chc::NotHorn::Clause(id) => id,
+    };
+    let message = format!(
+        "thrust: {asked_by}: a constraint, with the predicates it applies read as \
+         their definitions, has a disjunction of unknowns in head positions, or one under an \
+         existential quantifier there; {instead}"
+    );
+    let provenance = Provenance::of(&system.clauses[clause].debug_info);
+    match provenance.span(tcx) {
+        Some(span) => tcx.dcx().span_note(span, message),
+        None => tcx.dcx().note(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crate_verdict;
+
+    #[test]
+    fn a_refuted_part_refutes_the_crate_before_a_timeout() {
+        assert_eq!(crate_verdict(&["sat", "timeout", "unsat"]), "unsat");
+        assert_eq!(crate_verdict(&["sat", "timeout", "sat"]), "timeout");
+        assert_eq!(crate_verdict(&["sat", "sat"]), "sat");
+    }
+}

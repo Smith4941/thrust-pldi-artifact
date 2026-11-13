@@ -1,0 +1,767 @@
+//! A context for formatting a CHC system into SMT-LIB2.
+//!
+//! This module provides [`FormatContext`], which is responsible for translating parts of [`chc::System`]
+//! into a representation that is compatible with SMT solvers. It handles tasks like
+//! monomorphization of polymorphic datatypes and applying solver-specific workarounds.
+//! The [`super::smtlib2`] module uses this context to perform the final rendering to the SMT-LIB2 format.
+
+use std::collections::{BTreeSet, HashMap};
+
+use num_bigint::BigInt;
+use rustc_index::IndexVec;
+
+use crate::chc::{self, hoice::HoiceDatatypeRenamer};
+
+/// What a symbol the query declares for a datatype stands for, to read the solver's answers.
+#[derive(Debug, Clone)]
+pub enum DeclaredSymbol {
+    /// A datatype's name: the sort it is.
+    Sort(chc::Sort),
+    /// A constructor of an enum's datatype, of the sort it is in.
+    Ctor(chc::DatatypeSort, chc::DatatypeSymbol),
+    /// A selector of a constructor of an enum's datatype.
+    Selector(Box<chc::Selector>),
+    /// The constructor of a `Box`, a `Mut` or a tuple.
+    BoxCtor,
+    MutCtor,
+    TupleCtor,
+    /// The current value of a `Box` or a `Mut`, the final value of a `Mut`, the `i`-th component
+    /// of a tuple.
+    Current,
+    Final,
+    Field(usize),
+}
+
+/// A context for formatting a CHC system.
+///
+/// This subsumes a representational difference between [`chc::System`] and resulting SMT-LIB2.
+/// - Gives a naming convention of symbols to represent built-in datatypes of [`chc::System`] in SMT-LIB2,
+/// - Gives a stringified representation of [`chc::Sort`]s,
+/// - Monomorphizes polymorphic datatypes of [`chc::System`] to be compatible with several CHC solvers,
+/// - Renames datatypes to be compatible with Hoice (see [`HoiceDatatypeRenamer`]),
+/// - Carries what the configured solver reads (see [`chc::Capabilities`]),
+/// - etc.
+#[derive(Debug, Clone)]
+pub struct FormatContext {
+    renamer: HoiceDatatypeRenamer,
+    capabilities: chc::Capabilities,
+    datatypes: Vec<chc::Datatype>,
+    /// The sort each datatype declared for a `Box`, a `Mut` or a tuple sort stands for.
+    builtin_sorts: HashMap<chc::DatatypeSymbol, chc::Sort>,
+    /// Sizes of the consecutive groups in `datatypes`; see [`group_by_dependency`].
+    datatype_group_sizes: Vec<usize>,
+}
+
+// FIXME: this is obviously ineffective and should be replaced
+fn term_sorts(
+    var_sorts: &IndexVec<chc::TermVarIdx, chc::Sort>,
+    t: &chc::Term,
+    sorts: &mut BTreeSet<chc::Sort>,
+) {
+    sorts.insert(t.sort(|v| var_sorts[*v].clone()));
+    match t {
+        chc::Term::Null => {}
+        chc::Term::ForallDefault(_) => {}
+        chc::Term::Var(_) => {}
+        chc::Term::Bool(_) => {}
+        chc::Term::Int(_) => {}
+        chc::Term::String(_) => {}
+        chc::Term::Box(t) => term_sorts(var_sorts, t, sorts),
+        chc::Term::Mut(t1, t2) => {
+            term_sorts(var_sorts, t1, sorts);
+            term_sorts(var_sorts, t2, sorts);
+        }
+        chc::Term::BoxCurrent(t) => term_sorts(var_sorts, t, sorts),
+        chc::Term::MutCurrent(t) => term_sorts(var_sorts, t, sorts),
+        chc::Term::MutFinal(t) => term_sorts(var_sorts, t, sorts),
+        chc::Term::App(_fun, args) => {
+            for arg in args {
+                term_sorts(var_sorts, arg, sorts);
+            }
+        }
+        // The writer synthesises `default_for(elem)` for an empty array at print time, so the
+        // sorts that term mentions have to be declared even though no clause spells it out.
+        chc::Term::ArrayEmpty(_, elem) => {
+            term_sorts(var_sorts, &chc::Term::default_for(elem), sorts)
+        }
+        chc::Term::SeqEmpty(_) => {}
+        chc::Term::Tuple(ts) => {
+            for t in ts {
+                term_sorts(var_sorts, t, sorts);
+            }
+        }
+        chc::Term::TupleProj(t, _) => term_sorts(var_sorts, t, sorts),
+        chc::Term::DatatypeCtor(_, _, args) => {
+            for arg in args {
+                term_sorts(var_sorts, arg, sorts);
+            }
+        }
+        chc::Term::UserDefinedFn(_, _, args) | chc::Term::ForallFn(_, args) => {
+            for arg in args {
+                term_sorts(var_sorts, arg, sorts);
+            }
+        }
+        chc::Term::DatatypeDiscr(_, t)
+        | chc::Term::DatatypeSelector(.., t)
+        | chc::Term::IntToBitVec { term: t, .. } => term_sorts(var_sorts, t, sorts),
+        chc::Term::UserQuantifiedVar(_, _) => {}
+        chc::Term::ArrayLambda(_, s, t) => {
+            sorts.insert(s.clone());
+            term_sorts(var_sorts, t, sorts);
+        }
+    }
+}
+
+fn atom_sorts(
+    var_sorts: &IndexVec<chc::TermVarIdx, chc::Sort>,
+    a: &chc::Atom,
+    sorts: &mut BTreeSet<chc::Sort>,
+) {
+    if let Some(guard) = &a.guard {
+        formula_sorts(var_sorts, guard, sorts);
+    }
+    for a in &a.args {
+        term_sorts(var_sorts, a, sorts);
+    }
+}
+
+fn formula_sorts(
+    var_sorts: &IndexVec<chc::TermVarIdx, chc::Sort>,
+    formula: &chc::Formula,
+    sorts: &mut BTreeSet<chc::Sort>,
+) {
+    match formula {
+        chc::Formula::Atom(atom) => atom_sorts(var_sorts, atom, sorts),
+        chc::Formula::Not(formula) => formula_sorts(var_sorts, formula, sorts),
+        chc::Formula::And(formulas) | chc::Formula::Or(formulas) => {
+            for formula in formulas {
+                formula_sorts(var_sorts, formula, sorts);
+            }
+        }
+        chc::Formula::Implies(lhs, rhs) => {
+            formula_sorts(var_sorts, lhs, sorts);
+            formula_sorts(var_sorts, rhs, sorts);
+        }
+        chc::Formula::Exists(vars, formula) | chc::Formula::Forall(vars, formula) => {
+            sorts.extend(vars.iter().map(|(_, sort)| sort.clone()));
+            formula_sorts(var_sorts, formula, sorts);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SortSymbol<'a> {
+    inner: &'a chc::Sort,
+}
+
+impl<'a> std::fmt::Display for SortSymbol<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner {
+            chc::Sort::Null => write!(f, "Null"),
+            chc::Sort::Int => write!(f, "Int"),
+            chc::Sort::BitVec { width } => write!(f, "BitVec{}", width),
+            chc::Sort::Bool => write!(f, "Bool"),
+            chc::Sort::String => write!(f, "String"),
+            chc::Sort::Param(i) => write!(f, "T{}", i),
+            chc::Sort::Box(s) => write!(f, "Box{}", SortSymbol::new(s).sorts()),
+            chc::Sort::Mut(s) => write!(f, "Mut{}", SortSymbol::new(s).sorts()),
+            chc::Sort::Seq(elem) => write!(f, "Seq{}", SortSymbol::new(elem).sorts()),
+            chc::Sort::Tuple(ss) => write!(f, "Tuple{}", SortSymbols::new(ss)),
+            chc::Sort::Array(s1, s2) => {
+                write!(f, "Array{}", SortSymbols::new(&[*s1.clone(), *s2.clone()]))
+            }
+            chc::Sort::Datatype(s) => write!(f, "{}{}", s.symbol, SortSymbols::new(&s.args)),
+            chc::Sort::Forall(i) => write!(f, "{}", i),
+        }
+    }
+}
+
+impl<'a> SortSymbol<'a> {
+    pub fn new(inner: &'a chc::Sort) -> Self {
+        Self { inner }
+    }
+
+    pub fn sorts(self) -> impl std::fmt::Display {
+        format!("<{}>", self)
+    }
+
+    pub fn to_symbol(&self) -> chc::DatatypeSymbol {
+        chc::DatatypeSymbol::new(self.to_string())
+    }
+}
+
+/// `<S1-S2-...>`. `standalone.rs` reads each piece between `<`, `-` and `>` of a symbol as a name
+/// the symbol uses.
+#[derive(Debug, Clone)]
+struct SortSymbols<'a> {
+    inner: &'a [chc::Sort],
+}
+
+impl<'a> std::fmt::Display for SortSymbols<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.inner.is_empty() {
+            return Ok(());
+        }
+        write!(f, "<")?;
+        for (i, s) in self.inner.iter().enumerate() {
+            if i != 0 {
+                write!(f, "-")?;
+            }
+            write!(f, "{}", SortSymbol::new(s))?;
+        }
+        write!(f, ">")?;
+        Ok(())
+    }
+}
+
+impl<'a> SortSymbols<'a> {
+    pub fn new(inner: &'a [chc::Sort]) -> Self {
+        Self { inner }
+    }
+}
+
+/// The `<S1-S2-...>` suffix that decorates a symbol standing for one
+/// instantiation of a generic item. Empty for an empty list.
+pub fn format_sort_symbols(sorts: &[chc::Sort]) -> String {
+    SortSymbols::new(sorts).to_string()
+}
+
+/// A sort as it is spelled inside a decorated symbol name, without the
+/// surrounding angle brackets.
+pub fn format_sort_symbol(sort: &chc::Sort) -> String {
+    SortSymbol::new(sort).to_string()
+}
+
+/// SMT-LIB2 representation of a [`chc::ForallPred`]'s identifier as it appears
+/// in atoms (e.g. `q_completed_8cab…<a0>`). Used by the SMT emitter and by
+/// [`chc::System::populate_user_defined_pred_dependencies`] to substring-match
+/// `ForallPred` references inside user-defined predicate bodies.
+pub fn format_forall_pred_name(p: &chc::ForallPred) -> String {
+    format!("{}{}", p.inner(), p.type_arguments())
+}
+
+fn builtin_sort_datatype(s: chc::Sort) -> Option<chc::Datatype> {
+    let symbol = SortSymbol::new(&s).to_symbol();
+    let d = match s {
+        chc::Sort::Null => chc::Datatype {
+            symbol,
+            params: 0,
+            ctors: vec![chc::DatatypeCtor {
+                symbol: chc::DatatypeSymbol::new("null".to_string()),
+                selectors: vec![],
+                discriminant: BigInt::ZERO,
+            }],
+        },
+        chc::Sort::Box(inner) => {
+            let ss = SortSymbol::new(&inner).sorts();
+            chc::Datatype {
+                symbol,
+                params: 0,
+                ctors: vec![chc::DatatypeCtor {
+                    symbol: chc::DatatypeSymbol::new(format!("box{ss}")),
+                    selectors: vec![chc::DatatypeSelector {
+                        symbol: chc::DatatypeSymbol::new(format!("box_current{ss}")),
+                        sort: *inner,
+                    }],
+                    discriminant: BigInt::ZERO,
+                }],
+            }
+        }
+        chc::Sort::Mut(inner) => {
+            let ss = SortSymbol::new(&inner).sorts();
+            chc::Datatype {
+                symbol,
+                params: 0,
+                ctors: vec![chc::DatatypeCtor {
+                    symbol: chc::DatatypeSymbol::new(format!("mut{ss}")),
+                    selectors: vec![
+                        chc::DatatypeSelector {
+                            symbol: chc::DatatypeSymbol::new(format!("mut_current{ss}")),
+                            sort: *inner.clone(),
+                        },
+                        chc::DatatypeSelector {
+                            symbol: chc::DatatypeSymbol::new(format!("mut_final{ss}")),
+                            sort: *inner,
+                        },
+                    ],
+                    discriminant: BigInt::ZERO,
+                }],
+            }
+        }
+        chc::Sort::Tuple(elems) => {
+            let ss = SortSymbols::new(&elems);
+            let selectors = elems
+                .iter()
+                .enumerate()
+                .map(|(i, sort)| chc::DatatypeSelector {
+                    symbol: chc::DatatypeSymbol::new(format!("tuple_proj{ss}.{i}")),
+                    sort: sort.clone(),
+                })
+                .collect();
+            chc::Datatype {
+                symbol,
+                params: 0,
+                ctors: vec![chc::DatatypeCtor {
+                    symbol: chc::DatatypeSymbol::new(format!("tuple{ss}")),
+                    selectors,
+                    discriminant: BigInt::ZERO,
+                }],
+            }
+        }
+        _ => return None,
+    };
+    Some(d)
+}
+
+pub(super) fn collect_sorts(system: &chc::System) -> BTreeSet<chc::Sort> {
+    let mut sorts = BTreeSet::new();
+
+    for def in &system.pred_vars {
+        sorts.extend(def.sig.clone());
+    }
+
+    // Forall predicates and user-defined predicates are emitted with their signatures
+    // (`declare-forall-fun` / `define-fun`), so the sorts appearing there need declaring
+    // even when no clause mentions them
+    for pred in &system.forall_pred_vars {
+        sorts.extend(pred.type_parameters.clone());
+        sorts.extend(pred.params.clone());
+    }
+
+    for def in &system.user_defined_pred_defs {
+        sorts.extend(def.sig.iter().map(|(_, sort)| sort.clone()));
+        // A body binder can name a sort the signature never mentions, and after
+        // substitution that sort has to be declared like any other.
+        sorts.extend(def.sort_subst.iter().map(|(_, sort)| sort.clone()));
+        if let chc::UserDefinedPredBody::Formula(formula) = &def.body {
+            let var_sorts = def.sig.iter().map(|(_, sort)| sort.clone()).collect();
+            formula_sorts(&var_sorts, formula, &mut sorts);
+        }
+        if let chc::UserDefinedPredBody::Term(sort, term) = &def.body {
+            let var_sorts = def.sig.iter().map(|(_, sort)| sort.clone()).collect();
+            sorts.insert(sort.clone());
+            term_sorts(&var_sorts, term, &mut sorts);
+            if let Some(decreases) = &def.decreases {
+                term_sorts(&var_sorts, decreases, &mut sorts);
+            }
+        }
+    }
+
+    for law in system.laws.values().flatten() {
+        formula_sorts(&IndexVec::new(), law, &mut sorts);
+    }
+
+    for candidates in &system.candidate_atoms {
+        let var_sorts = system.pred_vars[candidates.pred]
+            .sig
+            .iter()
+            .cloned()
+            .collect();
+        for atom in &candidates.atoms {
+            formula_sorts(&var_sorts, atom, &mut sorts);
+        }
+    }
+
+    for clause in &system.clauses {
+        sorts.extend(clause.vars.clone());
+        atom_sorts(&clause.vars, &clause.head, &mut sorts);
+        for a in clause.body.iter_atoms() {
+            atom_sorts(&clause.vars, a, &mut sorts);
+        }
+    }
+
+    for sort in sorts.clone() {
+        sort.walk(|inner_sort| {
+            sorts.insert(inner_sort.clone());
+        });
+    }
+
+    sorts
+}
+
+fn monomorphize_datatype(
+    sort: &chc::DatatypeSort,
+    datatypes: &[chc::Datatype],
+    forall_sort_resolver: &impl Fn(chc::ForallSortIdx) -> Option<usize>,
+) -> Option<chc::Datatype> {
+    let datatype = datatypes.iter().find(|d| d.symbol == sort.symbol).unwrap();
+    if datatype.params == 0 {
+        return None;
+    }
+    let ss = SortSymbols::new(&sort.args);
+    let mono_datatype = chc::Datatype {
+        symbol: datatype.symbol.suffixed(&ss),
+        params: 0,
+        ctors: datatype
+            .ctors
+            .iter()
+            .map(|c| chc::DatatypeCtor {
+                symbol: c.symbol.suffixed(&ss),
+                selectors: c
+                    .selectors
+                    .iter()
+                    .map(|s| {
+                        let mut sel_sort = s.sort.clone();
+                        sel_sort.instantiate_params(&sort.args, forall_sort_resolver);
+                        chc::DatatypeSelector {
+                            symbol: s.symbol.suffixed(&ss),
+                            sort: sel_sort,
+                        }
+                    })
+                    .collect(),
+                discriminant: c.discriminant.clone(),
+            })
+            .collect(),
+    };
+    Some(mono_datatype)
+}
+
+/// Groups the datatypes into strongly connected components of their
+/// selector-sort dependency graph, dependencies first. Each group becomes one
+/// `declare-datatypes`: SMT-LIB2 permits any order inside a group, but pcsat
+/// resolves a datatype mentioned inside an array sort only against groups
+/// declared earlier. Datatypes in one group keep their relative order.
+fn group_by_dependency(datatypes: Vec<chc::Datatype>) -> Vec<Vec<chc::Datatype>> {
+    let index: HashMap<_, usize> = datatypes
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.symbol.clone(), i))
+        .collect();
+    let deps: Vec<Vec<usize>> = datatypes
+        .iter()
+        .map(|d| {
+            let mut deps = Vec::new();
+            for selector in d.selectors() {
+                selector.sort.walk(|sort| {
+                    // Builtin sorts (tuples, Mut, Box) and monomorphized datatypes are
+                    // declared under the symbol SortSymbol prints for them.
+                    let symbol = SortSymbol::new(sort).to_symbol();
+                    if let Some(j) = index.get(&symbol) {
+                        if !deps.contains(j) {
+                            deps.push(*j);
+                        }
+                    }
+                });
+            }
+            deps
+        })
+        .collect();
+
+    // Tarjan's algorithm emits every component after the components it depends on.
+    struct Tarjan<'a> {
+        deps: &'a [Vec<usize>],
+        index: Vec<Option<usize>>,
+        lowlink: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        next_index: usize,
+        components: Vec<Vec<usize>>,
+    }
+    impl Tarjan<'_> {
+        fn connect(&mut self, v: usize) {
+            self.index[v] = Some(self.next_index);
+            self.lowlink[v] = self.next_index;
+            self.next_index += 1;
+            self.stack.push(v);
+            self.on_stack[v] = true;
+            for &w in &self.deps[v] {
+                match self.index[w] {
+                    None => {
+                        self.connect(w);
+                        self.lowlink[v] = self.lowlink[v].min(self.lowlink[w]);
+                    }
+                    Some(w_index) if self.on_stack[w] => {
+                        self.lowlink[v] = self.lowlink[v].min(w_index);
+                    }
+                    Some(_) => {}
+                }
+            }
+            if self.lowlink[v] == self.index[v].unwrap() {
+                let mut component = Vec::new();
+                loop {
+                    let w = self.stack.pop().unwrap();
+                    self.on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                self.components.push(component);
+            }
+        }
+    }
+    let n = datatypes.len();
+    let mut tarjan = Tarjan {
+        deps: &deps,
+        index: vec![None; n],
+        lowlink: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        next_index: 0,
+        components: Vec::new(),
+    };
+    for v in 0..n {
+        if tarjan.index[v].is_none() {
+            tarjan.connect(v);
+        }
+    }
+    let mut slots: Vec<Option<chc::Datatype>> = datatypes.into_iter().map(Some).collect();
+    tarjan
+        .components
+        .into_iter()
+        .map(|component| {
+            component
+                .into_iter()
+                .map(|i| slots[i].take().unwrap())
+                .collect()
+        })
+        .collect()
+}
+
+impl FormatContext {
+    pub fn from_system(system: &chc::System, capabilities: chc::Capabilities) -> Self {
+        let type_params_reverse = system.type_params_reverse.clone();
+        let resolver = |idx: chc::ForallSortIdx| type_params_reverse.get(&idx).map(|&i| i as usize);
+        // let mut sorts = collect_sorts(system);
+        // let mut datatypes = system.datatypes.clone();
+        // for sort in sorts.iter().flat_map(|s| s.as_datatype()) {
+        //     if let Some(mono_datatype) = monomorphize_datatype(sort, &datatypes, &resolver) {
+        //         datatypes.push(mono_datatype);
+        let mut datatypes = system.datatypes.clone();
+        let mut sorts = collect_sorts(system);
+        // A datatype without parameters is declared whether or not a clause applies it, so the
+        // sorts of its selectors are declared too.
+        for datatype in system.datatypes.iter().filter(|d| d.params == 0) {
+            for selector in datatype.selectors() {
+                selector.sort.walk(|sort| {
+                    sorts.insert(sort.clone());
+                });
+            }
+        }
+
+        let mut pending: Vec<_> = sorts.clone().into_iter().collect();
+        while let Some(sort) = pending.pop() {
+            if let Some(datatype_sort) = sort.as_datatype() {
+                let datatype = match monomorphize_datatype(datatype_sort, &datatypes, &resolver) {
+                    Some(mono_datatype) => {
+                        datatypes.push(mono_datatype.clone());
+                        mono_datatype
+                    }
+                    None => datatypes
+                        .iter()
+                        .find(|d| d.symbol == datatype_sort.symbol)
+                        .unwrap()
+                        .clone(),
+                };
+                for selector in datatype.selectors() {
+                    selector.sort.walk(|sort| {
+                        if sorts.insert(sort.clone()) {
+                            pending.push(sort.clone());
+                        }
+                    });
+                }
+            }
+        }
+
+        let builtins: Vec<(chc::Sort, chc::Datatype)> = sorts
+            .into_iter()
+            .filter_map(|s| Some((s.clone(), builtin_sort_datatype(s)?)))
+            .collect();
+        let builtin_sorts = builtins
+            .iter()
+            .map(|(s, d)| (d.symbol.clone(), s.clone()))
+            .collect();
+        let datatypes: Vec<_> = builtins
+            .into_iter()
+            .map(|(_, d)| d)
+            .chain(datatypes)
+            .filter(|d| d.params == 0)
+            .collect();
+        let groups = group_by_dependency(datatypes);
+        let datatype_group_sizes = groups.iter().map(Vec::len).collect();
+        let datatypes: Vec<_> = groups.into_iter().flatten().collect();
+        let renamer = HoiceDatatypeRenamer::new(&datatypes);
+        FormatContext {
+            renamer,
+            capabilities,
+            datatypes,
+            builtin_sorts,
+            datatype_group_sizes,
+        }
+    }
+
+    /// Each symbol the query declares for a datatype, as the query writes it, with what it stands
+    /// for: every datatype's name, the constructors of an enum's, and the constructor and
+    /// selectors of a `Box`, a `Mut` or a tuple.
+    pub fn declared_symbols(&self) -> Vec<(String, DeclaredSymbol)> {
+        let mut symbols = Vec::new();
+        for d in &self.datatypes {
+            let sort = self.builtin_sorts.get(&d.symbol).cloned();
+            let named = sort.clone().unwrap_or_else(|| {
+                chc::Sort::Datatype(chc::DatatypeSort::new(d.symbol.clone(), Vec::new()))
+            });
+            symbols.push((
+                self.fmt_datatype_symbol(&d.symbol).to_string(),
+                DeclaredSymbol::Sort(named),
+            ));
+            let Some(sort) = sort else {
+                let sort = chc::DatatypeSort::new(d.symbol.clone(), Vec::new());
+                for c in &d.ctors {
+                    let meaning = DeclaredSymbol::Ctor(sort.clone(), c.symbol.clone());
+                    symbols.push((c.symbol.to_string(), meaning));
+                    for (index, selector) in c.selectors.iter().enumerate() {
+                        let sel = chc::Selector {
+                            sort: sort.clone(),
+                            ctor: c.symbol.clone(),
+                            index,
+                            field: selector.sort.clone(),
+                        };
+                        let meaning = DeclaredSymbol::Selector(Box::new(sel));
+                        symbols.push((selector.symbol.to_string(), meaning));
+                    }
+                }
+                continue;
+            };
+            let Some(ctor) = d.ctors.first() else {
+                continue;
+            };
+            let (ctor_meaning, selector_meaning): (_, fn(usize) -> DeclaredSymbol) = match sort {
+                chc::Sort::Box(_) => (DeclaredSymbol::BoxCtor, |_| DeclaredSymbol::Current),
+                chc::Sort::Mut(_) => (DeclaredSymbol::MutCtor, |i| match i {
+                    0 => DeclaredSymbol::Current,
+                    _ => DeclaredSymbol::Final,
+                }),
+                chc::Sort::Tuple(_) => (DeclaredSymbol::TupleCtor, DeclaredSymbol::Field),
+                _ => continue,
+            };
+            symbols.push((ctor.symbol.to_string(), ctor_meaning));
+            for (i, selector) in ctor.selectors.iter().enumerate() {
+                symbols.push((selector.symbol.to_string(), selector_meaning(i)));
+            }
+        }
+        symbols
+    }
+
+    pub fn capabilities(&self) -> chc::Capabilities {
+        self.capabilities
+    }
+
+    pub fn datatypes(&self) -> &[chc::Datatype] {
+        &self.datatypes
+    }
+
+    /// The datatypes split into the groups to declare, dependencies first.
+    pub fn datatype_groups(&self) -> impl Iterator<Item = &[chc::Datatype]> {
+        let mut rest = &self.datatypes[..];
+        self.datatype_group_sizes.iter().map(move |&size| {
+            let (group, tail) = rest.split_at(size);
+            rest = tail;
+            group
+        })
+    }
+
+    pub fn box_ctor(&self, sort: &chc::Sort) -> impl std::fmt::Display {
+        let ss = SortSymbol::new(sort).sorts();
+        format!("box{ss}")
+    }
+
+    pub fn box_current(&self, sort: &chc::Sort) -> impl std::fmt::Display {
+        let ss = SortSymbol::new(sort).sorts();
+        format!("box_current{ss}")
+    }
+
+    pub fn mut_ctor(&self, sort: &chc::Sort) -> impl std::fmt::Display {
+        let ss = SortSymbol::new(sort).sorts();
+        format!("mut{ss}")
+    }
+
+    pub fn mut_current(&self, sort: &chc::Sort) -> impl std::fmt::Display {
+        let ss = SortSymbol::new(sort).sorts();
+        format!("mut_current{ss}")
+    }
+
+    pub fn mut_final(&self, sort: &chc::Sort) -> impl std::fmt::Display {
+        let ss = SortSymbol::new(sort).sorts();
+        format!("mut_final{ss}")
+    }
+
+    pub fn tuple_ctor(&self, sorts: &[chc::Sort]) -> impl std::fmt::Display {
+        let ss = SortSymbols::new(sorts);
+        format!("tuple{ss}")
+    }
+
+    pub fn tuple_proj(&self, sorts: &[chc::Sort], idx: usize) -> impl std::fmt::Display {
+        let ss = SortSymbols::new(sorts);
+        format!("tuple_proj{ss}.{idx}")
+    }
+
+    pub fn datatype_ctor(
+        &self,
+        sort: &chc::DatatypeSort,
+        ctor_sym: &chc::DatatypeSymbol,
+    ) -> impl std::fmt::Display {
+        let ss = SortSymbols::new(&sort.args);
+        format!("{}{}", ctor_sym, ss)
+    }
+
+    /// The selector of the `index`-th field of the constructor `ctor_sym`, as the datatype's
+    /// declaration names it.
+    pub fn datatype_selector(
+        &self,
+        sort: &chc::DatatypeSort,
+        ctor_sym: &chc::DatatypeSymbol,
+        index: usize,
+    ) -> impl std::fmt::Display {
+        let ss = SortSymbols::new(&sort.args);
+        format!("_get{}.{}{}", ctor_sym, index, ss)
+    }
+
+    pub fn datatype_discr(&self, sort: &chc::DatatypeSort) -> impl std::fmt::Display {
+        let ss = SortSymbols::new(&sort.args);
+        let sym = chc::DatatypeSymbol::new(format!("{}{}", sort.symbol, ss));
+        self.datatype_discr_def(&sym)
+    }
+
+    pub fn datatype_discr_def(&self, sym: &chc::DatatypeSymbol) -> impl std::fmt::Display {
+        format!("datatype_discr<{}>", self.fmt_datatype_symbol(sym))
+    }
+
+    pub fn matcher_pred(&self, p: &chc::MatcherPred) -> impl std::fmt::Display {
+        let ss = SortSymbols::new(&p.datatype_args);
+        let sym = chc::DatatypeSymbol::new(format!("{}{}", p.datatype_symbol, ss));
+        self.matcher_pred_def(&sym)
+    }
+
+    pub fn matcher_pred_def(&self, sym: &chc::DatatypeSymbol) -> impl std::fmt::Display {
+        format!("matcher_pred<{}>", self.fmt_datatype_symbol(sym))
+    }
+
+    pub fn forall_pred(&self, p: &chc::ForallPred) -> impl std::fmt::Display {
+        format_forall_pred_name(p)
+    }
+
+    fn fmt_sort_impl(&self, sort: &chc::Sort) -> Box<dyn std::fmt::Display> {
+        match sort {
+            chc::Sort::BitVec { width } => Box::new(format!("(_ BitVec {})", width)),
+            chc::Sort::Seq(elem) => Box::new(format!("(Seq {})", self.fmt_sort(elem))),
+            chc::Sort::Array(s1, s2) => {
+                let s1 = self.fmt_sort(s1);
+                let s2 = self.fmt_sort(s2);
+                Box::new(format!("(Array {} {})", s1, s2))
+            }
+            _ => {
+                let sym = SortSymbol::new(sort).to_symbol();
+                Box::new(self.fmt_datatype_symbol(&sym))
+            }
+        }
+    }
+
+    pub fn fmt_sort(&self, sort: &chc::Sort) -> impl std::fmt::Display {
+        self.fmt_sort_impl(sort)
+    }
+
+    pub fn fmt_datatype_symbol(&self, sym: &chc::DatatypeSymbol) -> impl std::fmt::Display {
+        self.renamer.rename(sym)
+    }
+}

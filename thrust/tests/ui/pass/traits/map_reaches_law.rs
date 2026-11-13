@@ -1,0 +1,110 @@
+//@check-pass
+//@compile-flags: -C debug-assertions=off -A unused-variables
+//@rustc-env: THRUST_SOLVER=tests/thrust-pcsat-wrapper THRUST_SOLVER_TIMEOUT_SECS=60
+use thrust_models::model::{Closure, Int, Mut};
+use thrust_models::{exists, forall};
+
+#[thrust_macros::context]
+trait Iterator {
+    type Item;
+
+    #[thrust_macros::requires(Self::invariant(*self))]
+    #[thrust_macros::ensures(Self::invariant(!self))]
+    #[thrust_macros::ensures(result == None ==> Self::completed(self))]
+    #[thrust_macros::ensures(forall(|i| result == Some(i) ==> Self::step(*self, i, !self)))]
+    #[thrust_macros::ensures(Self::reaches(*self, !self))]
+    #[thrust_macros::ensures(forall(|m| Self::reaches(!self, m) ==> Self::reaches(*self, m)))]
+    fn next(&mut self) -> Option<Self::Item>;
+
+    #[thrust_macros::predicate]
+    fn invariant(self) -> bool;
+    #[thrust_macros::predicate]
+    fn completed(&mut self) -> bool;
+    #[thrust_macros::predicate]
+    fn step(self, item: Self::Item, dist: Self) -> bool;
+    /// Reflexive-transitive closure of `step`, with the produced items forgotten.
+    #[thrust_macros::predicate]
+    fn reaches(self, dist: Self) -> bool;
+}
+
+// Creusot states `produces_refl` / `produces_trans` as `#[law]`s on the trait. Thrust has
+// no `#[law]`, so the nearest thing is a `#[thrust::trusted]` function whose body is never
+// analysed. A bare transitivity law would not reach: a trusted function's `ensures` is
+// injected only at the concrete arguments of the call, while invariant preservation needs
+// the fact underneath the invariant's own quantifier. Putting the quantifier INSIDE the
+// law's `ensures` is what makes it reach.
+#[thrust::trusted]
+#[thrust_macros::context]
+#[thrust_macros::ensures(I::reaches(*x, *x))]
+fn reaches_refl<I: Iterator + thrust_models::Model>(x: &I)
+where
+    <I as Iterator>::Item: thrust_models::Model,
+{
+}
+
+struct Map<I, F> {
+    iter: I,
+    func: F,
+}
+
+impl<I: thrust_models::Model, F> thrust_models::Model for Map<I, F> {
+    type Ty = Map<<I as thrust_models::Model>::Ty, Closure<F>>;
+}
+
+#[thrust_macros::context]
+impl<I: Iterator<Item = i64> + thrust_models::Model, F: Fn(i64) -> i64> Iterator for Map<I, F>
+{
+    type Item = i64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        reaches_refl(&self.iter);
+        match self.iter.next() {
+            Some(v) => Some((self.func)(v)),
+            None => None,
+        }
+    }
+
+    #[thrust_macros::predicate]
+    fn invariant(self) -> bool {
+        // self.iter.invariant() &&
+        // forall(|m: I, e: i64, n: I|
+        //     self.iter.reaches(m) && m.step(e, n) ==> pre!(self.func(e)))
+        //
+        // The inner iterator is a type parameter here, so `reaches` and `step` are
+        // `declare-forall-fun`s over the bare abstract sort `a0` rather than the
+        // `define-fun`s the monomorphised version got, and the intermediate states
+        // are bound at `a0` instead of field by field at `Int`.
+        I::invariant(self.iter)
+            && forall(|zm: <I as thrust_models::Model>::Ty|
+                forall(|ze: Int|
+                    forall(|zn: <I as thrust_models::Model>::Ty|
+                        !(I::reaches(self.iter, zm) && I::step(zm, ze, zn))
+                            || thrust_macros::pre!((self.func)(ze)))))
+    }
+
+    #[thrust_macros::predicate]
+    fn completed(&mut self) -> bool {
+        // self.iter.completed() && *self.func == !self.func
+        I::completed(Mut::new((*self).iter, (!self).iter)) && (*self).func == (!self).func
+    }
+
+    #[thrust_macros::predicate]
+    fn step(self, item: Self::Item, dist: Self) -> bool {
+        // exists(|i: i64| self.iter.step(i, dist.iter)
+        //     && pre!(self.func(i)) && post!(self.func(i), item))
+        // && self.func == dist.func
+        exists(|zi: Int|
+            I::step(self.iter, zi, dist.iter)
+                && thrust_macros::pre!((self.func)(zi))
+                && thrust_macros::post!((self.func)(zi), item)
+                && self.func == dist.func)
+    }
+
+    #[thrust_macros::predicate]
+    fn reaches(self, dist: Self) -> bool {
+        // self.iter.reaches(dist.iter) && self.func == dist.func
+        I::reaches(self.iter, dist.iter) && self.func == dist.func
+    }
+}
+
+fn main() {}

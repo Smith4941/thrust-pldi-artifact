@@ -1,0 +1,111 @@
+From d5e8770554ed9e15fe5af3924070c52705878368 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] Replace slice::Iter and enumerate().map(I::new) on IndexSlice
+ with own iterators
+
+slice::Iter carries raw pointers that Thrust cannot model. SliceIter walks
+the slice by position and yields the same references in the same order;
+IterEnumerated yields (I::new(n), &raw[n]) for n in 0..len, the sequence
+iter_enumerated's std adapter chain produced. Both are to be swapped for
+the std iterator model once slices are supported. The consuming and
+mutable iterators (vec::IntoIter, slice::IterMut) are left as they are.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/main.rs | 64 ++++++++++++++++++++++---
+ 1 file changed, 58 insertions(+), 6 deletions(-)
+
+diff --git a/src/main.rs b/src/main.rs
+index b9766dc2..12000ab1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -326,6 +326,51 @@ pub struct IndexSlice<I: Idx, T> {
+     pub raw: [T],
+ }
+ 
++/// Own iterator standing in for `slice::Iter<'a, T>` (whose raw pointer
++/// fields have no model in Thrust): yields `&raw[0]`, ..., `&raw[len - 1]`.
++/// To be swapped for the std iterator model once slices are supported.
++pub struct SliceIter<'a, T> {
++    raw: &'a [T],
++    pos: usize,
++}
++
++impl<'a, T> Iterator for SliceIter<'a, T> {
++    type Item = &'a T;
++
++    fn next(&mut self) -> Option<&'a T> {
++        if self.pos < self.raw.len() {
++            let item = &self.raw[self.pos];
++            self.pos += 1;
++            Some(item)
++        } else {
++            None
++        }
++    }
++}
++
++/// Own iterator standing in for
++/// `raw.iter().enumerate().map(|(n, t)| (I::new(n), t))`: yields
++/// `(I::new(0), &raw[0])`, ..., `(I::new(len - 1), &raw[len - 1])`.
++pub struct IterEnumerated<'a, I: Idx, T> {
++    raw: &'a [T],
++    pos: usize,
++    marker: PhantomData<I>,
++}
++
++impl<'a, I: Idx, T> Iterator for IterEnumerated<'a, I, T> {
++    type Item = (I, &'a T);
++
++    fn next(&mut self) -> Option<(I, &'a T)> {
++        if self.pos < self.raw.len() {
++            let n = self.pos;
++            self.pos += 1;
++            Some((I::new(n), &self.raw[n]))
++        } else {
++            None
++        }
++    }
++}
++
+ impl<I: Idx, T> IndexSlice<I, T> {
+     #[inline]
+     pub const fn from_raw(raw: &[T]) -> &Self {
+@@ -352,14 +397,21 @@ impl<I: Idx, T> IndexSlice<I, T> {
+     }
+ 
+     #[inline]
+-    pub fn iter(&self) -> slice::Iter<'_, T> {
+-        self.raw.iter()
++    pub fn iter(&self) -> SliceIter<'_, T> {
++        SliceIter {
++            raw: &self.raw,
++            pos: 0,
++        }
+     }
+ 
+     #[inline]
+-    pub fn iter_enumerated(&self) -> impl DoubleEndedIterator<Item = (I, &T)> + ExactSizeIterator {
++    pub fn iter_enumerated(&self) -> IterEnumerated<'_, I, T> {
+         let _ = I::new(self.len());
+-        self.raw.iter().enumerate().map(|(n, t)| (I::new(n), t))
++        IterEnumerated {
++            raw: &self.raw,
++            pos: 0,
++            marker: PhantomData,
++        }
+     }
+ 
+     #[inline]
+@@ -531,10 +583,10 @@ impl<I: Idx, T> IntoIterator for IndexVec<I, T> {
+ 
+ impl<'a, I: Idx, T> IntoIterator for &'a IndexVec<I, T> {
+     type Item = &'a T;
+-    type IntoIter = slice::Iter<'a, T>;
++    type IntoIter = SliceIter<'a, T>;
+ 
+     #[inline]
+-    fn into_iter(self) -> slice::Iter<'a, T> {
++    fn into_iter(self) -> SliceIter<'a, T> {
+         self.iter()
+     }
+ }

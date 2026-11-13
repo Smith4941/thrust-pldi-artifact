@@ -1,0 +1,1363 @@
+//! Wrappers around CHC structures to display them in SMT-LIB2 format.
+//!
+//! The main entry point is the [`System`] wrapper, which takes a [`chc::System`] and provides a
+//! [`std::fmt::Display`] implementation that produces a complete SMT-LIB2.
+//! It uses [`FormatContext`] to handle the complexities of the conversion,
+//! such as naming convention and solver-specific workarounds.
+//! The output of this module is what gets passed to the external CHC solver.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use rustc_index::IndexVec;
+
+use crate::chc::{self, candidate_atoms::forall_preds_of, format_context::FormatContext};
+
+/// An integer constant. SMT-LIB2 has no negative numerals.
+struct IntConst<'a>(&'a num_bigint::BigInt);
+
+impl std::fmt::Display for IntConst<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.sign() == num_bigint::Sign::Minus {
+            write!(f, "(- {})", self.0.magnitude())
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+/// A helper struct to display a list of items.
+#[derive(Debug, Clone)]
+struct List<T> {
+    open: Option<&'static str>,
+    close: Option<&'static str>,
+    delimiter: &'static str,
+    items: Vec<T>,
+}
+
+impl<T> std::fmt::Display for List<T>
+where
+    T: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(c) = self.open {
+            write!(f, "{}", c)?;
+        }
+        for (i, e) in self.items.iter().enumerate() {
+            if i != 0 {
+                write!(f, "{}", self.delimiter)?;
+            }
+            write!(f, "{}", e)?;
+        }
+        if let Some(c) = self.close {
+            write!(f, "{}", c)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T> List<T> {
+    pub fn closed<I>(inner: I) -> Self
+    where
+        I: std::iter::IntoIterator<Item = T>,
+    {
+        Self {
+            open: Some("("),
+            close: Some(")"),
+            delimiter: " ",
+            items: inner.into_iter().collect(),
+        }
+    }
+
+    pub fn multiline_closed<I>(inner: I) -> Self
+    where
+        I: std::iter::IntoIterator<Item = T>,
+    {
+        Self {
+            open: Some("(\n"),
+            close: Some("\n)"),
+            delimiter: "\n",
+            items: inner.into_iter().collect(),
+        }
+    }
+
+    pub fn multiline_open<I>(inner: I) -> Self
+    where
+        I: std::iter::IntoIterator<Item = T>,
+    {
+        Self {
+            open: None,
+            close: None,
+            delimiter: "\n",
+            items: inner.into_iter().collect(),
+        }
+    }
+
+    pub fn open<I>(inner: I) -> Self
+    where
+        I: std::iter::IntoIterator<Item = T>,
+    {
+        Self {
+            open: None,
+            close: None,
+            delimiter: " ",
+            items: inner.into_iter().collect(),
+        }
+    }
+}
+
+/// A wrapper around a [`chc::Term`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Clone)]
+struct Term<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    // we need variable sorts to select box/mut selector/constructor
+    var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+    inner: &'a chc::Term,
+}
+
+impl<'ctx, 'a> std::fmt::Display for Term<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner {
+            chc::Term::Null => write!(f, "null"),
+            chc::Term::ForallDefault(idx) => write!(f, "default_{idx}"),
+            chc::Term::Var(v) => write!(f, "{}", v),
+            chc::Term::Int(i) => write!(f, "{}", IntConst(i)),
+            chc::Term::Bool(b) => write!(f, "{}", b),
+            chc::Term::String(s) => write!(f, "\"{}\"", s.escape_default()),
+            chc::Term::Box(t) => {
+                let s = t.sort(|v| self.var_sorts[*v].clone());
+                write!(
+                    f,
+                    "({} {})",
+                    self.ctx.box_ctor(&s),
+                    Term::new(self.ctx, self.var_sorts, t)
+                )
+            }
+            chc::Term::Mut(t1, t2) => {
+                let s = t1.sort(|v| self.var_sorts[*v].clone());
+                write!(
+                    f,
+                    "({} {} {})",
+                    self.ctx.mut_ctor(&s),
+                    Term::new(self.ctx, self.var_sorts, t1),
+                    Term::new(self.ctx, self.var_sorts, t2)
+                )
+            }
+            chc::Term::BoxCurrent(t) => {
+                let s = t.sort(|v| self.var_sorts[*v].clone()).deref();
+                write!(
+                    f,
+                    "({} {})",
+                    self.ctx.box_current(&s),
+                    Term::new(self.ctx, self.var_sorts, t)
+                )
+            }
+            chc::Term::MutCurrent(t) => {
+                let s = t.sort(|v| self.var_sorts[*v].clone()).deref();
+                write!(
+                    f,
+                    "({} {})",
+                    self.ctx.mut_current(&s),
+                    Term::new(self.ctx, self.var_sorts, t)
+                )
+            }
+            chc::Term::MutFinal(t) => {
+                let s = t.sort(|v| self.var_sorts[*v].clone()).deref();
+                write!(
+                    f,
+                    "({} {})",
+                    self.ctx.mut_final(&s),
+                    Term::new(self.ctx, self.var_sorts, t)
+                )
+            }
+            chc::Term::App(fn_, args) => {
+                write!(
+                    f,
+                    "({} {})",
+                    fn_,
+                    List::open(args.iter().map(|t| Term::new(self.ctx, self.var_sorts, t)))
+                )
+            }
+            chc::Term::ArrayEmpty(index, elem) => {
+                let index_sort = self.ctx.fmt_sort(index);
+                let elem_sort = self.ctx.fmt_sort(elem);
+                let default = chc::Term::default_for(elem);
+                write!(
+                    f,
+                    "((as const (Array {index_sort} {elem_sort})) {})",
+                    Term::new(self.ctx, self.var_sorts, &default)
+                )
+            }
+            chc::Term::SeqEmpty(elem) => {
+                write!(f, "(as seq.empty (Seq {}))", self.ctx.fmt_sort(elem))
+            }
+            chc::Term::Tuple(ts) => {
+                let ss: Vec<_> = ts
+                    .iter()
+                    .map(|t| t.sort(|v| self.var_sorts[*v].clone()))
+                    .collect();
+                if ss.is_empty() {
+                    write!(f, "{}", self.ctx.tuple_ctor(&ss),)
+                } else {
+                    write!(
+                        f,
+                        "({} {})",
+                        self.ctx.tuple_ctor(&ss),
+                        List::open(ts.iter().map(|t| Term::new(self.ctx, self.var_sorts, t)))
+                    )
+                }
+            }
+            chc::Term::TupleProj(t, i) => {
+                let s = t.sort(|v| self.var_sorts[*v].clone());
+                write!(
+                    f,
+                    "({} {})",
+                    self.ctx.tuple_proj(s.as_tuple().unwrap(), *i),
+                    Term::new(self.ctx, self.var_sorts, t)
+                )
+            }
+            chc::Term::DatatypeCtor(sort, sym, args) => {
+                if args.is_empty() {
+                    write!(f, "{}", self.ctx.datatype_ctor(sort, sym))
+                } else {
+                    write!(
+                        f,
+                        "({} {})",
+                        self.ctx.datatype_ctor(sort, sym),
+                        List::open(args.iter().map(|t| Term::new(self.ctx, self.var_sorts, t)))
+                    )
+                }
+            }
+            chc::Term::DatatypeSelector(sel, t) => write!(
+                f,
+                "({} {})",
+                self.ctx.datatype_selector(&sel.sort, &sel.ctor, sel.index),
+                Term::new(self.ctx, self.var_sorts, t)
+            ),
+            chc::Term::DatatypeDiscr(_s, t) => {
+                let s = t
+                    .sort(|v| self.var_sorts[*v].clone())
+                    .into_datatype()
+                    .unwrap();
+                write!(
+                    f,
+                    "({} {})",
+                    self.ctx.datatype_discr(&s),
+                    Term::new(self.ctx, self.var_sorts, t)
+                )
+            }
+            chc::Term::UserDefinedFn(symbol, _, args) => {
+                if args.is_empty() {
+                    write!(f, "{symbol}")
+                } else {
+                    write!(
+                        f,
+                        "({symbol} {})",
+                        List::open(args.iter().map(|t| Term::new(self.ctx, self.var_sorts, t)))
+                    )
+                }
+            }
+            chc::Term::ForallFn(pred, args) => {
+                let name = self.ctx.forall_pred(pred);
+                if args.is_empty() {
+                    write!(f, "{name}")
+                } else {
+                    write!(
+                        f,
+                        "({name} {})",
+                        List::open(args.iter().map(|t| Term::new(self.ctx, self.var_sorts, t)))
+                    )
+                }
+            }
+            chc::Term::IntToBitVec { width, term } => {
+                write!(
+                    f,
+                    "((_ int_to_bv {}) {})",
+                    width,
+                    Term::new(self.ctx, self.var_sorts, term)
+                )
+            }
+            chc::Term::UserQuantifiedVar(_, var) => write!(f, "{}", var),
+            chc::Term::ArrayLambda(var, index, body) => {
+                let index_sort = self.ctx.fmt_sort(index);
+                write!(
+                    f,
+                    "(lambda (({} {})) {})",
+                    var,
+                    index_sort,
+                    Term::new(self.ctx, self.var_sorts, body)
+                )
+            }
+        }
+    }
+}
+
+impl<'ctx, 'a> Term<'ctx, 'a> {
+    pub fn new(
+        ctx: &'ctx FormatContext,
+        var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+        inner: &'a chc::Term,
+    ) -> Self {
+        Self {
+            ctx,
+            var_sorts,
+            inner,
+        }
+    }
+}
+
+/// A wrapper around a [`chc::Atom`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Clone)]
+pub struct Atom<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+    inner: &'a chc::Atom,
+}
+
+impl<'ctx, 'a> std::fmt::Display for Atom<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(guard) = &self.inner.guard {
+            let guard = Formula::new(self.ctx, self.var_sorts, guard);
+            write!(f, "(=> {} ", guard)?;
+        }
+        if self.inner.pred.is_negative() {
+            write!(f, "(not ")?;
+        }
+        let pred = match &self.inner.pred {
+            chc::Pred::Matcher(p) => self.ctx.matcher_pred(p).to_string(),
+            chc::Pred::ForallPred(p) => self.ctx.forall_pred(p).to_string(),
+            chc::Pred::Tester(ctor) => {
+                let sort = self.inner.args[0]
+                    .sort(|v| self.var_sorts[*v].clone())
+                    .into_datatype()
+                    .unwrap();
+                format!("(_ is {})", self.ctx.datatype_ctor(&sort, ctor))
+            }
+            p => p.name().into_owned(),
+        };
+        if self.inner.args.is_empty() {
+            write!(f, "{}", pred)?;
+        } else {
+            let args = List::open(
+                self.inner
+                    .args
+                    .iter()
+                    .map(|t| Term::new(self.ctx, self.var_sorts, t)),
+            );
+            write!(f, "({} {})", pred, args)?;
+        }
+        if self.inner.pred.is_negative() {
+            write!(f, ")")?;
+        }
+        if self.inner.guard.is_some() {
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
+
+impl<'ctx, 'a> Atom<'ctx, 'a> {
+    pub fn new(
+        ctx: &'ctx FormatContext,
+        var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+        inner: &'a chc::Atom,
+    ) -> Self {
+        Self {
+            ctx,
+            var_sorts,
+            inner,
+        }
+    }
+}
+
+/// A wrapper around a [`chc::Formula`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Clone)]
+pub struct Formula<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+    inner: &'a chc::Formula,
+}
+
+impl<'ctx, 'a> std::fmt::Display for Formula<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner {
+            chc::Formula::Atom(atom) => {
+                let atom = Atom::new(self.ctx, self.var_sorts, atom);
+                write!(f, "{}", atom)
+            }
+            chc::Formula::Not(fo) => {
+                let fo = Formula::new(self.ctx, self.var_sorts, fo);
+                write!(f, "(not {})", fo)
+            }
+            chc::Formula::And(fs) => {
+                let fs = List::open(
+                    fs.iter()
+                        .map(|fo| Formula::new(self.ctx, self.var_sorts, fo)),
+                );
+                write!(f, "(and {})", fs)
+            }
+            chc::Formula::Or(fs) => {
+                let fs = List::open(
+                    fs.iter()
+                        .map(|fo| Formula::new(self.ctx, self.var_sorts, fo)),
+                );
+                write!(f, "(or {})", fs)
+            }
+            chc::Formula::Implies(lhs, rhs) => {
+                let lhs = Formula::new(self.ctx, self.var_sorts, lhs);
+                let rhs = Formula::new(self.ctx, self.var_sorts, rhs);
+                write!(f, "(=> {lhs} {rhs})")
+            }
+            chc::Formula::Exists(vars, fo) => {
+                let vars =
+                    List::closed(vars.iter().map(|(v, s)| {
+                        List::closed([v.to_string(), self.ctx.fmt_sort(s).to_string()])
+                    }));
+                let fo = Formula::new(self.ctx, self.var_sorts, fo);
+                write!(f, "(exists {vars} {fo})")
+            }
+            chc::Formula::Forall(vars, fo) => {
+                let vars =
+                    List::closed(vars.iter().map(|(v, s)| {
+                        List::closed([v.to_string(), self.ctx.fmt_sort(s).to_string()])
+                    }));
+                let fo = Formula::new(self.ctx, self.var_sorts, fo);
+                write!(f, "(forall {vars} {fo})")
+            }
+        }
+    }
+}
+
+impl<'ctx, 'a> Formula<'ctx, 'a> {
+    pub fn new(
+        ctx: &'ctx FormatContext,
+        var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+        inner: &'a chc::Formula,
+    ) -> Self {
+        Self {
+            ctx,
+            var_sorts,
+            inner,
+        }
+    }
+}
+
+/// A wrapper around a [`chc::Body`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Clone)]
+pub struct Body<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+    inner: &'a chc::Body,
+}
+
+impl<'ctx, 'a> std::fmt::Display for Body<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let atoms = List::open(
+            self.inner
+                .atoms
+                .iter()
+                .map(|a| Atom::new(self.ctx, self.var_sorts, a)),
+        );
+        let formula = Formula::new(self.ctx, self.var_sorts, &self.inner.formula);
+        write!(f, "(and {atoms} {formula})")
+    }
+}
+
+impl<'ctx, 'a> Body<'ctx, 'a> {
+    pub fn new(
+        ctx: &'ctx FormatContext,
+        var_sorts: &'a IndexVec<chc::TermVarIdx, chc::Sort>,
+        inner: &'a chc::Body,
+    ) -> Self {
+        Self {
+            ctx,
+            var_sorts,
+            inner,
+        }
+    }
+}
+
+/// A wrapper around a [`chc::Clause`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct Clause<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a chc::Clause,
+}
+
+impl<'ctx, 'a> std::fmt::Display for Clause<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let body = Body::new(self.ctx, &self.inner.vars, &self.inner.body);
+        let head = Atom::new(self.ctx, &self.inner.vars, &self.inner.head);
+        if !self.inner.vars.is_empty() {
+            let vars = List::closed(
+                self.inner
+                    .vars
+                    .iter_enumerated()
+                    .map(|(v, s)| List::closed([v.to_string(), self.ctx.fmt_sort(s).to_string()])),
+            );
+            write!(f, "(forall {vars} ")?;
+        }
+        write!(f, "(=> {body} {head})")?;
+        if !self.inner.vars.is_empty() {
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
+
+impl<'ctx, 'a> Clause<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a chc::Clause) -> Self {
+        Self { ctx, inner }
+    }
+}
+
+/// How much the query says in comments about where its parts come from, by the log level
+/// enabled for this module: nothing by default; at `info`, what the quantified variables stand
+/// for and one line placing each clause and declaration in the source; at `debug`, every field
+/// of the spans each was made in and the typing environment, body and head of each clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Comments {
+    None,
+    Origin,
+    Full,
+}
+
+impl Comments {
+    /// The level the current log configuration asks for. What `tracing::enabled!` answers on the
+    /// worker threads of [`chc::in_parallel`] varies between runs, so the level is decided once,
+    /// on the main thread, by [`chc::Config::from_env`], and passed to
+    /// [`System::with_comments`].
+    pub(crate) fn from_log_level() -> Self {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            Comments::Full
+        } else if tracing::enabled!(tracing::Level::INFO) {
+            Comments::Origin
+        } else {
+            Comments::None
+        }
+    }
+}
+
+fn write_comment(
+    f: &mut std::fmt::Formatter<'_>,
+    indent: usize,
+    text: impl std::fmt::Display,
+) -> std::fmt::Result {
+    for line in text.to_string().lines() {
+        writeln!(f, "; {:indent$}{line}", "")?;
+    }
+    Ok(())
+}
+
+fn write_origin_entry(
+    f: &mut std::fmt::Formatter<'_>,
+    indent: usize,
+    entry: &chc::debug::origin::Entry,
+) -> std::fmt::Result {
+    write_comment(f, indent, entry.text())?;
+    for mapping in entry.mappings() {
+        write_comment(f, indent + 2, mapping)?;
+    }
+    Ok(())
+}
+
+fn write_debug_info(
+    f: &mut std::fmt::Formatter<'_>,
+    debug_info: &chc::debug::DebugInfo,
+    comments: Comments,
+) -> std::fmt::Result {
+    match comments {
+        Comments::None => Ok(()),
+        Comments::Origin => {
+            let line = debug_info.origin_line().to_string();
+            if line.is_empty() {
+                return Ok(());
+            }
+            writeln!(f, ";{line}")
+        }
+        Comments::Full => {
+            if debug_info.is_empty() {
+                return Ok(());
+            }
+            writeln!(f, "{}", debug_info.display("; "))
+        }
+    }
+}
+
+fn write_clause_origin(
+    f: &mut std::fmt::Formatter<'_>,
+    origin: &chc::debug::origin::ClauseOrigin,
+) -> std::fmt::Result {
+    if !origin.environment.is_empty() {
+        write_comment(f, 0, "Γ")?;
+        for entry in &origin.environment {
+            write_origin_entry(f, 2, entry)?;
+        }
+    }
+    if !origin.body.is_empty() {
+        write_comment(f, 0, "body:")?;
+        for entry in &origin.body {
+            write_origin_entry(f, 2, entry)?;
+        }
+    }
+    write_comment(f, 0, format_args!("head: {}", origin.head.text()))?;
+    for mapping in origin.head.mappings() {
+        write_comment(f, 2, mapping)?;
+    }
+    Ok(())
+}
+
+/// A wrapper around a [`chc::RawCommand`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct RawCommand<'a> {
+    inner: &'a chc::RawCommand,
+}
+
+impl<'a> std::fmt::Display for RawCommand<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner.command,)
+    }
+}
+
+impl<'a> RawCommand<'a> {
+    pub fn new(inner: &'a chc::RawCommand) -> Self {
+        Self { inner }
+    }
+}
+
+/// A wrapper around a [`chc::DatatypeSelector`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct DatatypeSelector<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a chc::DatatypeSelector,
+}
+
+impl<'ctx, 'a> std::fmt::Display for DatatypeSelector<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "({} {})",
+            &self.inner.symbol,
+            self.ctx.fmt_sort(&self.inner.sort)
+        )
+    }
+}
+
+impl<'ctx, 'a> DatatypeSelector<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a chc::DatatypeSelector) -> Self {
+        Self { ctx, inner }
+    }
+}
+
+/// A wrapper around a [`chc::DatatypeCtor`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct DatatypeCtor<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a chc::DatatypeCtor,
+}
+
+impl<'ctx, 'a> std::fmt::Display for DatatypeCtor<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let selectors = self
+            .inner
+            .selectors
+            .iter()
+            .map(|s| DatatypeSelector::new(self.ctx, s));
+        write!(f, "    ({} {})", &self.inner.symbol, List::open(selectors))
+    }
+}
+
+impl<'ctx, 'a> DatatypeCtor<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a chc::DatatypeCtor) -> Self {
+        Self { ctx, inner }
+    }
+}
+
+/// A wrapper around a slice of [`chc::Datatype`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct Datatypes<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a [chc::Datatype],
+}
+
+impl<'ctx, 'a> std::fmt::Display for Datatypes<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.inner.is_empty() {
+            return Ok(());
+        }
+
+        let datatypes = self
+            .inner
+            .iter()
+            .map(|d| format!("({} 0)", self.ctx.fmt_datatype_symbol(&d.symbol)));
+        let ctors = self.inner.iter().map(|d| {
+            format!(
+                "  (par () (\n{}\n  ))",
+                List::multiline_open(d.ctors.iter().map(|c| DatatypeCtor::new(self.ctx, c)))
+            )
+        });
+        write!(
+            f,
+            "(declare-datatypes {} {})",
+            List::closed(datatypes),
+            List::multiline_closed(ctors)
+        )
+    }
+}
+
+impl<'ctx, 'a> Datatypes<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a [chc::Datatype]) -> Self {
+        Self { ctx, inner }
+    }
+}
+
+/// A wrapper around a [`chc::Datatype`] that provides a [`std::fmt::Display`] implementation for the
+/// discriminant function in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct DatatypeDiscrFun<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a chc::Datatype,
+}
+
+impl<'ctx, 'a> std::fmt::Display for DatatypeDiscrFun<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sym = &self.inner.symbol;
+        let cases = self
+            .inner
+            .ctors
+            .iter()
+            .rfold("(- 1)".to_owned(), |acc, ctor| {
+                format!(
+                    "(ite ((_ is {ctor}) x) {discr} {acc})",
+                    ctor = &ctor.symbol,
+                    discr = IntConst(&ctor.discriminant),
+                )
+            });
+        write!(
+            f,
+            "(define-fun {discr} ((x {sym})) Int {cases})",
+            discr = self.ctx.datatype_discr_def(sym),
+            sym = self.ctx.fmt_datatype_symbol(sym),
+        )
+    }
+}
+
+impl<'ctx, 'a> DatatypeDiscrFun<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a chc::Datatype) -> DatatypeDiscrFun<'ctx, 'a> {
+        DatatypeDiscrFun { ctx, inner }
+    }
+}
+
+/// A wrapper around a [`chc::Datatype`] that provides a [`std::fmt::Display`] implementation for the
+/// matcher predicate in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct MatcherPredFun<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a chc::Datatype,
+}
+
+impl<'ctx, 'a> std::fmt::Display for MatcherPredFun<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sym = &self.inner.symbol;
+        let mut offset = 0;
+        let mut variants = Vec::new();
+        for ctor in &self.inner.ctors {
+            let args = List::open(
+                (0..ctor.selectors.len())
+                    .map(|i| i + offset)
+                    .map(|i| format!("x{i}")),
+            );
+            offset += ctor.selectors.len();
+            let repr = if ctor.selectors.is_empty() {
+                ctor.symbol.to_string()
+            } else {
+                format!("({} {})", &ctor.symbol, args)
+            };
+            variants.push(format!("(= v {repr})"));
+        }
+        let params = List::closed(
+            self.inner
+                .ctors
+                .iter()
+                .flat_map(|c| &c.selectors)
+                .enumerate()
+                .map(|(idx, s)| format!("(x{} {})", idx, self.ctx.fmt_sort(&s.sort)))
+                .chain([format!("(v {})", self.ctx.fmt_datatype_symbol(sym))]),
+        );
+        write!(
+            f,
+            "(define-fun {name} {params} Bool (or {variants}))",
+            name = self.ctx.matcher_pred_def(sym),
+            variants = List::open(variants),
+        )
+    }
+}
+
+impl<'ctx, 'a> MatcherPredFun<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a chc::Datatype) -> MatcherPredFun<'ctx, 'a> {
+        MatcherPredFun { ctx, inner }
+    }
+}
+
+pub struct UserDefinedPredDef<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a chc::UserDefinedPredDef,
+}
+
+impl<'ctx, 'a> std::fmt::Display for UserDefinedPredDef<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params = List::closed(
+            self.inner
+                .sig
+                .iter()
+                .map(|(name, sort)| format!("({} {})", name, self.ctx.fmt_sort(sort))),
+        );
+        if let chc::UserDefinedPredBody::Derived = &self.inner.body {
+            // An unknown, declared before every forall predicate (see `System`'s output), so
+            // that to a dependency-aware solver it depends on none.
+            let sorts = List::closed(
+                self.inner
+                    .sig
+                    .iter()
+                    .map(|(_, sort)| self.ctx.fmt_sort(sort)),
+            );
+            return write!(f, "(declare-fun {} {sorts} Bool)", self.inner.symbol);
+        }
+        let ret_sort = match &self.inner.body {
+            chc::UserDefinedPredBody::Term(sort, _) => self.ctx.fmt_sort(sort).to_string(),
+            _ => "Bool".to_string(),
+        };
+        let command = if self.inner.is_recursive() {
+            "define-fun-rec"
+        } else {
+            "define-fun"
+        };
+        write!(
+            f,
+            "({command} {name} {params} {ret_sort} ",
+            name = self.inner.symbol,
+        )?;
+        let var_sorts: IndexVec<chc::TermVarIdx, chc::Sort> = self
+            .inner
+            .sig
+            .iter()
+            .map(|(_, sort)| sort.clone())
+            .collect();
+        match &self.inner.body {
+            chc::UserDefinedPredBody::Raw(body) => write!(f, "{}", self.raw_body(body))?,
+            chc::UserDefinedPredBody::Formula(formula) => {
+                write!(f, "{}", Formula::new(self.ctx, &var_sorts, formula))?;
+            }
+            chc::UserDefinedPredBody::Term(_, term) => {
+                let term = Term::new(self.ctx, &var_sorts, term);
+                match &self.inner.decreases {
+                    Some(decreases) => write!(
+                        f,
+                        "(! {term} :decreases {})",
+                        Term::new(self.ctx, &var_sorts, decreases)
+                    )?,
+                    None => write!(f, "{term}")?,
+                }
+            }
+            chc::UserDefinedPredBody::Derived => unreachable!("declared above"),
+        }
+        write!(f, ")")
+    }
+}
+
+impl<'ctx, 'a> UserDefinedPredDef<'ctx, 'a> {
+    /// A body taken from the source, printed with the definition's forall sorts
+    /// replaced by the sorts of the instantiation it is emitted for.
+    ///
+    /// A forall sort reads two ways in that text. Inside the `<...>` that
+    /// decorates a constructor, selector or predicate name it is part of the
+    /// symbol, spelled the way the emitter spells sorts there; standing alone it
+    /// is a binder's sort, which must be the declared datatype name. The scan
+    /// tracks which of the two it is in, taking a `<` for a decoration only when
+    /// it follows a symbol character, so that a comparison operator is left
+    /// alone.
+    fn raw_body(&self, body: &'a str) -> std::borrow::Cow<'a, str> {
+        use std::borrow::Cow;
+        if self.inner.sort_subst.is_empty() {
+            return Cow::Borrowed(body);
+        }
+        let bytes = body.as_bytes();
+        let is_symbol_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if is_symbol_char(c) {
+                let start = i;
+                while i < bytes.len() && is_symbol_char(bytes[i]) {
+                    i += 1;
+                }
+                let token = &body[start..i];
+                match self.substitute_token(token, depth) {
+                    Some(replacement) => out.extend_from_slice(replacement.as_bytes()),
+                    None => out.extend_from_slice(token.as_bytes()),
+                }
+                continue;
+            }
+            if c == b'<' && start_of_decoration(bytes, i) {
+                depth += 1;
+            } else if c == b'>' && depth > 0 {
+                depth -= 1;
+            }
+            out.push(c);
+            i += 1;
+        }
+        Cow::Owned(String::from_utf8(out).expect("substitution preserves UTF-8 boundaries"))
+    }
+
+    fn substitute_token(&self, token: &str, depth: usize) -> Option<String> {
+        let idx = token.strip_prefix('a')?.parse::<usize>().ok()?;
+        let (_, sort) = self
+            .inner
+            .sort_subst
+            .iter()
+            .find(|(from, _)| from.index() == idx)?;
+        Some(if depth == 0 {
+            self.ctx.fmt_sort(sort).to_string()
+        } else {
+            super::format_context::format_sort_symbol(sort)
+        })
+    }
+}
+
+fn start_of_decoration(bytes: &[u8], i: usize) -> bool {
+    match i.checked_sub(1).map(|j| bytes[j]) {
+        Some(c) => c.is_ascii_alphanumeric() || c == b'_' || c == b'>',
+        None => false,
+    }
+}
+
+impl<'ctx, 'a> UserDefinedPredDef<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a chc::UserDefinedPredDef) -> Self {
+        Self { ctx, inner }
+    }
+}
+
+pub struct ForallPredDef<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    pred: &'a chc::ForallPred,
+    laws: &'a [chc::Formula],
+}
+
+impl<'ctx, 'a> std::fmt::Display for ForallPredDef<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params = self.pred.params.iter().map(|sort| self.ctx.fmt_sort(sort));
+        let params = List::closed(params);
+        write!(
+            f,
+            "(declare-forall-fun {name} {params} {result}",
+            name = self.ctx.forall_pred(self.pred),
+            result = self.ctx.fmt_sort(self.pred.result()),
+        )?;
+        let no_vars = IndexVec::new();
+        let mut laws = self
+            .laws
+            .iter()
+            .map(|law| Formula::new(self.ctx, &no_vars, law));
+        match (laws.next(), laws.next()) {
+            (None, _) => {}
+            (Some(law), None) => write!(f, " :law {law}")?,
+            (Some(first), Some(second)) => {
+                write!(f, " :law (and {first} {second}")?;
+                laws.try_for_each(|law| write!(f, " {law}"))?;
+                write!(f, ")")?;
+            }
+        }
+        write!(f, ")")
+    }
+}
+
+impl<'ctx, 'a> ForallPredDef<'ctx, 'a> {
+    pub fn new(
+        ctx: &'ctx FormatContext,
+        pred: &'a chc::ForallPred,
+        laws: &'a [chc::Formula],
+    ) -> Self {
+        Self { ctx, pred, laws }
+    }
+}
+
+/// An opaque predicate or logic function ([`chc::System::make_opaque`]): a universal function of
+/// its parameters, without its definition.
+pub struct OpaquePredDecl<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    inner: &'a chc::UserDefinedPredDef,
+}
+
+impl<'ctx, 'a> std::fmt::Display for OpaquePredDecl<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params = self
+            .inner
+            .sig
+            .iter()
+            .map(|(_, sort)| self.ctx.fmt_sort(sort));
+        let result = match &self.inner.body {
+            chc::UserDefinedPredBody::Term(sort, _) => self.ctx.fmt_sort(sort).to_string(),
+            _ => "Bool".to_string(),
+        };
+        write!(
+            f,
+            "(declare-forall-fun {} {} {result}",
+            self.inner.symbol,
+            List::closed(params)
+        )?;
+        if let Some(facts) = &self.inner.result_facts {
+            write!(f, " :law {}", self.closed_law(facts))?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl<'ctx, 'a> OpaquePredDecl<'ctx, 'a> {
+    pub fn new(ctx: &'ctx FormatContext, inner: &'a chc::UserDefinedPredDef) -> Self {
+        Self { ctx, inner }
+    }
+
+    /// `facts`, a formula over the function's parameters, closed by a `forall` over them: a law
+    /// written closed is a premise that holds at every argument.
+    fn closed_law(&self, facts: &chc::Formula) -> String {
+        let var_sorts: IndexVec<chc::TermVarIdx, chc::Sort> = self
+            .inner
+            .sig
+            .iter()
+            .map(|(_, sort)| sort.clone())
+            .collect();
+        let body = Formula::new(self.ctx, &var_sorts, facts).to_string();
+        if self.inner.sig.is_empty() {
+            return body;
+        }
+        let binders = List::closed(
+            self.inner
+                .sig
+                .iter()
+                .map(|(name, sort)| format!("({} {})", name, self.ctx.fmt_sort(sort))),
+        );
+        format!("(forall {binders} {body})")
+    }
+}
+
+pub struct DepExistsPredVarDef<'ctx, 'a> {
+    ctx: &'ctx FormatContext,
+    id: &'a chc::PredVarId,
+    def: &'a chc::PredVarDef,
+    /// The opaque predicates (`chc::System::make_opaque`), listed after `dependencies`: every
+    /// unknown may depend on them, as it may on their definitions.
+    opaque: &'a [&'a chc::UserDefinedPred],
+    // A `BTreeSet`, not a `HashSet`: `fmt` below iterates this directly to
+    // list a `declare-dep-exists-fun`'s dependencies, so whatever order it
+    // arrives in is the order emitted. It is ordered where it is built, in
+    // `chc::System::compute_dependency`, rather than sorted here.
+    dependencies: &'a BTreeSet<chc::ForallPred>,
+}
+
+impl<'ctx, 'a> std::fmt::Display for DepExistsPredVarDef<'ctx, 'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "(declare-dep-exists-fun {} {} {} Bool)",
+            self.id,
+            List::closed(
+                self.dependencies
+                    .iter()
+                    .map(|p| self.ctx.forall_pred(p).to_string())
+                    .chain(self.opaque.iter().map(|p| p.to_string()))
+            ),
+            List::closed(self.def.sig.iter().map(|s| self.ctx.fmt_sort(s))),
+        )
+    }
+}
+
+impl<'ctx, 'a> DepExistsPredVarDef<'ctx, 'a> {
+    pub fn new(
+        ctx: &'ctx FormatContext,
+        id: &'a chc::PredVarId,
+        def: &'a chc::PredVarDef,
+        dependencies: &'a BTreeSet<chc::ForallPred>,
+        opaque: &'a [&'a chc::UserDefinedPred],
+    ) -> Self {
+        Self {
+            ctx,
+            id,
+            def,
+            opaque,
+            dependencies,
+        }
+    }
+}
+
+/// A wrapper around a [`chc::System`] that provides a [`std::fmt::Display`] implementation in SMT-LIB2 format.
+#[derive(Debug, Clone)]
+pub struct System<'a> {
+    ctx: FormatContext,
+    inner: &'a chc::System,
+    comments: Comments,
+}
+
+/// What each quantified variable `q$<n>` stands for: a binder of an annotation, with its source
+/// position, or a variable of a law Thrust states.
+fn write_quantified_var_names(
+    f: &mut std::fmt::Formatter<'_>,
+    system: &chc::System,
+) -> std::fmt::Result {
+    let mut names = system.user_quantified_var_names().peekable();
+    if names.peek().is_none() {
+        return Ok(());
+    }
+    write_comment(f, 0, "quantified variables")?;
+    for (var, name) in names {
+        write_comment(f, 2, format!("{var} = {name}"))?;
+    }
+    writeln!(f)
+}
+
+impl<'a> std::fmt::Display for System<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let comments = self.comments;
+        writeln!(f, "(set-logic HORN)\n")?;
+        if comments >= Comments::Origin {
+            write_quantified_var_names(f, self.inner)?;
+        }
+
+        let used_forall_sorts = self.inner.used_forall_sorts();
+        for forall_sort_def in &self.inner.forall_sorts {
+            if !used_forall_sorts.contains(&forall_sort_def.idx) {
+                continue;
+            }
+            write_debug_info(f, &forall_sort_def.debug_info, comments)?;
+            writeln!(f, "(declare-forall-sort {})\n", forall_sort_def.idx)?;
+        }
+        let used_forall_defaults = self.inner.used_forall_default_sorts();
+        for forall_sort_def in &self.inner.forall_sorts {
+            if !used_forall_defaults.contains(&forall_sort_def.idx) {
+                continue;
+            }
+            // The padding of an empty array at an abstract element sort: an arbitrary but
+            // fixed value that nothing is allowed to observe. Under `(set-logic HORN)` a
+            // top-level `declare-const` names something the solver must *build*, and an
+            // abstract sort has no value the solver can build, so that spelling stops the
+            // query at the parser. A nullary `declare-forall-fun` is the universal reading:
+            // the clauses have to hold whatever the padding is, which is what "nothing may
+            // observe it" means.
+            writeln!(
+                f,
+                "(declare-forall-fun default_{} () {})\n",
+                forall_sort_def.idx, forall_sort_def.idx
+            )?;
+        }
+
+        for group in self.ctx.datatype_groups() {
+            writeln!(f, "{}\n", Datatypes::new(&self.ctx, group))?;
+        }
+        for datatype in self.ctx.datatypes() {
+            writeln!(f, "{}", DatatypeDiscrFun::new(&self.ctx, datatype))?;
+            writeln!(f, "{}", MatcherPredFun::new(&self.ctx, datatype))?;
+        }
+
+        // A derived predicate is one relation independent of every forall predicate: to a
+        // dependency-aware solver a `declare-fun` may depend on the forall predicates declared
+        // before it, so it comes before them.
+        let derived = |def: &&chc::UserDefinedPredDef| def.is_derived();
+        for def in self.inner.user_defined_pred_defs.iter().filter(derived) {
+            writeln!(f, "{}\n", UserDefinedPredDef::new(&self.ctx, def))?;
+        }
+
+        for pred in &self.inner.forall_pred_vars {
+            writeln!(
+                f,
+                "{}\n",
+                ForallPredDef::new(&self.ctx, pred, self.inner.laws_of(pred))
+            )?;
+        }
+
+        // An opaque predicate is a universal function, declared with the forall predicates so
+        // that every unknown and definition after it may read it.
+        let opaque = self.opaque_preds();
+        for def in self.inner.user_defined_pred_defs.iter() {
+            if opaque.contains(&&def.symbol) {
+                writeln!(f, "{}\n", OpaquePredDecl::new(&self.ctx, def))?;
+            }
+        }
+
+        // insert command from #![thrust::raw_command()] here
+        for raw_command in &self.inner.raw_commands {
+            writeln!(f, "{}\n", RawCommand::new(raw_command))?;
+        }
+
+        // The solver reads a `define-fun` against what precedes it, so the unknowns a
+        // definition applies are declared ahead of the definitions.
+        let dependencies = self.inner.compute_dependency();
+        let emitted = super::prune::emitted_clauses(self.inner);
+        let emitted_pred_vars =
+            super::prune::pred_vars_of(emitted.iter().map(|&id| &self.inner.clauses[id]));
+        let declared_early = self.inner.pred_vars_in_definitions();
+        for &p in &declared_early {
+            self.fmt_pred_var_decl(f, p, &dependencies, &opaque, comments)?;
+        }
+
+        for user_defined_pred_def in self.inner.user_defined_preds_in_dependency_order() {
+            if user_defined_pred_def.is_derived() || opaque.contains(&&user_defined_pred_def.symbol)
+            {
+                continue;
+            }
+            writeln!(
+                f,
+                "{}\n",
+                UserDefinedPredDef::new(&self.ctx, user_defined_pred_def)
+            )?;
+        }
+
+        writeln!(f)?;
+        for p in self.inner.pred_vars.indices() {
+            if !declared_early.contains(&p) && emitted_pred_vars.contains(&p) {
+                self.fmt_pred_var_decl(f, p, &dependencies, &opaque, comments)?;
+            }
+        }
+        for id in emitted {
+            let clause = &self.inner.clauses[id];
+            match comments {
+                Comments::None => {}
+                Comments::Origin => writeln!(f, "; {:?}{}", id, clause.debug_info.origin_line())?,
+                Comments::Full => {
+                    writeln!(f, "; {:?}", id)?;
+                    write_debug_info(f, &clause.debug_info, comments)?;
+                    write_clause_origin(f, &clause.origin)?;
+                }
+            }
+            writeln!(f, "(assert {})\n", Clause::new(&self.ctx, clause))?;
+        }
+        for candidates in &self.inner.candidate_atoms {
+            if !emitted_pred_vars.contains(&candidates.pred) {
+                continue;
+            }
+            self.fmt_candidate_atoms(f, candidates, &dependencies, comments)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> System<'a> {
+    /// The opaque predicates in the order of their definitions, for a solver that reads
+    /// universal functions; to any other solver every predicate is emitted with its definition.
+    fn opaque_preds(&self) -> Vec<&'a chc::UserDefinedPred> {
+        if !self.ctx.capabilities().dependency_aware_declarations {
+            return Vec::new();
+        }
+        self.inner
+            .user_defined_pred_defs
+            .iter()
+            .map(|def| &def.symbol)
+            .filter(|symbol| self.inner.is_opaque(symbol))
+            .collect()
+    }
+
+    fn fmt_pred_var_decl(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        p: chc::PredVarId,
+        dependencies: &HashMap<chc::PredVarId, BTreeSet<chc::ForallPred>>,
+        opaque: &[&chc::UserDefinedPred],
+        comments: Comments,
+    ) -> std::fmt::Result {
+        let def = &self.inner.pred_vars[p];
+        write_debug_info(f, &def.debug_info, comments)?;
+        // To a dependency-aware solver a plain `declare-fun` means "every forall pred
+        // declared before it", so an unknown whose computed set is empty is declared
+        // with the explicit, empty list. Any other solver keeps the plain form for it.
+        let explicit = self.ctx.capabilities().dependency_aware_declarations;
+        if dependencies
+            .get(&p)
+            .is_some_and(|deps| explicit || !deps.is_empty())
+        {
+            return writeln!(
+                f,
+                "{}\n",
+                DepExistsPredVarDef::new(&self.ctx, &p, def, &dependencies[&p], opaque)
+            );
+        }
+        writeln!(
+            f,
+            "(declare-fun {} {} Bool)\n",
+            p,
+            List::closed(def.sig.iter().map(|s| self.ctx.fmt_sort(s)))
+        )
+    }
+
+    /// Declares the candidate atoms of a predicate variable, in fptprove's
+    /// `(set-info :candidates (P ((x1 s1) ...) (A1 ...)))`. An atom naming a forall predicate
+    /// outside the variable's dependencies could not be a qualifier of it and is left out, as
+    /// is a repeat of an earlier atom. z3 reports the compound `set-info` value as an error, so
+    /// the declaration is written only for a dependency-aware solver.
+    fn fmt_candidate_atoms(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        candidates: &chc::CandidateAtoms,
+        dependencies: &HashMap<chc::PredVarId, BTreeSet<chc::ForallPred>>,
+        comments: Comments,
+    ) -> std::fmt::Result {
+        if !self.ctx.capabilities().dependency_aware_declarations {
+            return Ok(());
+        }
+        let var_sorts: IndexVec<chc::TermVarIdx, chc::Sort> = self.inner.pred_vars[candidates.pred]
+            .sig
+            .iter()
+            .cloned()
+            .collect();
+        let no_dependencies = BTreeSet::new();
+        let allowed = dependencies
+            .get(&candidates.pred)
+            .unwrap_or(&no_dependencies);
+        let mut seen = HashSet::new();
+        let atoms: Vec<String> = candidates
+            .atoms
+            .iter()
+            .filter(|atom| {
+                forall_preds_of(atom, &self.inner.user_defined_pred_defs)
+                    .into_iter()
+                    .all(|p| allowed.contains(p))
+            })
+            .map(|atom| Formula::new(&self.ctx, &var_sorts, atom).to_string())
+            .filter(|atom| seen.insert(atom.clone()))
+            .collect();
+        if atoms.is_empty() {
+            return Ok(());
+        }
+        let params = List::closed(
+            var_sorts
+                .iter_enumerated()
+                .map(|(v, s)| List::closed([v.to_string(), self.ctx.fmt_sort(s).to_string()])),
+        );
+        if comments >= Comments::Origin {
+            writeln!(
+                f,
+                "; candidate atoms of {}, from contracts",
+                candidates.pred
+            )?;
+        }
+        writeln!(
+            f,
+            "(set-info :candidates ({} {} {}))\n",
+            candidates.pred,
+            params,
+            List::closed(atoms),
+        )
+    }
+
+    pub fn new(inner: &'a chc::System, capabilities: chc::Capabilities) -> Self {
+        let ctx = FormatContext::from_system(inner, capabilities);
+        Self {
+            ctx,
+            inner,
+            comments: Comments::None,
+        }
+    }
+
+    pub(crate) fn with_comments(mut self, comments: Comments) -> Self {
+        self.comments = comments;
+        self
+    }
+}

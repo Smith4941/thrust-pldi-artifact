@@ -1,0 +1,87 @@
+name: Claude review
+
+# Reviews a pull request when someone with write access runs it with the pull request's number,
+# from the Actions tab or with `gh workflow run claude-review.yml -f pr=<number>`.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.pr }}
+  cancel-in-progress: true
+
+# This job holds the API key, so its actions are pinned to commits, its packages to hashes, and
+# the key and the token are given only to the step that needs them.
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    timeout-minutes: 10
+    env:
+      PR: ${{ inputs.pr }}
+      HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      # The script and the prompt come from the default branch; the pull request's head is
+      # checked out apart, only to be read.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/pull/${{ env.PR }}/head
+          path: pr-head
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - run: pip install --require-hashes -r .github/scripts/requirements.txt
+      # The standard library's source of the toolchain the default branch pins, which the
+      # review reads with its grep_std and read_std tools.
+      - name: Fetch the standard library source
+        # Without it the review runs without the std tools.
+        continue-on-error: true
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rust-src --no-self-update
+          echo "RUST_SRC=$(rustup run "$channel" rustc --print sysroot)/lib/rustlib/src/rust/library" >> "$GITHUB_ENV"
+      - if: ${{ env.HAS_API_KEY == 'true' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/claude_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --prompt .github/claude-review-prompt.md --head pr-head
+      - if: ${{ env.HAS_API_KEY != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/claude_review.py --repo "$GITHUB_REPOSITORY" --pr "$PR" --prompt .github/claude-review-prompt.md --head pr-head --dry-run
+  # A review posted with the workflow's token triggers no workflow, so the freshness check
+  # (review-freshness.yml) of the pull request's head is run again here, apart from the API key.
+  freshness:
+    needs: review
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      pull-requests: read
+    timeout-minutes: 5
+    env:
+      PR: ${{ inputs.pr }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          head=$(gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          run=$(gh run list -R "$GITHUB_REPOSITORY" -w review-freshness.yml -c "$head" -L 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$run" ]; then
+            echo "no freshness check has run on $head"
+            exit 0
+          fi
+          # A run in progress may have read the reviews before this one; it cannot be re-run until it ends.
+          gh run watch "$run" -R "$GITHUB_REPOSITORY" > /dev/null
+          gh run rerun "$run" -R "$GITHUB_REPOSITORY"
